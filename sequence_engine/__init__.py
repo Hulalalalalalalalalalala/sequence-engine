@@ -3,8 +3,9 @@
 Public interface (see README.md):
 
 - ``Tensor(data)`` with ``tolist()`` and ``shape``.
-- ``Sequential(modules)`` with ``forward``, ``backward``, ``zero_grad``
-  and ``parameters``.
+- ``Sequential(modules)`` with ``forward``, ``backward``, ``zero_grad``,
+  ``parameters``, ``update`` (one in-place gradient step), and ``save`` /
+  ``load`` (versioned atomic checkpoints to a path or a bytearray).
 """
 
 from .sequential import Sequential

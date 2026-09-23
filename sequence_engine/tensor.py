@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 
 def _normalize(data):
     """Validate *data* and return ``(shape, deep-copied nested lists)``."""
@@ -58,3 +60,38 @@ class Tensor:
 
     def __repr__(self):
         return f"Tensor(shape={self._shape}, data={self._data!r})"
+
+    # -- internal engine hooks (not part of the public README surface) ------
+
+    def _values(self):
+        """Return the raw nested storage (not a copy)."""
+        return self._data
+
+    def _set_values(self, values):
+        """Replace the raw nested storage with an already-validated tree."""
+        self._data = values
+
+    def _scaled_subtract_(self, other, scale):
+        """Subtract *scale* times *other* in place, element by element.
+
+        The arithmetic happens in a fixed left-to-right order so the
+        result is identical to an uninterrupted run.
+        """
+        self._data = _scaled_subtract(self._data, other._data, float(scale))
+
+    def _all_finite(self):
+        return _all_finite(self._data)
+
+
+def _scaled_subtract(a, b, scale):
+    if isinstance(a, list):
+        return [_scaled_subtract(x, y, scale) for x, y in zip(a, b)]
+    return a - scale * b
+
+
+def _all_finite(value):
+    if isinstance(value, list):
+        return all(_all_finite(item) for item in value)
+    return isinstance(value, int) or (
+        isinstance(value, float) and math.isfinite(value)
+    )
