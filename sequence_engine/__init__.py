@@ -8,8 +8,9 @@ Public interface (see README.md):
   ``load`` (versioned atomic checkpoints to a path or a bytearray).
 """
 
+from .checkpoint import MemoryChain
 from .sequential import Sequential
 from .tensor import Tensor
 
-__all__ = ["Tensor", "Sequential"]
+__all__ = ["Tensor", "Sequential", "MemoryChain"]
 __version__ = "0.1.0"

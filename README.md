@@ -14,6 +14,9 @@ Python 3.11 or newer. Standard library only.
 
     python3 -m sequence_engine --selftest
 
+The built-in self-check runs only in memory (including the incremental
+checkpoint path) and writes no files.
+
 ## Public interface
 
 `sequence_engine.Tensor(data)` and `sequence_engine.Sequential(modules)`.
@@ -35,17 +38,38 @@ Python 3.11 or newer. Standard library only.
 - `Sequential.save(target) -> None` fixes parameters, accumulated gradients
   (zeros for parameters that have none), the slice-boundary hidden state and
   the layer order in one versioned binary checkpoint. `target` is a
-  filesystem path (`str`/`os.PathLike`) or an in-memory `bytearray`; saving
-  mutates no existing state and repeated saves of the same state produce
-  identical bytes. Saves happen at segment boundaries (no pending
-  `backward`); saving mid-segment raises `RuntimeError`.
+  filesystem path (`str`/`os.PathLike`), an existing directory used as an
+  incremental checkpoint chain, a `MemoryChain`, or an in-memory
+  `bytearray`; saving mutates no existing state and repeated saves of the
+  same state produce identical bytes. A boundary exists before the first
+  segment and after every `forward` -- the hidden state returned by that
+  forward *is* the boundary -- so saving is allowed even when the latest
+  forward has not been back-propagated yet; the snapshot fixes the boundary
+  state, not the in-flight activations.
 - `Sequential.load(source) -> hidden | None` restores a checkpoint from a
-  path or bytes-like buffer and returns the restored hidden-state list for
-  the next `forward(batch, hidden)`. The version, every tensor shape and the
-  layer order (count, layer kinds, per-layer parameter shapes) are checked
-  first; any mismatch, truncation, corruption or missing field rejects the
-  whole checkpoint with `ValueError` -- nothing is partially applied or
-  silently filled in. A missing path raises `FileNotFoundError`.
+  path, an incremental-chain directory, a `MemoryChain`, or bytes-like
+  buffer and returns the restored hidden-state list for the next
+  `forward(batch, hidden)`. The format version (the previous format version
+  1 is read and migrated item by item; `Sequential.loaded_from_version`
+  reports the version a successful load came from), every tensor shape and
+  the layer order (count, layer kinds, per-layer parameter shapes) are
+  checked first; hidden-state shapes are verified on the spot, even for a
+  model that has never run a forward. Any mismatch, truncation, corruption
+  or missing field rejects the whole checkpoint with `ValueError` -- nothing
+  is partially applied or silently filled in. A missing path raises
+  `FileNotFoundError`.
+
+### Threading
+
+All `Sequential` operations are serialised by one per-container lock, so
+multiple threads may interleave `forward`, `backward`, `update`, `save` and
+`load`. Under any interleaving each parameter's final value is one a serial
+execution of the same calls could have produced: `update` applies as one
+atomic step, a `load` is never observed half-applied, and no `save` can read
+a half-written tensor. Every snapshot corresponds to one complete slice
+boundary -- never two passes half mixed. When two threads save to the same
+file path the bytes on disk are always one or the other writer's complete
+checkpoint (never a blend).
 
 ## Checkpoint file semantics
 
@@ -59,9 +83,50 @@ trailer and CRC and refused with `ValueError`.
 Floats are stored as raw IEEE-754 float64 values, so a save/load round-trip
 is bitwise identical, including the sign of negative zero. Integers must
 fit in int64 and all serialized numbers must be finite; oversized integers
-or non-finite floats raise `ValueError`. Saving into a directory that does
-not exist or is not writable, or failing because the disk is full, raises
-`OSError`; the caller chooses the destination path.
+or non-finite floats raise `ValueError` on save, and a payload that merely
+contains an oversized or non-finite value is refused on load. Saving into
+a directory that does not exist or is not writable, or failing because the
+disk is full, raises `OSError`; the caller chooses the destination path.
+
+## Checkpoint format versions
+
+The on-disk format is versioned. This build writes **version 2** and still
+reads **version 1**: an old file is migrated item by item into the current
+document shape and the source version is recorded; if migration fails on
+any item the whole file is rejected rather than silently filled in. A file
+with an unknown version, or a header with a field added or removed, is
+rejected with `ValueError`. A migrated state re-saves as native version 2.
+Unknown (future) versions are never guessed; they are refused.
+
+## Incremental checkpoint chains
+
+Passing an existing directory (or a `MemoryChain`) to `save`/`load` uses an
+incremental chain instead of one self-contained file:
+
+- the first save writes a full **basis** segment (`seg-0000000000.seqd`);
+- every later save appends a delta segment naming only the tensors that
+  changed, compared by encoded leaf identity (so float sign bits such as
+  `-0.0` count); unchanged saves append an empty delta deterministically,
+  and layers with no parameters participate like any other layer;
+- a `head` pointer names the newest committed segment. Each segment file is
+  written completely and atomically before the head is advanced, so a crash,
+  a full disk or two saves racing into one directory always leave a single
+  complete chain reachable from `head`.
+
+Loading walks the basis and every delta up to the head and reassembles the
+state by layer. The reassembled state is bit for bit identical to the full
+snapshot taken at the same moment. Any segment in the chain that is
+truncated, corrupt, missing a field, out of order, changes the layer order
+or parameter/shapes, or introduces hidden state incompletely makes the load
+reject the **whole** chain with `ValueError`. A missing chain directory or a
+referenced segment file that is absent raises `FileNotFoundError`; an
+unwritable directory or a full disk raises `OSError`. A chain cannot change
+the model's layer order or parameter shapes -- use a fresh full snapshot for
+a different model.
+
+`MemoryChain` (exported from `sequence_engine`) is an in-memory chain with
+identical commit semantics, useful for tests and long-running processes that
+want incremental snapshots without files.
 
 ## Tests
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 from . import checkpoint as _checkpoint
 from .tensor import Tensor
 
@@ -48,7 +50,15 @@ class Sequential:
       not cleared (``zero_grad`` still does that).
     * ``save(target)`` / ``load(source)`` -- atomic, versioned snapshots of
       parameters, accumulated gradients and slice-boundary hidden state,
-      to a filesystem path or to an in-memory ``bytearray``.
+      to a filesystem path, an incremental-chain directory or to an
+      in-memory ``bytearray``.
+
+    All public operations are serialised by one re-entrant lock, so
+    several threads may interleave ``forward``, ``backward``, ``update``,
+    ``save`` and ``load`` calls: every observed parameter state is one a
+    serial execution of the same calls could have produced, ``update`` is
+    atomic and a snapshot always corresponds to one complete slice
+    boundary -- never two passes half mixed.
     """
 
     def __init__(self, modules):
@@ -79,56 +89,74 @@ class Sequential:
         self._hidden_shapes = None
         self._last_output = None
         self._last_hidden = None
+        # Version a checkpoint was loaded from (None until the first load).
+        self._loaded_from_version = None
+        self._lock = threading.RLock()
+
+    @property
+    def loaded_from_version(self):
+        """Format version the last ``load`` migrated from (``None`` before).
+
+        A version-1 checkpoint reports ``1``; a native version-2 file
+        reports ``2``. The source version is only updated on a successful
+        load -- a checkpoint rejected mid-migration leaves the previous
+        value untouched.
+        """
+        return self._loaded_from_version
 
     def forward(self, batch, hidden=None):
-        if not isinstance(batch, Tensor):
-            raise ValueError("batch must be a Tensor")
-        batch_shape = batch.shape
-        if len(batch_shape) == 0 or batch_shape[0] <= 0:
-            raise ValueError("batch must be non-empty")
-        slots = self._prepare_hidden(hidden)
-        x = batch
-        new_hidden = []
-        for module, slot in zip(self._modules, slots):
-            result = module.forward(x, slot)
-            try:
-                x, slot_out = result
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    "each layer's forward must return an (output, hidden) pair"
-                ) from exc
-            if not isinstance(x, Tensor) or not isinstance(slot_out, Tensor):
-                raise ValueError("each layer's forward must return (Tensor, Tensor)")
-            new_hidden.append(slot_out)
-        self._hidden_shapes = [slot.shape for slot in new_hidden]
-        self._last_output = x
-        self._last_hidden = new_hidden
-        self._pending_backward = True
-        return x, new_hidden
+        with self._lock:
+            if not isinstance(batch, Tensor):
+                raise ValueError("batch must be a Tensor")
+            batch_shape = batch.shape
+            if len(batch_shape) == 0 or batch_shape[0] <= 0:
+                raise ValueError("batch must be non-empty")
+            slots = self._prepare_hidden(hidden)
+            x = batch
+            new_hidden = []
+            for module, slot in zip(self._modules, slots):
+                result = module.forward(x, slot)
+                try:
+                    x, slot_out = result
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "each layer's forward must return an (output, hidden) pair"
+                    ) from exc
+                if not isinstance(x, Tensor) or not isinstance(slot_out, Tensor):
+                    raise ValueError(
+                        "each layer's forward must return (Tensor, Tensor)"
+                    )
+                new_hidden.append(slot_out)
+            self._hidden_shapes = [slot.shape for slot in new_hidden]
+            self._last_output = x
+            self._last_hidden = new_hidden
+            self._pending_backward = True
+            return x, new_hidden
 
     def backward(self, loss):
-        if not self._pending_backward:
-            raise RuntimeError(
-                "backward() requires a preceding forward() and may only be "
-                "called once per forward()"
-            )
-        upstream = self._parse_loss(loss)
-        # Snapshot gradients first: if any layer raises mid-pass, roll the
-        # partial accumulation back so the state is exactly as if backward
-        # had never run and the caller may retry the same forward's backward
-        # (that retry is not a second backward pass).
-        grad_snapshot = [
-            None if param.grad is None else param.grad.tolist()
-            for param in self.parameters()
-        ]
-        try:
-            for module in reversed(self._modules):
-                upstream = module.backward(upstream)
-        except BaseException:
-            for param, saved in zip(self.parameters(), grad_snapshot):
-                param.grad = None if saved is None else Tensor(saved)
-            raise
-        self._pending_backward = False
+        with self._lock:
+            if not self._pending_backward:
+                raise RuntimeError(
+                    "backward() requires a preceding forward() and may only be "
+                    "called once per forward()"
+                )
+            upstream = self._parse_loss(loss)
+            # Snapshot gradients first: if any layer raises mid-pass, roll the
+            # partial accumulation back so the state is exactly as if backward
+            # had never run and the caller may retry the same forward's backward
+            # (that retry is not a second backward pass).
+            grad_snapshot = [
+                None if param.grad is None else param.grad.tolist()
+                for param in self.parameters()
+            ]
+            try:
+                for module in reversed(self._modules):
+                    upstream = module.backward(upstream)
+            except BaseException:
+                for param, saved in zip(self.parameters(), grad_snapshot):
+                    param.grad = None if saved is None else Tensor(saved)
+                raise
+            self._pending_backward = False
 
     def _parse_loss(self, loss):
         if isinstance(loss, bool):
@@ -158,14 +186,16 @@ class Sequential:
         )
 
     def zero_grad(self):
-        for param in self.parameters():
-            param.grad = Tensor(_zeros(param.shape))
+        with self._lock:
+            for param in self.parameters():
+                param.grad = Tensor(_zeros(param.shape))
 
     def parameters(self):
-        params = []
-        for module in self._modules:
-            params.extend(module.parameters())
-        return params
+        with self._lock:
+            params = []
+            for module in self._modules:
+                params.extend(module.parameters())
+            return params
 
     def update(self, learning_rate):
         """Perform one in-place step ``theta <- theta - learning_rate * grad``.
@@ -174,45 +204,29 @@ class Sequential:
         accumulated gradient; parameters without a gradient slot are left
         untouched (their gradient is implicitly zero). Gradients are not
         cleared -- ``zero_grad`` remains the only way to reset them.
+
+        The whole step runs under the container lock, so a concurrent
+        ``save`` or ``load`` can never observe a half-updated model.
         """
-        if isinstance(learning_rate, bool) or not isinstance(
-            learning_rate, (int, float)
-        ):
-            raise ValueError("learning rate must be a number")
-        if learning_rate != learning_rate or learning_rate in (
-            float("inf"),
-            float("-inf"),
-        ):
-            raise ValueError("learning rate must be finite")
-        for param in self.parameters():
-            if param.grad is not None:
-                param._scaled_subtract_(param.grad, learning_rate)
+        with self._lock:
+            if isinstance(learning_rate, bool) or not isinstance(
+                learning_rate, (int, float)
+            ):
+                raise ValueError("learning rate must be a number")
+            if learning_rate != learning_rate or learning_rate in (
+                float("inf"),
+                float("-inf"),
+            ):
+                raise ValueError("learning rate must be finite")
+            for param in self.parameters():
+                if param.grad is not None:
+                    param._scaled_subtract_(param.grad, learning_rate)
 
     # -- checkpoints --------------------------------------------------------
 
-    def save(self, target):
-        """Fix the full training state into *target*.
-
-        *target* is either a filesystem path (``str``/``os.PathLike``) or a
-        ``bytearray`` used as an in-memory buffer. The snapshot records
-        every parameter tensor, every accumulated gradient (zeros for
-        parameters that have never received one), the current
-        slice-boundary hidden state, the layer order with per-layer
-        parameter shapes and the format version.
-
-        A snapshot may only be taken at a segment boundary -- i.e. when no
-        backward pass is pending -- because a forward's intermediate
-        activations live inside the caller's layers and cannot be fixed by
-        the engine. Saving mutates no existing state and repeated saves
-        produce identical bytes.
-        """
-        if self._pending_backward:
-            raise RuntimeError(
-                "save() requires a completed segment: call backward() for the "
-                "pending forward() first"
-            )
+    def _snapshot_document(self):
         params = self.parameters()
-        document = {
+        return {
             "params": [
                 {"s": param.shape, "v": param.tolist()} for param in params
             ],
@@ -239,47 +253,91 @@ class Sequential:
             ],
             "pending": False,
         }
-        return _checkpoint.save_bytes(document, target)
+
+    def save(self, target):
+        """Fix the current slice-boundary training state into *target*.
+
+        *target* is either a filesystem path (``str``/``os.PathLike``), an
+        existing directory used as an incremental checkpoint chain, or a
+        ``bytearray`` used as an in-memory buffer. The snapshot records
+        every parameter tensor, every accumulated gradient (zeros for
+        parameters that have never received one), the current
+        slice-boundary hidden state, the layer order with per-layer
+        parameter shapes and the format version.
+
+        A boundary exists before the first segment and after every
+        ``forward`` (the hidden state returned by that forward *is* the
+        boundary), so saving is allowed even while the latest forward has
+        not been back-propagated yet: the snapshot fixes the boundary
+        state, not the in-flight activations. Saving mutates no existing
+        state and repeated saves of the same state produce identical
+        bytes. The whole snapshot is taken under the container lock, so a
+        concurrent ``update`` can never leave a half-written tensor in it.
+        """
+        with self._lock:
+            document = self._snapshot_document()
+            return _checkpoint.save_bytes(document, target)
 
     def load(self, source):
         """Restore state previously written by ``save``.
 
-        *source* is a filesystem path or a bytes-like buffer. The whole
-        checkpoint is validated before anything is applied: the format
-        version, every tensor shape and the layer order (count, kinds and
-        per-layer parameter shapes) must match this container exactly. A
+        *source* is a filesystem path, an incremental-chain directory or a
+        bytes-like buffer. The whole checkpoint is validated before
+        anything is applied: the format version (version 1 is migrated
+        item by item and the origin is recorded), every tensor shape and
+        the layer order (count, kinds and per-layer parameter shapes) must
+        match this container exactly. Hidden-state shapes are verified on
+        the spot, including for a model that has never run a forward. A
         missing path raises ``FileNotFoundError``; any structural problem
         rejects the entire checkpoint with ``ValueError`` and leaves the
-        container untouched.
+        container untouched -- nothing is partially applied or silently
+        filled in.
 
         On success returns the restored slice-boundary hidden-state list
         (one tensor per layer), or ``None`` when the checkpoint fixed the
         start-of-training state. Feed it back into the next
         ``forward(batch, hidden)`` to continue the sequence.
         """
-        document = _checkpoint.load_bytes(source)
-        self._validate_against_model(document)
+        with self._lock:
+            document, source_version = _checkpoint.load_bytes_with_source(source)
+            self._validate_against_model(document)
 
-        params = self.parameters()
-        for param, entry in zip(params, document["params"]):
-            param._set_values(_rebuild_tree(entry["v"], entry["s"]))
-        for param, entry in zip(params, document["grads"]):
-            param.grad = Tensor(_rebuild_tree(entry["v"], entry["s"]))
-        if document["hidden"] is None:
-            self._last_hidden = None
-            self._hidden_shapes = None
-            restored_hidden = None
-        else:
-            slots = [
-                Tensor(_rebuild_tree(entry["v"], entry["s"]))
-                for entry in document["hidden"]
+            # Build every replacement tree before touching any live state,
+            # so a failure in the middle still leaves the model exactly as
+            # it was (validation above already rejects malformed input, but
+            # the rebuild is kept on the apply side as a hard guarantee).
+            params = self.parameters()
+            new_values = [
+                _rebuild_tree(entry["v"], entry["s"])
+                for entry in document["params"]
             ]
-            self._last_hidden = slots
-            self._hidden_shapes = [slot.shape for slot in slots]
-            restored_hidden = [Tensor(slot.tolist()) for slot in slots]
-        self._last_output = None
-        self._pending_backward = False
-        return restored_hidden
+            new_grads = [
+                Tensor(_rebuild_tree(entry["v"], entry["s"]))
+                for entry in document["grads"]
+            ]
+            if document["hidden"] is None:
+                new_hidden = None
+                new_hidden_shapes = None
+            else:
+                rebuilt_slots = [
+                    Tensor(_rebuild_tree(entry["v"], entry["s"]))
+                    for entry in document["hidden"]
+                ]
+                new_hidden = rebuilt_slots
+                new_hidden_shapes = [slot.shape for slot in rebuilt_slots]
+
+            for param, values in zip(params, new_values):
+                param._set_values(values)
+            for param, grad in zip(params, new_grads):
+                param.grad = grad
+            self._last_hidden = new_hidden
+            self._hidden_shapes = new_hidden_shapes
+            self._last_output = None
+            self._pending_backward = False
+            self._loaded_from_version = source_version
+            if new_hidden is None:
+                return None
+            return [Tensor(slot.tolist()) for slot in new_hidden]
 
     def _validate_against_model(self, document):
         if not isinstance(document, dict):
@@ -306,6 +364,10 @@ class Sequential:
                     f"checkpoint parameter {index} shape does not match the "
                     f"current model"
                 )
+            # Eagerly confirm the leaves agree with the declared shapes
+            # before any live state is touched.
+            _rebuild_tree(p_entry["v"], p_entry["s"])
+            _rebuild_tree(g_entry["v"], g_entry["s"])
 
         saved_layers = document.get("layers")
         if not isinstance(saved_layers, list) or len(saved_layers) != len(
@@ -341,11 +403,19 @@ class Sequential:
                 raise ValueError(
                     "checkpoint hidden slot count does not match the current model"
                 )
+            checkpoint_shapes = []
             for index, entry in enumerate(saved_hidden):
-                if not isinstance(entry, dict) or "s" not in entry:
+                if not isinstance(entry, dict) or "s" not in entry or "v" not in entry:
                     raise ValueError(f"checkpoint hidden slot {index} is malformed")
+                # Verify the slot concretely on the spot: a well-formed
+                # positive shape whose values conform. This runs even for a
+                # model that has never executed a forward and therefore has
+                # no recorded hidden shapes yet; the first load pins them.
+                rebuilt = _rebuild_tree(entry["v"], entry["s"])
+                slot_shape = Tensor(rebuilt).shape
+                checkpoint_shapes.append(slot_shape)
                 if self._hidden_shapes is not None and (
-                    entry["s"] != self._hidden_shapes[index]
+                    slot_shape != self._hidden_shapes[index]
                 ):
                     raise ValueError(
                         f"checkpoint hidden slot {index} shape does not match "

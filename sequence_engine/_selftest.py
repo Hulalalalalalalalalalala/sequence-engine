@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import math
 import struct
 import sys
+import threading
+import zlib
 
 from . import checkpoint as _checkpoint
+from . import _v1_golden
 from .sequential import Sequential
 from .tensor import Tensor
 
@@ -689,6 +693,406 @@ def _check_checkpoint_roundtrip():
     )
 
 
+# ---------------------------------------------------------------------------
+# Format v2, v1 migration, incremental chains, concurrency.
+# ---------------------------------------------------------------------------
+
+
+def _repack_full(raw, mutate, version=_checkpoint.FORMAT_VERSION):
+    hlen = struct.unpack("<Q", raw[12:20])[0]
+    header = json.loads(raw[20 : 20 + hlen])
+    payload = raw[20 + hlen : raw.rfind(_checkpoint.END_MAGIC)]
+    mutate(header)
+    new_header = json.dumps(
+        header, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    leaf_count = len(payload) // 9
+    body = (
+        raw[:8]
+        + struct.pack("<I", version)
+        + struct.pack("<Q", len(new_header))
+        + new_header
+        + payload
+    )
+    crc = zlib.crc32(body[20:])
+    return body + _checkpoint.END_MAGIC + struct.pack("<QI", leaf_count, crc)
+
+
+def _check_v2_version_and_v1_migration():
+    # Native saves carry format version 2.
+    seq, _ = _fresh_stack()
+    out, h1 = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out))
+    raw = bytearray()
+    seq.save(raw)
+    _check(
+        struct.unpack("<I", bytes(raw)[8:12])[0] == 2,
+        "new full checkpoints are format version 2",
+    )
+
+    # A genuine version-1 file loads, migrates and records source 1.
+    v1 = _v1_golden.trained_bytes()
+    _check(struct.unpack("<I", v1[8:12])[0] == 1, "golden fixture really is v1")
+    migrated, _ = _fresh_stack()
+    restored_hidden = migrated.load(bytes(v1))
+    _check(migrated.loaded_from_version == 1, "a v1 load records source version 1")
+    _check(
+        [s.tolist() for s in restored_hidden] == [s.tolist() for s in h1],
+        "v1 migration restores slice-boundary hidden state",
+    )
+    _check(
+        [p.tolist() for p in migrated.parameters()]
+        == [p.tolist() for p in seq.parameters()],
+        "v1 migration restores parameters exactly",
+    )
+
+    # Float fidelity incl. negative zero through v1 migration.
+    v1_tricky = _v1_golden.tricky_bytes()
+    tricky, _ = _fresh_stack()
+    tricky.load(bytes(v1_tricky))
+    values = tricky.parameters()[0].tolist()
+    grad_values = tricky.parameters()[0].grad.tolist()
+    _check(
+        values == [[1.5, -0.0, 3.25], [100000000000000.0, -2.5, 0.0625]],
+        "v1 tricky parameter values migrate",
+    )
+    _check(
+        struct.pack("<d", values[0][1]) == struct.pack("<d", -0.0)
+        and struct.pack("<d", grad_values[0][0]) == struct.pack("<d", -0.0),
+        "v1 migration keeps the negative-zero sign",
+    )
+
+    # A migrated state re-saves as native v2, source recorded as 2.
+    rebuf = bytearray()
+    migrated.save(rebuf)
+    _check(
+        struct.unpack("<I", bytes(rebuf)[8:12])[0] == 2,
+        "a migrated checkpoint re-saves natively as v2",
+    )
+    again, _ = _fresh_stack()
+    again.load(bytes(rebuf))
+    _check(again.loaded_from_version == 2, "a native v2 load records source version 2")
+
+    # Migration failure rejects the whole file and records no source.
+    torn = bytes(v1)[: len(v1) // 2]
+    victim, _ = _fresh_stack()
+    _expect(ValueError, lambda: victim.load(torn), "a torn v1 file is rejected")
+    _check(victim.loaded_from_version is None, "rejected migration records no version")
+
+    # A non-finite float smuggled into a v1 payload is refused mid-migration.
+    smuggled = bytearray(v1_tricky)
+    hlen = struct.unpack("<Q", bytes(smuggled)[12:20])[0]
+    end = bytes(smuggled).rfind(_checkpoint.END_MAGIC)
+    payload_start = 20 + hlen
+    payload = bytes(smuggled)[payload_start:end]
+    pos = next(i for i in range(0, len(payload), 9) if payload[i] == ord("f"))
+    smuggled[payload_start + pos + 1 : payload_start + pos + 9] = struct.pack(
+        "<d", float("inf")
+    )
+    crc = zlib.crc32(bytes(smuggled)[20:end])
+    smuggled[-4:] = struct.pack("<I", crc)
+    victim2, _ = _fresh_stack()
+    _expect(
+        ValueError,
+        lambda: victim2.load(bytes(smuggled)),
+        "a non-finite float in a v1 payload refuses migration",
+    )
+
+    # v2 header with a removed or added field is rejected wholesale.
+    victim3, _ = _fresh_stack()
+    _expect(
+        ValueError,
+        lambda: victim3.load(_repack_full(bytes(raw), lambda h: h.pop("layers"))),
+        "v2 checkpoint missing a field is rejected",
+    )
+    _expect(
+        ValueError,
+        lambda: _fresh_stack()[0].load(
+            _repack_full(bytes(raw), lambda h: h.update(surprise=1))
+        ),
+        "v2 checkpoint with an extra field is rejected",
+    )
+
+
+def _check_incremental_chain_in_memory():
+    # The whole chain mechanism runs against the in-memory store, so the
+    # built-in self-check writes no files.
+    seq, _ = _fresh_stack()
+    chain = _checkpoint.MemoryChain()
+    basis_full = bytearray()
+    seq.save(basis_full)
+    seq.save(chain)  # basis segment
+    _check(len(chain) == 1, "the first chain save writes one basis segment")
+
+    # Unchanged model: an empty, deterministic delta.
+    seq.save(chain)
+    seg1 = chain.read_segment(_checkpoint._segment_name(1))
+    _n, _hc, _p, items1 = _checkpoint._parse_delta(seg1, 1)
+    _check(items1 == [], "an unchanged save produces an empty delta")
+
+    # Train: the next delta introduces hidden state with all slots.
+    out, hidden = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out))
+    seq.save(chain)
+    seg2 = chain.read_segment(_checkpoint._segment_name(2))
+    _n2, hc2, _p2, items2 = _checkpoint._parse_delta(seg2, 2)
+    hidden_indices = {i for i, _s, _t in items2 if i >= 2 * len(seq.parameters())}
+    _check(
+        hidden_indices == set(range(2 * len(seq.parameters()), 2 * len(seq.parameters()) + 2)),
+        "the delta that first fixes hidden state carries every hidden slot",
+    )
+
+    # Update: parameters change, hidden does not.
+    seq.update(_LR)
+    full_after = bytearray()
+    seq.save(full_after)
+    seq.save(chain)  # no-op state already captured? update changed params -> delta
+
+    head_doc = _checkpoint.load_chain_memory(chain)
+    _check(
+        _checkpoint.build_bytes(head_doc) == bytes(full_after),
+        "reassembling the chain reproduces the full snapshot bit for bit",
+    )
+
+    basis_doc = _checkpoint.load_chain_memory(chain, up_to=0)
+    _check(
+        _checkpoint.build_bytes(basis_doc) == bytes(basis_full),
+        "reassembling up to the basis reproduces the original full snapshot",
+    )
+
+    # Loading the chain through Sequential gives the same state as a full load.
+    target, _ = _fresh_stack()
+    restored = target.load(chain)
+    _check(
+        [p.tolist() for p in target.parameters()]
+        == [p.tolist() for p in seq.parameters()],
+        "Sequential.load reassembles chain parameters",
+    )
+    _check(
+        [s.tolist() for s in restored] == [s.tolist() for s in hidden],
+        "Sequential.load reassembles chain hidden state",
+    )
+
+    # A truncated middle segment rejects the whole chain with ValueError.
+    good_seg2 = seg2
+    chain.write_segment(_checkpoint._segment_name(2), good_seg2[: len(good_seg2) // 2])
+    _expect(
+        ValueError,
+        lambda: _checkpoint.load_chain_memory(chain),
+        "a truncated delta segment rejects the whole chain",
+    )
+    chain.write_segment(_checkpoint._segment_name(2), good_seg2)
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+        == bytes(full_after),
+        "the chain recovers once the segment is whole again",
+    )
+
+    # A delta missing a required field is rejected.
+    raw = seg2
+    hlen = struct.unpack("<Q", raw[12:20])[0]
+    dheader = json.loads(raw[20 : 20 + hlen])
+    dpayload = raw[20 + hlen : raw.rfind(_checkpoint.DELTA_END_MAGIC)]
+    dheader.pop("changed")
+    new_header = json.dumps(dheader, separators=(",", ":")).encode("utf-8")
+    body = (
+        raw[:8]
+        + struct.pack("<I", 2)
+        + struct.pack("<Q", len(new_header))
+        + new_header
+        + dpayload
+    )
+    crc = zlib.crc32(body[20:])
+    forged = body + _checkpoint.DELTA_END_MAGIC + struct.pack(
+        "<QI", len(dpayload) // 9, crc
+    )
+    chain.write_segment(_checkpoint._segment_name(2), forged)
+    _expect(
+        ValueError,
+        lambda: _checkpoint.load_chain_memory(chain),
+        "a delta missing a field rejects the whole chain",
+    )
+
+
+class _IntLayer:
+    """Integer arithmetic layer; backward sets a constant integer gradient."""
+
+    checkpoint_kind = "_IntLayer"
+
+    def __init__(self, weights, grad_const):
+        self.w = Tensor(weights)
+        self._grad = list(grad_const)
+        self._cache = None
+
+    def parameters(self):
+        return [self.w]
+
+    def forward(self, x, hidden):
+        xs = x.tolist()
+        ws = self.w.tolist()
+        y = [[xs[r][j] + ws[j] for j in range(len(xs[0]))] for r in range(len(xs))]
+        self._cache = xs
+        return Tensor(y), Tensor(y)
+
+    def backward(self, upstream):
+        dy = (
+            upstream.tolist()
+            if isinstance(upstream, Tensor)
+            else [[upstream] * len(self._grad) for _ in self._cache]
+        )
+        self.w.grad = Tensor(list(self._grad))
+        return Tensor(dy)
+
+
+def _concurrency_model():
+    a = _IntLayer([100000, 200000], [3, 7])
+    b = _IntLayer([500000, 900000], [1, 2])
+    return Sequential([a, b]), a, b
+
+
+def _assert_single_step_count(probe, baseline, grads):
+    # Each element of a coherent state reads baseline[j] - k * g[j] for one
+    # shared non-negative integer k (lr=1, every update adds exactly one
+    # step); a half-updated tensor or a load applied halfway would leave
+    # different elements at different k. Values stay exact integers because
+    # the magnitudes here never lose integral precision in float64.
+    steps = None
+    for values, w0, g in zip(probe, baseline, grads):
+        for j, value in enumerate(values):
+            number = int(value)
+            delta = w0[j] - number
+            _check(delta % g[j] == 0, "concurrent weight left its update lattice")
+            k = delta // g[j]
+            _check(k >= 0, "an incoherent state produced a negative step count")
+            steps = k if steps is None else steps
+            _check(k == steps, "half-observed update/load mixed two serial states")
+
+
+def _check_concurrent_updates_saves_loads():
+    # Establish a constant gradient once (one clean segment), then enter the
+    # concurrent phase. The only mutating call raced thereafter is
+    # update(1): each applied step moves every parameter by exactly its
+    # constant gradient g, and an atomic load resets the whole state to the
+    # phase baseline. Under any thread interleaving a coherent state is
+    # therefore baseline - k*g for one shared k; save/load must never expose
+    # anything else.
+    seq, a, b = _concurrency_model()
+    seq.forward(Tensor([[1, 1]]))
+    seq.backward(1)
+    baseline = [p.tolist() for p in seq.parameters()]
+    grads = [a._grad, b._grad]
+    base_bytes = bytearray()
+    seq.save(base_bytes)
+    errors = []
+
+    def updater():
+        try:
+            for _ in range(300):
+                seq.update(1)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def buffer_roundtrip():
+        try:
+            for _ in range(300):
+                buf = bytearray()
+                seq.save(buf)
+                probe, _, _ = _concurrency_model()
+                probe.load(bytes(buf))
+                _assert_single_step_count(
+                    [p.tolist() for p in probe.parameters()], baseline, grads
+                )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def chain_roundtrip():
+        chain = _checkpoint.MemoryChain()
+        try:
+            for _ in range(300):
+                seq.save(chain)
+                probe, _, _ = _concurrency_model()
+                probe.load(chain)
+                _assert_single_step_count(
+                    [p.tolist() for p in probe.parameters()], baseline, grads
+                )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def loader_to_base():
+        try:
+            for _ in range(300):
+                seq.load(bytes(base_bytes))  # atomic reset to the baseline
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = (
+        [threading.Thread(target=updater) for _ in range(3)]
+        + [
+            threading.Thread(target=buffer_roundtrip),
+            threading.Thread(target=chain_roundtrip),
+            threading.Thread(target=loader_to_base),
+        ]
+    )
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    _check(errors == [], f"concurrent run raised: {errors!r}")
+    _assert_single_step_count(
+        [p.tolist() for p in seq.parameters()], baseline, grads
+    )
+
+
+def _check_boundary_save_and_eager_hidden_shapes():
+    # Save after a forward with no backward is allowed: it fixes the
+    # post-forward slice boundary, not the in-flight activations.
+    seq, _ = _fresh_stack()
+    out, hidden = seq.forward(Tensor(_SEG1))
+    buf = bytearray()
+    seq.save(buf)  # must not raise
+    victim, _ = _fresh_stack()
+    restored = victim.load(bytes(buf))
+    _check(
+        [s.tolist() for s in restored] == [s.tolist() for s in hidden],
+        "a post-forward (pre-backward) save fixes boundary hidden state",
+    )
+    # The saving model's still-pending backward is untouched.
+    seq.backward(_total(out))
+    _check(
+        all(p.grad is not None for p in seq.parameters()),
+        "saving does not consume the pending backward",
+    )
+
+    # A fresh model (never forwarded) checks hidden shapes on the spot:
+    # a checkpoint whose hidden slot declares a wrong shape is refused.
+    trained, _ = _fresh_stack()
+    o, _h = trained.forward(Tensor(_SEG1))
+    trained.backward(_total(o))
+    good = bytearray()
+    trained.save(good)
+    forged = _repack_full(bytes(good), lambda h: h["hidden"].__setitem__(0, [9, 9]))
+    brand_new, _ = _fresh_stack()
+    _expect(
+        ValueError,
+        lambda: brand_new.load(forged),
+        "a fresh model rejects a checkpoint with a wrong hidden shape",
+    )
+
+    # A valid checkpoint loaded into a fresh model pins the hidden shapes:
+    # a later forward carrying a wrongly-shaped slot is rejected.
+    pinned, _ = _fresh_stack()
+    pinned.load(bytes(good))
+    bad_hidden = [
+        Tensor([[0.0] * 5] * 2),  # layer 1 expects 3 hidden units
+        Tensor([[0.0] * 2] * 2),
+    ]
+    _expect(
+        ValueError,
+        lambda: pinned.forward(Tensor(_SEG1), bad_hidden),
+        "the first load pins hidden shapes used by later forwards",
+    )
+
+
 _GROUPS = [
     ("tensor basics", _check_tensor_basics),
     ("tensor validation", _check_tensor_validation),
@@ -702,6 +1106,10 @@ _GROUPS = [
     ("tuple loss and backward retry", _check_tuple_loss_and_retry),
     ("checkpoint bitwise continuity", _check_checkpoint_continuity),
     ("checkpoint round-trip and rejection", _check_checkpoint_roundtrip),
+    ("v2 format and v1 migration", _check_v2_version_and_v1_migration),
+    ("incremental checkpoint chain", _check_incremental_chain_in_memory),
+    ("concurrent update/save/load", _check_concurrent_updates_saves_loads),
+    ("boundary save and eager hidden shapes", _check_boundary_save_and_eager_hidden_shapes),
 ]
 
 

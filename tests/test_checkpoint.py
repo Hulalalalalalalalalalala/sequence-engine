@@ -479,14 +479,26 @@ class CheckpointRejectionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._load(forged)
 
-    def test_save_while_backward_pending_is_runtime_error(self):
+    def test_save_after_forward_without_backward_fixes_the_boundary(self):
+        # The post-forward state IS a slice boundary (the returned hidden
+        # state lives there), so saving is judged by the boundary, not by
+        # whether backward has run, and is now allowed.
         seq, _ = _stack()
-        seq.forward(Tensor(_SEG1))  # no backward yet
-        with self.assertRaises(RuntimeError):
-            seq.save(bytearray())
+        out, hidden = seq.forward(Tensor(_SEG1))  # no backward yet
+        buf = bytearray()
+        seq.save(buf)  # must not raise
+        self.assertTrue(len(bytes(buf)) > 0)
         with tempfile.TemporaryDirectory() as td:
-            with self.assertRaises(RuntimeError):
-                seq.save(os.path.join(td, "state.ckp"))
+            path = os.path.join(td, "state.ckp")
+            seq.save(path)
+            victim, _ = _stack()
+            restored = victim.load(path)
+        self.assertEqual(
+            [s.tolist() for s in restored], [s.tolist() for s in hidden]
+        )
+        # The still-pending backward of the saving model is unaffected.
+        seq.backward(_total(out))
+        self.assertTrue(all(p.grad is not None for p in seq.parameters()))
 
 
 class CheckpointValueGuardsTests(unittest.TestCase):
