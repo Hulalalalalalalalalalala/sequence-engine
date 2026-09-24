@@ -4,8 +4,11 @@ Public interface (see README.md):
 
 - ``Tensor(data)`` with ``tolist()`` and ``shape``.
 - ``Sequential(modules)`` with ``forward``, ``backward``, ``zero_grad``,
-  ``parameters``, ``update`` (one in-place gradient step), and ``save`` /
-  ``load`` (versioned atomic checkpoints to a path or a bytearray).
+  ``parameters``, ``update`` (one in-place gradient step), ``adam_step``
+  (one in-place Adam step with fixed coefficients), ``set_recompute``
+  (bounded-memory activation recomputation), and ``save`` / ``load``
+  (versioned atomic checkpoints to a path, a chain directory, a
+  ``MemoryChain`` or a bytearray).
 """
 
 from .checkpoint import MemoryChain

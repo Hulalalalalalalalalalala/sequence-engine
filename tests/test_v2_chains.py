@@ -77,13 +77,13 @@ class Version1CompatTests(unittest.TestCase):
         seq.backward(_total(out1))
         migrated, _ = _stack()
         migrated.load(_v1_trained())
-        # Re-save: migrated state is written out natively as version 2.
+        # Re-save: migrated state is written out natively as version 3.
         rebuf = bytearray()
         migrated.save(rebuf)
         self.assertEqual(struct.unpack("<I", rebuf[8:12])[0], cp.FORMAT_VERSION)
         again, _ = _stack()
         hidden2 = again.load(bytes(rebuf))
-        self.assertEqual(again.loaded_from_version, 2)
+        self.assertEqual(again.loaded_from_version, 3)
         self.assertEqual(
             [s.tolist() for s in hidden2], [s.tolist() for s in h1]
         )

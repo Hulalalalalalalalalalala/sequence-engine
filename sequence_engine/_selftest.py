@@ -11,7 +11,7 @@ import zlib
 
 from . import checkpoint as _checkpoint
 from . import _v1_golden
-from .sequential import Sequential
+from .sequential import Sequential, _zeros
 from .tensor import Tensor
 
 
@@ -718,16 +718,48 @@ def _repack_full(raw, mutate, version=_checkpoint.FORMAT_VERSION):
     return body + _checkpoint.END_MAGIC + struct.pack("<QI", leaf_count, crc)
 
 
-def _check_v2_version_and_v1_migration():
-    # Native saves carry format version 2.
+def _downgrade_full_to_v2(raw):
+    """Rewrite current-version snapshot bytes as a genuine version-2 file.
+
+    The optimizer state (first/second moments) is the last block of
+    payload leaves, so dropping that block plus the header field yields a
+    faithful old-format file for the migration checks.
+    """
+    hlen = struct.unpack("<Q", raw[12:20])[0]
+    header = json.loads(raw[20 : 20 + hlen])
+    end = raw.rfind(_checkpoint.END_MAGIC)
+    payload = raw[20 + hlen : end]
+    param_leaves = sum(
+        math.prod(shape) for shape in header["params"]
+    )
+    payload_v2 = payload[: -(2 * param_leaves * 9)]
+    header.pop("optim")
+    header["v"] = 2
+    new_header = json.dumps(
+        header, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    leaf_count = len(payload_v2) // 9
+    body = (
+        raw[:8]
+        + struct.pack("<I", 2)
+        + struct.pack("<Q", len(new_header))
+        + new_header
+        + payload_v2
+    )
+    crc = zlib.crc32(body[20:])
+    return body + _checkpoint.END_MAGIC + struct.pack("<QI", leaf_count, crc)
+
+
+def _check_v3_version_and_v1_v2_migration():
+    # Native saves carry format version 3.
     seq, _ = _fresh_stack()
     out, h1 = seq.forward(Tensor(_SEG1))
     seq.backward(_total(out))
     raw = bytearray()
     seq.save(raw)
     _check(
-        struct.unpack("<I", bytes(raw)[8:12])[0] == 2,
-        "new full checkpoints are format version 2",
+        struct.unpack("<I", bytes(raw)[8:12])[0] == 3,
+        "new full checkpoints are format version 3",
     )
 
     # A genuine version-1 file loads, migrates and records source 1.
@@ -736,14 +768,24 @@ def _check_v2_version_and_v1_migration():
     migrated, _ = _fresh_stack()
     restored_hidden = migrated.load(bytes(v1))
     _check(migrated.loaded_from_version == 1, "a v1 load records source version 1")
+    # The hidden-state check is aligned to the migrated values themselves:
+    # the migrated document's hidden slots are exactly what load returns.
+    migrated_doc = _checkpoint.parse_bytes(bytes(v1))
     _check(
-        [s.tolist() for s in restored_hidden] == [s.tolist() for s in h1],
+        [s.tolist() for s in restored_hidden]
+        == [entry["v"] for entry in migrated_doc["hidden"]],
         "v1 migration restores slice-boundary hidden state",
     )
     _check(
         [p.tolist() for p in migrated.parameters()]
         == [p.tolist() for p in seq.parameters()],
         "v1 migration restores parameters exactly",
+    )
+    _check(migrated._adam_t == 0, "v1 migration starts the optimizer at t=0")
+    _check(
+        all(value == 0 for tree in migrated._adam_m for value in _flatten(tree))
+        and all(value == 0 for tree in migrated._adam_v for value in _flatten(tree)),
+        "v1 migration starts the optimizer moments at zero",
     )
 
     # Float fidelity incl. negative zero through v1 migration.
@@ -762,16 +804,31 @@ def _check_v2_version_and_v1_migration():
         "v1 migration keeps the negative-zero sign",
     )
 
-    # A migrated state re-saves as native v2, source recorded as 2.
+    # A genuine version-2 file (no optimizer state) migrates to t=0, zero
+    # moments, and re-saves natively as version 3.
+    v2 = _downgrade_full_to_v2(bytes(raw))
+    _check(struct.unpack("<I", v2[8:12])[0] == 2, "downgraded fixture really is v2")
+    from_v2, _ = _fresh_stack()
+    from_v2.load(bytes(v2))
+    _check(from_v2.loaded_from_version == 2, "a v2 load records source version 2")
+    _check(from_v2._adam_t == 0, "v2 migration starts the optimizer at t=0")
     rebuf = bytearray()
-    migrated.save(rebuf)
+    from_v2.save(rebuf)
     _check(
-        struct.unpack("<I", bytes(rebuf)[8:12])[0] == 2,
-        "a migrated checkpoint re-saves natively as v2",
+        struct.unpack("<I", bytes(rebuf)[8:12])[0] == 3,
+        "a migrated checkpoint re-saves natively as v3",
     )
     again, _ = _fresh_stack()
     again.load(bytes(rebuf))
-    _check(again.loaded_from_version == 2, "a native v2 load records source version 2")
+    _check(again.loaded_from_version == 3, "a native v3 load records source version 3")
+
+    # A migrated v1 state re-saves natively as v3 too.
+    rebuf_v1 = bytearray()
+    migrated.save(rebuf_v1)
+    _check(
+        struct.unpack("<I", bytes(rebuf_v1)[8:12])[0] == 3,
+        "a migrated v1 checkpoint re-saves natively as v3",
+    )
 
     # Migration failure rejects the whole file and records no source.
     torn = bytes(v1)[: len(v1) // 2]
@@ -798,19 +855,24 @@ def _check_v2_version_and_v1_migration():
         "a non-finite float in a v1 payload refuses migration",
     )
 
-    # v2 header with a removed or added field is rejected wholesale.
+    # v3 header with a removed or added field is rejected wholesale.
     victim3, _ = _fresh_stack()
     _expect(
         ValueError,
         lambda: victim3.load(_repack_full(bytes(raw), lambda h: h.pop("layers"))),
-        "v2 checkpoint missing a field is rejected",
+        "v3 checkpoint missing a field is rejected",
+    )
+    _expect(
+        ValueError,
+        lambda: victim3.load(_repack_full(bytes(raw), lambda h: h.pop("optim"))),
+        "v3 checkpoint missing the optimizer state is rejected",
     )
     _expect(
         ValueError,
         lambda: _fresh_stack()[0].load(
             _repack_full(bytes(raw), lambda h: h.update(surprise=1))
         ),
-        "v2 checkpoint with an extra field is rejected",
+        "v3 checkpoint with an extra field is rejected",
     )
 
 
@@ -836,9 +898,11 @@ def _check_incremental_chain_in_memory():
     seq.save(chain)
     seg2 = chain.read_segment(_checkpoint._segment_name(2))
     _n2, hc2, _p2, items2 = _checkpoint._parse_delta(seg2, 2)
-    hidden_indices = {i for i, _s, _t in items2 if i >= 2 * len(seq.parameters())}
+    param_count = len(seq.parameters())
+    hidden_base = 4 * param_count + 1
+    hidden_indices = {i for i, _s, _t in items2 if i >= hidden_base}
     _check(
-        hidden_indices == set(range(2 * len(seq.parameters()), 2 * len(seq.parameters()) + 2)),
+        hidden_indices == set(range(hidden_base, hidden_base + 2)),
         "the delta that first fixes hidden state carries every hidden slot",
     )
 
@@ -846,12 +910,25 @@ def _check_incremental_chain_in_memory():
     seq.update(_LR)
     full_after = bytearray()
     seq.save(full_after)
-    seq.save(chain)  # no-op state already captured? update changed params -> delta
+    seq.save(chain)  # update changed params -> delta
 
     head_doc = _checkpoint.load_chain_memory(chain)
     _check(
         _checkpoint.build_bytes(head_doc) == bytes(full_after),
         "reassembling the chain reproduces the full snapshot bit for bit",
+    )
+
+    # Adam steps touch the optimizer tensors too: the chain still
+    # reassembles to exactly the full snapshot.
+    seq.adam_step(_LR)
+    seq.adam_step(_LR)
+    full_adam = bytearray()
+    seq.save(full_adam)
+    seq.save(chain)
+    head_doc = _checkpoint.load_chain_memory(chain)
+    _check(
+        _checkpoint.build_bytes(head_doc) == bytes(full_adam),
+        "the chain reproduces a full snapshot with optimizer state bit for bit",
     )
 
     basis_doc = _checkpoint.load_chain_memory(chain, up_to=0)
@@ -884,7 +961,7 @@ def _check_incremental_chain_in_memory():
     chain.write_segment(_checkpoint._segment_name(2), good_seg2)
     _check(
         _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
-        == bytes(full_after),
+        == bytes(full_adam),
         "the chain recovers once the segment is whole again",
     )
 
@@ -1093,6 +1170,542 @@ def _check_boundary_save_and_eager_hidden_shapes():
     )
 
 
+# ---------------------------------------------------------------------------
+# Adam steps, bounded-memory recompute, version-3 optimizer state.
+# ---------------------------------------------------------------------------
+
+_ADAM_LR = 0.05
+
+
+def _reference_adam_step(theta, grads, m, v, t, lr):
+    beta1, beta2, eps = 0.9, 0.999, 1e-8
+
+    def rec(theta, grads, m, v):
+        if isinstance(theta, list):
+            return [
+                rec(a, b, c, d)
+                for a, b, c, d in zip(theta, grads, m, v)
+            ]
+        m_next = 0.9 * m + 0.1 * grads
+        v_next = 0.999 * v + 0.001 * (grads * grads)
+        m_hat = m_next / (1.0 - beta1**t)
+        v_hat = v_next / (1.0 - beta2**t)
+        return theta - lr * m_hat / (math.sqrt(v_hat) + eps)
+
+    def moments(grads, m, v, which):
+        if isinstance(grads, list):
+            return [
+                moments(a, b, c, which) for a, b, c in zip(grads, m, v)
+            ]
+        if which == "m":
+            return 0.9 * m + 0.1 * grads
+        return 0.999 * v + 0.001 * (grads * grads)
+
+    return (
+        rec(theta, grads, m, v),
+        moments(grads, m, v, "m"),
+        moments(grads, m, v, "v"),
+    )
+
+
+def _check_adam_step():
+    seq, _ = _fresh_stack()
+    _check(seq._adam_t == 0, "optimizer starts at t=0")
+    out, _ = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out))
+    before = [p.tolist() for p in seq.parameters()]
+    grads = [p.grad.tolist() for p in seq.parameters()]
+
+    m0 = [_zeros(p.shape) for p in seq.parameters()]
+    v0 = m0
+    expected_theta, expected_m, expected_v = [], [], []
+    for theta, grad, m, v in zip(before, grads, m0, v0):
+        nt, nm, nv = _reference_adam_step(theta, grad, m, v, 1, _ADAM_LR)
+        expected_theta.append(nt)
+        expected_m.append(nm)
+        expected_v.append(nv)
+    seq.adam_step(_ADAM_LR)
+    _check(seq._adam_t == 1, "the first adam_step sets t=1")
+    _check(
+        [p.tolist() for p in seq.parameters()] == expected_theta,
+        "adam_step applies the bias-corrected update exactly",
+    )
+    _check(seq._adam_m == expected_m and seq._adam_v == expected_v,
+           "adam_step keeps the updated first/second moments")
+    _check(
+        [p.grad.tolist() for p in seq.parameters()] == grads,
+        "adam_step does not clear accumulated gradients",
+    )
+
+    # A second step uses t=2 and the carried moments.
+    expected_theta2, expected_m2, expected_v2 = [], [], []
+    for index, param in enumerate(seq.parameters()):
+        nt, nm, nv = _reference_adam_step(
+            param.tolist(), grads[index], seq._adam_m[index],
+            seq._adam_v[index], 2, _ADAM_LR,
+        )
+        expected_theta2.append(nt)
+        expected_m2.append(nm)
+        expected_v2.append(nv)
+    seq.adam_step(_ADAM_LR)
+    _check(seq._adam_t == 2, "the second adam_step sets t=2")
+    _check(
+        [p.tolist() for p in seq.parameters()] == expected_theta2,
+        "the second adam_step continues from the carried moments",
+    )
+    _check(seq._adam_m == expected_m2 and seq._adam_v == expected_v2,
+           "the carried moments match the reference")
+
+    # Validation mirrors update(): non-numeric/non-finite lr is ValueError.
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        _expect(ValueError, lambda bad=bad: seq.adam_step(bad),
+                "non-finite adam learning rate")
+    _expect(ValueError, lambda: seq.adam_step("0.05"),
+            "non-numeric adam learning rate")
+    _check(seq._adam_t == 2, "a rejected adam_step advances no step")
+
+    # update() and adam_step() are independent: a plain update changes
+    # neither the moments nor t.
+    untouched_m = _copy_nested(seq._adam_m)
+    untouched_v = _copy_nested(seq._adam_v)
+    seq.update(_LR)
+    _check(seq._adam_t == 2, "update() leaves the adam step count alone")
+    _check(seq._adam_m == untouched_m and seq._adam_v == untouched_v,
+           "update() leaves the adam moments alone")
+
+    # Parameters without a gradient are left as-is, but t still advances.
+    quiet, _ = _fresh_stack()
+    quiet_t0 = [p.tolist() for p in quiet.parameters()]
+    quiet.adam_step(_ADAM_LR)
+    _check(
+        [p.tolist() for p in quiet.parameters()] == quiet_t0,
+        "adam_step leaves parameters without gradients untouched",
+    )
+    _check(quiet._adam_t == 1, "adam_step still advances t without gradients")
+
+
+def _copy_nested(value):
+    if isinstance(value, list):
+        return [_copy_nested(item) for item in value]
+    return value
+
+
+def _adam_run(interrupt_target=None):
+    """Three segments, Adam between segments two and three, optional resume."""
+    seq, _ = _fresh_stack()
+    out1, hidden1 = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out1))
+    if interrupt_target is not None:
+        seq.save(interrupt_target)
+        seq, _ = _fresh_stack()
+        hidden1 = seq.load(interrupt_target)
+    out2, hidden2 = seq.forward(Tensor(_SEG2), hidden1)
+    seq.backward(_total(out2))
+    seq.adam_step(_ADAM_LR)
+    if interrupt_target is not None:
+        seq.save(interrupt_target)
+        restored_hidden = [Tensor(slot.tolist()) for slot in hidden2]
+        seq, _ = _fresh_stack()
+        hidden2 = seq.load(interrupt_target)
+        _check(
+            [s.tolist() for s in hidden2]
+            == [s.tolist() for s in restored_hidden],
+            "resumed optimizer state keeps the boundary hidden state",
+        )
+        _check(seq._adam_t == 1, "resumed optimizer state keeps t=1")
+    carry = [Tensor(slot.tolist()) for slot in hidden2]
+    out3, _ = seq.forward(Tensor(_SEG3), carry)
+    seq.backward(_total(out3))
+    seq.adam_step(_ADAM_LR)
+    return (
+        [p.tolist() for p in seq.parameters()],
+        [p.grad.tolist() for p in seq.parameters()],
+        seq._adam_t,
+    )
+
+
+def _check_adam_checkpoint_continuity():
+    uninterrupted = _adam_run()
+    resumed_buffer = _adam_run(bytearray())
+    _check(
+        resumed_buffer == uninterrupted,
+        "save/load resume of adam steps matches the uninterrupted run bit "
+        "for bit (parameters, gradients, step count)",
+    )
+    chain = _checkpoint.MemoryChain()
+    resumed_chain = _adam_run(chain)
+    _check(
+        resumed_chain == uninterrupted,
+        "an incremental-chain resume matches the uninterrupted adam run",
+    )
+    # The reassembled chain equals the full snapshot at the same moment.
+    seq, _ = _fresh_stack()
+    o, _ = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(o))
+    seq.adam_step(_ADAM_LR)
+    full = bytearray()
+    seq.save(full)
+    other_chain = _checkpoint.MemoryChain()
+    seq.save(other_chain)
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(other_chain))
+        == bytes(full),
+        "optimizer state travels the incremental chain bit for bit",
+    )
+
+
+def _check_optim_state_guards():
+    # An oversized step count can never enter a checkpoint.
+    seq, _ = _fresh_stack()
+    seq.zero_grad()
+    doc = {
+        "params": [{"s": p.shape, "v": p.tolist()} for p in seq.parameters()],
+        "grads": [
+            {"s": p.shape, "v": p.grad.tolist()} for p in seq.parameters()
+        ],
+        "hidden": None,
+        "optim": {
+            "t": 2**63,
+            "m": [{"s": p.shape, "v": p.grad.tolist()} for p in seq.parameters()],
+            "v": [{"s": p.shape, "v": p.grad.tolist()} for p in seq.parameters()],
+        },
+        "layers": [
+            {"kind": "_RNNStep",
+             "shapes": [[2, 3], [3, 3], [3]]},
+            {"kind": "_RNNStep",
+             "shapes": [[3, 2], [2, 2], [2]]},
+        ],
+        "pending": False,
+    }
+    _expect(ValueError, lambda: _checkpoint.build_bytes(doc),
+            "oversized optimizer step count rejected on save")
+
+    # A non-finite moment is rejected on save too.
+    doc["optim"]["t"] = 1
+    bad_m = doc["optim"]["m"][0]["v"]
+    bad_m[0][0] = float("inf")
+    _expect(ValueError, lambda: _checkpoint.build_bytes(doc),
+            "non-finite optimizer moment rejected on save")
+
+    # A v3 payload missing the optimizer state, or with a bad moment shape,
+    # is rejected wholesale and leaves the container untouched.
+    trained, _ = _fresh_stack()
+    o, _ = trained.forward(Tensor(_SEG1))
+    trained.backward(_total(o))
+    trained.adam_step(_ADAM_LR)
+    raw = bytearray()
+    trained.save(raw)
+    victim, _ = _fresh_stack()
+    _expect(
+        ValueError,
+        lambda: victim.load(
+            _repack_full(bytes(raw), lambda h: h.pop("optim"))
+        ),
+        "a v3 checkpoint missing optimizer state is refused",
+    )
+    _check(victim._adam_t == 0, "a rejected load leaves the optimizer untouched")
+
+    raw2 = bytearray()
+    trained.save(raw2)
+
+    def mangle_moment_shape(header):
+        header["optim"]["m"][0] = [9, 9]
+
+    victim2, _ = _fresh_stack()
+    _expect(
+        ValueError,
+        lambda: victim2.load(
+            _repack_full(bytes(raw2), mangle_moment_shape)
+        ),
+        "a checkpoint with a wrong optimizer moment shape is refused",
+    )
+
+
+def _segment_stack(recompute):
+    seq, _ = _fresh_stack()
+    seq.set_recompute(recompute)
+    return seq
+
+
+def _check_recompute_equivalence():
+    _check_three_segment_modes(False, False)
+    _check_three_segment_modes(True, True)
+    _check_three_segment_modes(False, True)
+    _check_three_segment_modes(True, False)
+
+
+def _check_three_segment_modes(first_mode, second_mode):
+    plain = _segment_stack(False)
+    tuned = _segment_stack(False)
+    tuned.set_recompute(first_mode)
+    o1p, h1p = plain.forward(Tensor(_SEG1))
+    o1t, h1t = tuned.forward(Tensor(_SEG1))
+    _check(o1t.tolist() == o1p.tolist(),
+           "recompute forward outputs are bitwise identical")
+    plain.backward(_total(o1p))
+    tuned.backward(_total(o1t))
+    _check(
+        [p.grad.tolist() for p in tuned.parameters()]
+        == [p.grad.tolist() for p in plain.parameters()],
+        "recompute parameter gradients are bitwise identical",
+    )
+    # Switching between segments is allowed and changes nothing numerically.
+    tuned.set_recompute(second_mode)
+    o2p, h2p = plain.forward(Tensor(_SEG2), h1p)
+    o2t, h2t = tuned.forward(Tensor(_SEG2), h1t)
+    _check(o2t.tolist() == o2p.tolist(),
+           "recompute stays identical after a between-segment switch")
+    plain.backward(_total(o2p))
+    tuned.backward(_total(o2t))
+    _check(
+        [p.grad.tolist() for p in tuned.parameters()]
+        == [p.grad.tolist() for p in plain.parameters()],
+        "gradients stay identical after a between-segment switch",
+    )
+    plain.adam_step(_ADAM_LR)
+    tuned.adam_step(_ADAM_LR)
+    _check(
+        [p.tolist() for p in tuned.parameters()]
+        == [p.tolist() for p in plain.parameters()],
+        "the parameter trajectory under adam is identical in both modes",
+    )
+
+
+def _check_recompute_bounded_memory_and_guards():
+    seq, layers = _fresh_stack()
+    seq.set_recompute(True)
+    out, _ = seq.forward(Tensor(_SEG1))
+    # Only anchors are retained: the segment input and the incoming hidden
+    # values (here null), independent of how many segments came before.
+    batch_values, hidden_values = seq._anchors
+    _check(batch_values == _SEG1, "recompute anchors keep the segment input")
+    _check(hidden_values == [None, None],
+            "recompute anchors keep just the incoming hidden values")
+    # Layers are free to drop their own caches entirely: backward recomputes.
+    for layer in layers:
+        layer._cache = None
+    ref, _ = _fresh_stack()
+    ref_out, _ = ref.forward(Tensor(_SEG1))
+    ref.backward(_total(ref_out))
+    seq.backward(_total(out))
+    _check(
+        [p.grad.tolist() for p in seq.parameters()]
+        == [p.grad.tolist() for p in ref.parameters()],
+        "backward with evicted layer caches still matches the ordinary run",
+    )
+    _check(seq._anchors is None, "anchors are released once backward completes")
+
+    # A parameter rewritten mid-segment is rejected before any gradient
+    # lands, and leaves no half-applied state.
+    victim, _ = _fresh_stack()
+    victim.set_recompute(True)
+    bad_out, _ = victim.forward(Tensor(_SEG1))
+    target = victim.parameters()[0]
+    rewritten = target.tolist()
+    rewritten[0][1] += 1.0
+    target._set_values(rewritten)
+    _expect(
+        RuntimeError, lambda: victim.backward(_total(bad_out)),
+        "a parameter rewritten during a segment raises RuntimeError",
+    )
+    _check(
+        all(p.grad is None for p in victim.parameters()),
+        "the rejected recompute leaves no partial gradients",
+    )
+    # The failed backward consumes nothing: a fresh segment works normally.
+    recover_out, _ = victim.forward(Tensor(_SEG1))
+    victim.backward(_total(recover_out))
+    _check(
+        all(p.grad is not None for p in victim.parameters()),
+        "the container trains normally after rejecting a stale segment",
+    )
+
+    # The switch cannot move in the middle of a pending segment.
+    toggled, _ = _fresh_stack()
+    toggled.set_recompute(True)
+    toggled.forward(Tensor(_SEG1))
+    _expect(
+        RuntimeError, lambda: toggled.set_recompute(False),
+        "turning recompute off mid-segment raises RuntimeError",
+    )
+    ordinary, _ = _fresh_stack()
+    ordinary.forward(Tensor(_SEG1))
+    _expect(
+        RuntimeError, lambda: ordinary.set_recompute(True),
+        "turning recompute on mid-segment raises RuntimeError",
+    )
+
+    # A long run's retained state never grows with the total length: after
+    # every backward the only kept state is the boundary hidden tensors.
+    long_run, _ = _fresh_stack()
+    long_run.set_recompute(True)
+    hidden = None
+    for segment in (_SEG1, _SEG2, _SEG3, _SEG1, _SEG2):
+        out, hidden = long_run.forward(Tensor(segment), hidden)
+        long_run.backward(_total(out))
+        _check(long_run._anchors is None,
+                "no anchors survive between segments")
+        _check(len(hidden) == 2, "only the boundary hidden state is carried")
+
+
+def _check_v2_chain_migration():
+    # Assemble a genuine version-2 chain (basis + empty delta + the delta
+    # that first introduces hidden state) entirely in memory.
+    seq, _ = _fresh_stack()
+    basis_raw = bytearray()
+    seq.save(basis_raw)
+    basis_v2 = _downgrade_full_to_v2(bytes(basis_raw))
+
+    param_count = len(seq.parameters())
+
+    def v2_delta_frame(number, hc, changed_entries):
+        payload = []
+        header_entries = []
+        for index, shape, tree in changed_entries:
+            _checkpoint._freeze_tree(tree, shape, payload)
+            header_entries.append({"i": index, "s": shape})
+        header = {
+            "v": 2,
+            "b": _checkpoint._segment_name(0),
+            "n": number,
+            "hc": hc,
+            "changed": header_entries,
+            "pending": False,
+        }
+        return _checkpoint._frame(
+            _checkpoint.DELTA_MAGIC, _checkpoint.DELTA_END_MAGIC, header, payload
+        )
+
+    chain = _checkpoint.MemoryChain()
+    chain.write_segment(_checkpoint._segment_name(0), basis_v2)
+    chain.write_head(b"0")
+    chain.write_segment(
+        _checkpoint._segment_name(1), v2_delta_frame(1, None, [])
+    )
+    chain.write_head(b"1")
+
+    out, hidden = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out))
+    hidden_entries = [
+        (2 * param_count + slot, slot_tensor.shape, slot_tensor.tolist())
+        for slot, slot_tensor in enumerate(hidden)
+    ]
+    chain.write_segment(
+        _checkpoint._segment_name(2), v2_delta_frame(2, 2, hidden_entries)
+    )
+    chain.write_head(b"2")
+
+    # Reassembling the old chain yields the migrated state: optimizer at
+    # t=0 with zero moments, hidden slots exactly as written.
+    doc = _checkpoint.load_chain_memory(chain)
+    _check(doc["optim"]["t"] == 0, "a v2 chain migrates to t=0")
+    _check(
+        all(value == 0.0 for entry in doc["optim"]["m"]
+            for value in _flatten(entry["v"])),
+        "a v2 chain migrates to zero first moments",
+    )
+    _check(
+        [entry["v"] for entry in doc["hidden"]]
+        == [slot.tolist() for slot in hidden],
+        "a v2 chain reassembles its hidden slots correctly",
+    )
+
+    victim, _ = _fresh_stack()
+    restored = victim.load(chain)
+    _check(victim.loaded_from_version == 3,
+           "a loaded chain always reports the current document version")
+    _check(
+        [s.tolist() for s in restored] == [s.tolist() for s in hidden],
+        "Sequential.load reassembles a v2 chain's hidden state",
+    )
+    _check(victim._adam_t == 0, "a v2 chain starts the optimizer at t=0")
+
+    # Re-saving the migrated chain appends native v3 deltas; the head must
+    # still reassemble to the full snapshot exactly.
+    victim.adam_step(_ADAM_LR)
+    full = bytearray()
+    victim.save(full)
+    victim.save(chain)
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+        == bytes(full),
+        "a migrated v2 chain continues with v3 deltas bit for bit",
+    )
+
+
+def _check_concurrent_adam_saves_loads():
+    seq, _ = _fresh_stack()
+    seq.forward(Tensor(_SEG1))
+    seq.backward(1.0)
+    base = bytearray()
+    seq.save(base)
+    errors = []
+
+    def stepper():
+        try:
+            for _ in range(200):
+                seq.adam_step(_ADAM_LR)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def probe_state(model):
+        _check(model._adam_t >= 0, "a loaded checkpoint carries a valid step count")
+        for param, m, v in zip(
+            model.parameters(), model._adam_m, model._adam_v
+        ):
+            for tree in (param.tolist(), m, v, param.grad.tolist()):
+                for value in _flatten(tree):
+                    _check(
+                        isinstance(value, (int, float))
+                        and value == value
+                        and value not in (float("inf"), float("-inf")),
+                        "a concurrently saved checkpoint is fully finite",
+                    )
+
+    def buffer_roundtrip():
+        try:
+            for _ in range(200):
+                buf = bytearray()
+                seq.save(buf)
+                probe, _ = _fresh_stack()
+                probe.load(bytes(buf))
+                probe_state(probe)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def chain_roundtrip():
+        chain = _checkpoint.MemoryChain()
+        try:
+            for _ in range(200):
+                seq.save(chain)
+                probe, _ = _fresh_stack()
+                probe.load(chain)
+                probe_state(probe)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def loader_to_base():
+        try:
+            for _ in range(200):
+                seq.load(bytes(base))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = (
+        [threading.Thread(target=stepper) for _ in range(3)]
+        + [
+            threading.Thread(target=buffer_roundtrip),
+            threading.Thread(target=chain_roundtrip),
+            threading.Thread(target=loader_to_base),
+        ]
+    )
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    _check(errors == [], f"concurrent adam run raised: {errors!r}")
+
+
 _GROUPS = [
     ("tensor basics", _check_tensor_basics),
     ("tensor validation", _check_tensor_validation),
@@ -1103,12 +1716,19 @@ _GROUPS = [
     ("truncated backpropagation", _check_truncation),
     ("zero_grad and parameters", _check_zero_grad_and_parameters),
     ("one-step update", _check_update_step),
+    ("adam step", _check_adam_step),
     ("tuple loss and backward retry", _check_tuple_loss_and_retry),
     ("checkpoint bitwise continuity", _check_checkpoint_continuity),
     ("checkpoint round-trip and rejection", _check_checkpoint_roundtrip),
-    ("v2 format and v1 migration", _check_v2_version_and_v1_migration),
+    ("v3 format and v1/v2 migration", _check_v3_version_and_v1_v2_migration),
     ("incremental checkpoint chain", _check_incremental_chain_in_memory),
+    ("v2 incremental chain migration", _check_v2_chain_migration),
+    ("optimizer-state checkpoint guards", _check_optim_state_guards),
+    ("adam checkpoint continuity", _check_adam_checkpoint_continuity),
+    ("recompute mode equivalence", _check_recompute_equivalence),
+    ("recompute bounded memory and guards", _check_recompute_bounded_memory_and_guards),
     ("concurrent update/save/load", _check_concurrent_updates_saves_loads),
+    ("concurrent adam/save/load", _check_concurrent_adam_saves_loads),
     ("boundary save and eager hidden shapes", _check_boundary_save_and_eager_hidden_shapes),
 ]
 

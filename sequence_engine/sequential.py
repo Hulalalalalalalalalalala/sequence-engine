@@ -2,18 +2,78 @@
 
 from __future__ import annotations
 
+import hashlib
+import math
+import struct
 import threading
 
 from . import checkpoint as _checkpoint
 from .tensor import Tensor
+from .tensor import _deep_copy as _copy_tree
 
 _REQUIRED_CAPABILITIES = ("forward", "backward", "parameters")
+
+# Adam coefficients are fixed by the engine; callers only choose the rate.
+_ADAM_BETA1 = 0.9
+_ADAM_BETA2 = 0.999
+_ADAM_EPSILON = 1e-8
 
 
 def _zeros(shape):
     if not shape:
         return 0.0
     return [_zeros(shape[1:]) for _ in range(shape[0])]
+
+
+def _parameters_fingerprint(params):
+    """A deterministic bitwise fingerprint of every parameter's values."""
+    digest = hashlib.sha256()
+    for param in params:
+        for dim in param.shape:
+            digest.update(struct.pack("<q", dim))
+        _fingerprint_tree(param._values(), digest)
+    return digest.digest()
+
+
+def _fingerprint_tree(value, digest):
+    if isinstance(value, list):
+        digest.update(b"[")
+        for item in value:
+            _fingerprint_tree(item, digest)
+        digest.update(b"]")
+    elif isinstance(value, bool):
+        digest.update(b"?")
+    elif isinstance(value, int):
+        digest.update(b"i")
+        digest.update(str(value).encode("ascii"))
+        digest.update(b";")
+    else:
+        digest.update(b"f")
+        digest.update(struct.pack("<d", value))
+
+
+def _adam_update_trees(theta, m, v, grad, lr, m_correction, v_correction):
+    """One Adam step on matching trees; returns ``(theta, m, v)`` updated.
+
+    The arithmetic order is fixed -- m and v first, then the bias
+    corrections, then the parameter -- so a resumed run is bitwise
+    identical to an uninterrupted one.
+    """
+    if isinstance(theta, list):
+        new_theta, new_m, new_v = [], [], []
+        for t_item, m_item, v_item, g_item in zip(theta, m, v, grad):
+            nt, nm, nv = _adam_update_trees(
+                t_item, m_item, v_item, g_item, lr, m_correction, v_correction
+            )
+            new_theta.append(nt)
+            new_m.append(nm)
+            new_v.append(nv)
+        return new_theta, new_m, new_v
+    m_next = _ADAM_BETA1 * m + 0.1 * grad
+    v_next = _ADAM_BETA2 * v + 0.001 * (grad * grad)
+    m_hat = m_next / m_correction
+    v_hat = v_next / v_correction
+    return theta - lr * m_hat / (math.sqrt(v_hat) + _ADAM_EPSILON), m_next, v_next
 
 
 def _layer_kind(module):
@@ -48,10 +108,16 @@ class Sequential:
     * ``update(learning_rate)`` -- one in-place gradient step
       ``theta <- theta - lr * grad`` on every parameter; gradients are
       not cleared (``zero_grad`` still does that).
+    * ``adam_step(learning_rate)`` -- one in-place Adam step with the
+      engine's fixed coefficients; the first/second moments and the step
+      count ride along in every checkpoint.
+    * ``set_recompute(enabled)`` -- bounded-memory mode: a segment keeps
+      only its boundary hidden state plus a few anchors, and the backward
+      pass recomputes the activations from them.
     * ``save(target)`` / ``load(source)`` -- atomic, versioned snapshots of
-      parameters, accumulated gradients and slice-boundary hidden state,
-      to a filesystem path, an incremental-chain directory or to an
-      in-memory ``bytearray``.
+      parameters, accumulated gradients, optimizer state and
+      slice-boundary hidden state, to a filesystem path, an
+      incremental-chain directory or to an in-memory ``bytearray``.
 
     All public operations are serialised by one re-entrant lock, so
     several threads may interleave ``forward``, ``backward``, ``update``,
@@ -89,6 +155,18 @@ class Sequential:
         self._hidden_shapes = None
         self._last_output = None
         self._last_hidden = None
+        # Recompute mode: the configured switch plus the per-segment latch
+        # with its anchors (segment input + incoming hidden values) and the
+        # parameter fingerprint taken at forward time.
+        self._recompute = False
+        self._segment_recompute = False
+        self._anchors = None
+        self._forward_fingerprint = None
+        # Optimizer state: first/second moment trees per parameter plus the
+        # step count.  Lazily sized to the parameter list on first use.
+        self._adam_t = 0
+        self._adam_m = None
+        self._adam_v = None
         # Version a checkpoint was loaded from (None until the first load).
         self._loaded_from_version = None
         self._lock = threading.RLock()
@@ -97,10 +175,10 @@ class Sequential:
     def loaded_from_version(self):
         """Format version the last ``load`` migrated from (``None`` before).
 
-        A version-1 checkpoint reports ``1``; a native version-2 file
-        reports ``2``. The source version is only updated on a successful
-        load -- a checkpoint rejected mid-migration leaves the previous
-        value untouched.
+        A version-1 or version-2 checkpoint reports ``1``/``2``; a native
+        version-3 file reports ``3``. The source version is only updated on
+        a successful load -- a checkpoint rejected mid-migration leaves the
+        previous value untouched.
         """
         return self._loaded_from_version
 
@@ -130,8 +208,49 @@ class Sequential:
             self._hidden_shapes = [slot.shape for slot in new_hidden]
             self._last_output = x
             self._last_hidden = new_hidden
+            if self._recompute:
+                # Bounded-memory mode: keep only the anchors needed to
+                # recompute this segment's activations at backward time --
+                # the segment input, the incoming hidden values and a
+                # fingerprint of the parameters.
+                self._segment_recompute = True
+                self._anchors = (
+                    batch.tolist(),
+                    [None if slot is None else slot.tolist() for slot in slots],
+                )
+                self._forward_fingerprint = _parameters_fingerprint(
+                    self.parameters()
+                )
+            else:
+                self._segment_recompute = False
+                self._anchors = None
+                self._forward_fingerprint = None
             self._pending_backward = True
             return x, new_hidden
+
+    def set_recompute(self, enabled):
+        """Switch bounded-memory (activation-recompute) mode on or off.
+
+        With the mode on, a ``forward`` keeps only the slice-boundary
+        hidden state and a few anchors (the segment input and the incoming
+        hidden values); the matching ``backward`` recomputes the layer
+        activations from those anchors instead of relying on anything the
+        layers retained.  Forward outputs and parameter gradients are
+        bitwise identical to the default mode, and peak activation memory
+        no longer grows with the number of segments.
+
+        The switch may only be flipped between segments: changing it while
+        a backward is still pending raises ``RuntimeError`` and leaves the
+        container state untouched.
+        """
+        with self._lock:
+            enabled = bool(enabled)
+            if self._pending_backward and enabled != self._segment_recompute:
+                raise RuntimeError(
+                    "set_recompute() cannot change the mode in the middle of "
+                    "a segment (a backward is still pending)"
+                )
+            self._recompute = enabled
 
     def backward(self, loss):
         with self._lock:
@@ -141,6 +260,8 @@ class Sequential:
                     "called once per forward()"
                 )
             upstream = self._parse_loss(loss)
+            if self._segment_recompute:
+                self._recompute_activations()
             # Snapshot gradients first: if any layer raises mid-pass, roll the
             # partial accumulation back so the state is exactly as if backward
             # had never run and the caller may retry the same forward's backward
@@ -157,6 +278,47 @@ class Sequential:
                     param.grad = None if saved is None else Tensor(saved)
                 raise
             self._pending_backward = False
+            self._anchors = None
+            self._forward_fingerprint = None
+
+    def _recompute_activations(self):
+        """Rebuild the in-flight segment's activations from its anchors.
+
+        Runs before the backward walk in recompute mode.  The parameters
+        must be bitwise identical to their forward-time values -- an
+        external rewrite in between would silently corrupt the recomputed
+        activations, so it raises ``RuntimeError`` instead, before any
+        gradient is touched.
+        """
+        if self._anchors is None or self._forward_fingerprint is None:
+            raise RuntimeError("recompute anchors are missing for this segment")
+        if _parameters_fingerprint(self.parameters()) != self._forward_fingerprint:
+            raise RuntimeError(
+                "parameters were modified while the segment was in flight; "
+                "cannot recompute its activations"
+            )
+        batch_values, slot_values = self._anchors
+        x = Tensor(batch_values)
+        slots = [None if value is None else Tensor(value) for value in slot_values]
+        for module, slot in zip(self._modules, slots):
+            result = module.forward(x, slot)
+            try:
+                x, slot_out = result
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "each layer's forward must return an (output, hidden) pair"
+                ) from exc
+            if not isinstance(x, Tensor) or not isinstance(slot_out, Tensor):
+                raise ValueError(
+                    "each layer's forward must return (Tensor, Tensor)"
+                )
+        if _checkpoint._trees_differ(
+            x.tolist(), self._last_output.tolist(), x.shape
+        ):
+            raise RuntimeError(
+                "recomputed activations diverge from the recorded forward "
+                "output; the segment cannot be back-propagated"
+            )
 
     def _parse_loss(self, loss):
         if isinstance(loss, bool):
@@ -222,10 +384,86 @@ class Sequential:
                 if param.grad is not None:
                     param._scaled_subtract_(param.grad, learning_rate)
 
+    def _ensure_optim_state(self, count):
+        if self._adam_m is None or len(self._adam_m) != count:
+            # Un-stepped state starts from the initial values: t = 0 and
+            # zero moments shaped like the parameters.
+            params = self.parameters()
+            self._adam_t = 0
+            self._adam_m = [_zeros(param.shape) for param in params]
+            self._adam_v = [_zeros(param.shape) for param in params]
+
+    def adam_step(self, learning_rate):
+        """Perform one in-place Adam step on every parameter.
+
+        The coefficients are fixed by the engine (beta1 = 0.9, beta2 =
+        0.999, epsilon = 1e-8); only the learning rate is chosen by the
+        caller.  Each call first updates the moments
+        ``m <- 0.9*m + 0.1*g`` and ``v <- 0.999*v + 0.001*g^2``, advances
+        the step count ``t`` (1 on the first call), then applies the
+        bias-corrected update ``theta <- theta - lr * m_hat /
+        (sqrt(v_hat) + 1e-8)`` with ``m_hat = m / (1 - 0.9**t)`` and
+        ``v_hat = v / (1 - 0.999**t)``.  Parameters without a gradient are
+        left untouched; gradients are not cleared.  A state that never
+        stepped starts from ``t = 0`` and zero moments.  A non-finite or
+        non-numeric learning rate raises ``ValueError``.
+
+        The moments and the step count are part of every checkpoint, so a
+        resumed run continues bitwise identically.  The whole step runs
+        under the container lock, like ``update``.
+        """
+        with self._lock:
+            if isinstance(learning_rate, bool) or not isinstance(
+                learning_rate, (int, float)
+            ):
+                raise ValueError("learning rate must be a number")
+            if learning_rate != learning_rate or learning_rate in (
+                float("inf"),
+                float("-inf"),
+            ):
+                raise ValueError("learning rate must be finite")
+            params = self.parameters()
+            self._ensure_optim_state(len(params))
+            self._adam_t += 1
+            step = self._adam_t
+            lr = float(learning_rate)
+            m_correction = 1.0 - _ADAM_BETA1 ** step
+            v_correction = 1.0 - _ADAM_BETA2 ** step
+            # Build every updated tree before touching any live state, so
+            # the step is all-or-nothing.
+            new_values = []
+            new_m = []
+            new_v = []
+            for index, param in enumerate(params):
+                grad = param.grad
+                if grad is None:
+                    new_values.append(None)
+                    new_m.append(self._adam_m[index])
+                    new_v.append(self._adam_v[index])
+                    continue
+                theta, m_tree, v_tree = _adam_update_trees(
+                    param._values(),
+                    self._adam_m[index],
+                    self._adam_v[index],
+                    grad._values(),
+                    lr,
+                    m_correction,
+                    v_correction,
+                )
+                new_values.append(theta)
+                new_m.append(m_tree)
+                new_v.append(v_tree)
+            for param, values in zip(params, new_values):
+                if values is not None:
+                    param._set_values(values)
+            self._adam_m = new_m
+            self._adam_v = new_v
+
     # -- checkpoints --------------------------------------------------------
 
     def _snapshot_document(self):
         params = self.parameters()
+        self._ensure_optim_state(len(params))
         return {
             "params": [
                 {"s": param.shape, "v": param.tolist()} for param in params
@@ -244,6 +482,17 @@ class Sequential:
             else [
                 {"s": slot.shape, "v": slot.tolist()} for slot in self._last_hidden
             ],
+            "optim": {
+                "t": self._adam_t,
+                "m": [
+                    {"s": param.shape, "v": _copy_tree(tree)}
+                    for param, tree in zip(params, self._adam_m)
+                ],
+                "v": [
+                    {"s": param.shape, "v": _copy_tree(tree)}
+                    for param, tree in zip(params, self._adam_v)
+                ],
+            },
             "layers": [
                 {
                     "kind": _layer_kind(module),
@@ -261,9 +510,11 @@ class Sequential:
         existing directory used as an incremental checkpoint chain, or a
         ``bytearray`` used as an in-memory buffer. The snapshot records
         every parameter tensor, every accumulated gradient (zeros for
-        parameters that have never received one), the current
-        slice-boundary hidden state, the layer order with per-layer
-        parameter shapes and the format version.
+        parameters that have never received one), the optimizer state
+        (first/second moments and step count; zeros and ``t = 0`` when
+        ``adam_step`` never ran), the current slice-boundary hidden state,
+        the layer order with per-layer parameter shapes and the format
+        version.
 
         A boundary exists before the first segment and after every
         ``forward`` (the hidden state returned by that forward *is* the
@@ -283,10 +534,11 @@ class Sequential:
 
         *source* is a filesystem path, an incremental-chain directory or a
         bytes-like buffer. The whole checkpoint is validated before
-        anything is applied: the format version (version 1 is migrated
-        item by item and the origin is recorded), every tensor shape and
-        the layer order (count, kinds and per-layer parameter shapes) must
-        match this container exactly. Hidden-state shapes are verified on
+        anything is applied: the format version (versions 1 and 2 are
+        migrated item by item -- a missing optimizer state starts at
+        ``t = 0`` with zero moments -- and the origin is recorded), every
+        tensor shape and the layer order (count, kinds and per-layer
+        parameter shapes) must match this container exactly. Hidden-state shapes are verified on
         the spot, including for a model that has never run a forward. A
         missing path raises ``FileNotFoundError``; any structural problem
         rejects the entire checkpoint with ``ValueError`` and leaves the
@@ -325,15 +577,29 @@ class Sequential:
                 ]
                 new_hidden = rebuilt_slots
                 new_hidden_shapes = [slot.shape for slot in rebuilt_slots]
+            optim = document["optim"]
+            new_optim_t = optim["t"]
+            new_optim_m = [
+                _rebuild_tree(entry["v"], entry["s"]) for entry in optim["m"]
+            ]
+            new_optim_v = [
+                _rebuild_tree(entry["v"], entry["s"]) for entry in optim["v"]
+            ]
 
             for param, values in zip(params, new_values):
                 param._set_values(values)
             for param, grad in zip(params, new_grads):
                 param.grad = grad
+            self._adam_t = new_optim_t
+            self._adam_m = new_optim_m
+            self._adam_v = new_optim_v
             self._last_hidden = new_hidden
             self._hidden_shapes = new_hidden_shapes
             self._last_output = None
             self._pending_backward = False
+            self._segment_recompute = False
+            self._anchors = None
+            self._forward_fingerprint = None
             self._loaded_from_version = source_version
             if new_hidden is None:
                 return None
@@ -376,6 +642,40 @@ class Sequential:
             raise ValueError(
                 "checkpoint layer count does not match the current model"
             )
+        saved_optim = document.get("optim")
+        if not isinstance(saved_optim, dict) or set(saved_optim) != {"t", "m", "v"}:
+            raise ValueError("checkpoint optimizer state is missing or malformed")
+        optim_t = saved_optim["t"]
+        if (
+            isinstance(optim_t, bool)
+            or not isinstance(optim_t, int)
+            or optim_t < 0
+        ):
+            raise ValueError("checkpoint optimizer step count is invalid")
+        optim_m = saved_optim["m"]
+        optim_v = saved_optim["v"]
+        if (
+            not isinstance(optim_m, list)
+            or not isinstance(optim_v, list)
+            or len(optim_m) != len(params)
+            or len(optim_v) != len(params)
+        ):
+            raise ValueError(
+                "checkpoint optimizer state does not match the current model"
+            )
+        for index, (param, m_entry, v_entry) in enumerate(
+            zip(params, optim_m, optim_v)
+        ):
+            if not isinstance(m_entry, dict) or not isinstance(v_entry, dict):
+                raise ValueError(f"checkpoint optimizer moment {index} is malformed")
+            if m_entry.get("s") != param.shape or v_entry.get("s") != param.shape:
+                raise ValueError(
+                    f"checkpoint optimizer moment {index} shape does not match "
+                    f"the current model"
+                )
+            _rebuild_tree(m_entry["v"], m_entry["s"])
+            _rebuild_tree(v_entry["v"], v_entry["s"])
+
         offset = 0
         for index, (module, saved) in enumerate(zip(self._modules, saved_layers)):
             if not isinstance(saved, dict):
