@@ -1,4 +1,4 @@
-"""Tests for format v2: v1 read compatibility/migration and incremental chains."""
+"""Tests for format v3: v1/v2 read compatibility/migration and incremental chains."""
 
 from __future__ import annotations
 
@@ -77,13 +77,13 @@ class Version1CompatTests(unittest.TestCase):
         seq.backward(_total(out1))
         migrated, _ = _stack()
         migrated.load(_v1_trained())
-        # Re-save: migrated state is written out natively as version 2.
+        # Re-save: migrated state is written out natively as version 3.
         rebuf = bytearray()
         migrated.save(rebuf)
         self.assertEqual(struct.unpack("<I", rebuf[8:12])[0], cp.FORMAT_VERSION)
         again, _ = _stack()
         hidden2 = again.load(bytes(rebuf))
-        self.assertEqual(again.loaded_from_version, 2)
+        self.assertEqual(again.loaded_from_version, 3)
         self.assertEqual(
             [s.tolist() for s in hidden2], [s.tolist() for s in h1]
         )
@@ -228,14 +228,14 @@ class ChainRoundTripTests(unittest.TestCase):
 
             with open(os.path.join(td, _seg_name(3)), "rb") as fh:
                 seg_raw = fh.read()
-            _n, _hc, _p, items = cp._parse_delta(seg_raw, 3)
+            _n, _hc, _t, _p, items = cp._parse_delta(seg_raw, 3)
             self.assertTrue(items)  # the update delta carries leaves
 
             # The two no-op deltas carry no tensors at all.
             for i in (1, 2):
                 with open(os.path.join(td, _seg_name(i)), "rb") as fh:
                     raw = fh.read()
-                _n, _hc, _p, items = cp._parse_delta(raw, i)
+                _n, _hc, _t, _p, items = cp._parse_delta(raw, i)
                 self.assertEqual(items, [])
 
             # Loading through the directory entry point on Sequential.
@@ -328,7 +328,7 @@ class ChainRoundTripTests(unittest.TestCase):
             seq.save(td)  # unchanged: delta must deterministically be empty
             with open(os.path.join(td, _seg_name(1)), "rb") as fh:
                 raw = fh.read()
-            _n, hc, _p, items = cp._parse_delta(raw, 1)
+            _n, hc, _t, _p, items = cp._parse_delta(raw, 1)
             self.assertEqual(items, [])
             doc = cp.load_chain(td)
             victim = Sequential([Scale(), PassThrough(), Scale()])

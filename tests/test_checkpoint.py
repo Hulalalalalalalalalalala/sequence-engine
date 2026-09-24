@@ -23,6 +23,24 @@ def _stack(weights=None):
     return _build(weights if weights is not None else _base_weights())
 
 
+def _zeros_shape(shape):
+    if not shape:
+        return 0.0
+    return [_zeros_shape(shape[1:]) for _ in range(shape[0])]
+
+
+def _zero_optim(seq):
+    return {
+        "t": 0,
+        "m": [
+            {"s": p.shape, "v": _zeros_shape(p.shape)} for p in seq.parameters()
+        ],
+        "v": [
+            {"s": p.shape, "v": _zeros_shape(p.shape)} for p in seq.parameters()
+        ],
+    }
+
+
 class UpdateTests(unittest.TestCase):
     def test_step_is_theta_minus_lr_times_grad_in_place(self):
         seq, layers = _stack()
@@ -413,6 +431,7 @@ class CheckpointRejectionTests(unittest.TestCase):
             "grads": [
                 {"s": p.shape, "v": p.grad.tolist()} for p in seq.parameters()
             ],
+            "optim": _zero_optim(seq),
             "hidden": None,
             "layers": [
                 {"kind": "WrongLayer", "shapes": [[2, 3], [3, 3], [3]]},
@@ -433,6 +452,7 @@ class CheckpointRejectionTests(unittest.TestCase):
             "grads": [
                 {"s": p.shape, "v": p.grad.tolist()} for p in seq.parameters()
             ],
+            "optim": _zero_optim(seq),
             "hidden": None,
             "layers": [
                 {"kind": "_RNNStep", "shapes": shapes[:3]},
@@ -506,6 +526,11 @@ class CheckpointValueGuardsTests(unittest.TestCase):
         return {
             "params": [{"s": [1], "v": [value]}],
             "grads": [{"s": [1], "v": [0.0]}],
+            "optim": {
+                "t": 0,
+                "m": [{"s": [1], "v": [0.0]}],
+                "v": [{"s": [1], "v": [0.0]}],
+            },
             "hidden": None,
             "layers": [{"kind": "L", "shapes": [[1]]}],
             "pending": False,

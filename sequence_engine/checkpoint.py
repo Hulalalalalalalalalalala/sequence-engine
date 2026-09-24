@@ -4,6 +4,9 @@ A full snapshot fixes, in one self-describing document:
 
 * every parameter tensor,
 * every accumulated gradient (zeros when a parameter has none yet),
+* the Adam optimizer state: the step count ``t`` plus one first-moment
+  tensor ``m`` and one second-moment tensor ``v`` per parameter (all
+  zeros, ``t == 0``, before the first ``adam_step``),
 * the slice-boundary hidden state of the latest boundary,
 * the layer order and per-layer parameter shapes,
 * the format version.
@@ -21,7 +24,7 @@ Two on-disk shapes share the same leaf encoding and trailer:
 Full snapshot wire format (all integers little-endian)::
 
     magic        8 bytes  b"SEQECKP1"
-    version      uint32   format version (2; version 1 is read and migrated)
+    version      uint32   format version (3; versions 1 and 2 are migrated)
     header_len   uint64   length of the JSON header in bytes
     header       header_len bytes of UTF-8 JSON (shapes, layer order, flags)
     payload      one leaf per tensor element, each a 1-byte tag
@@ -30,10 +33,17 @@ Full snapshot wire format (all integers little-endian)::
     leaf_count   uint64   number of encoded leaves
     payload_crc  uint32   CRC-32 of the header bytes followed by the payload
 
+Version 3 extends version 2 with an ``optim`` header object
+(``{"t", "m", "v"}`` -- the Adam step count and the two moment shape
+lists); its leaves sit between the gradient leaves and the hidden
+leaves, so payload order is params, grads, first moments, second
+moments, hidden slots.
+
 Delta segments use magic ``SEQDELTA`` / ``SEQDELTAEND`` with the same
 framing; their header names the basis file, the segment number, the
-hidden-slot count (or null) and the changed tensors as ``{"i", "s"}``
-records, where *i* is the flat tensor index (params, then grads, then
+Adam step count ``t``, the hidden-slot count (or null) and the changed
+tensors as ``{"i", "s"}`` records, where *i* is the flat tensor index
+(params, then grads, then first moments, then second moments, then
 hidden slots).
 
 Float leaves are emitted as raw IEEE-754 bytes, so values (including the
@@ -64,8 +74,8 @@ END_MAGIC = b"SEQECKP1END"
 DELTA_MAGIC = b"SEQDELTA"
 DELTA_END_MAGIC = b"SEQDELTAEND"
 
-FORMAT_VERSION = 2
-SUPPORTED_READ_VERSIONS = (1, 2)
+FORMAT_VERSION = 3
+SUPPORTED_READ_VERSIONS = (1, 2, 3)
 
 _TAG_INT = ord("i")
 _TAG_FLOAT = ord("f")
@@ -80,10 +90,20 @@ _SEG_WIDTH = 10
 _HEAD_NAME = "head"
 _BASIS_INDEX = 0
 
-_FULL_HEADER_KEYS = frozenset(("v", "params", "grads", "hidden", "layers", "pending"))
-_DOCUMENT_KEYS = frozenset(("params", "grads", "hidden", "layers", "pending"))
+_FULL_HEADER_KEYS = frozenset(
+    ("v", "params", "grads", "optim", "hidden", "layers", "pending")
+)
+_LEGACY_FULL_HEADER_KEYS = frozenset(
+    ("v", "params", "grads", "hidden", "layers", "pending")
+)
+_DOCUMENT_KEYS = frozenset(
+    ("params", "grads", "optim", "hidden", "layers", "pending")
+)
+_OPTIM_KEYS = frozenset(("t", "m", "v"))
 _LAYER_KEYS = frozenset(("kind", "shapes"))
-_DELTA_HEADER_KEYS = frozenset(("v", "b", "n", "hc", "changed", "pending"))
+_DELTA_HEADER_KEYS = frozenset(
+    ("v", "b", "n", "hc", "t", "changed", "pending")
+)
 # Wire records in a delta header carry just index + shape; the leaves live
 # in the binary payload. The in-memory build input additionally carries "v".
 _CHANGED_KEYS = frozenset(("i", "s"))
@@ -137,6 +157,23 @@ def _shape_size(shape):
     return size
 
 
+def _zero_tree(shape):
+    """An all-zero (float) tree with *shape*."""
+    if shape:
+        return [_zero_tree(shape[1:]) for _ in range(shape[0])]
+    return 0.0
+
+
+def _check_step_count(t):
+    if isinstance(t, bool) or not isinstance(t, int):
+        raise CheckpointError("optimizer step count must be an integer")
+    if not _INT64_MIN <= t <= _INT64_MAX:
+        raise CheckpointError(
+            "optimizer step count is too large to represent (int64)"
+        )
+    return t
+
+
 def _check_leaf(value):
     if isinstance(value, bool):
         raise CheckpointError("checkpoint values must be numbers, not booleans")
@@ -172,6 +209,12 @@ def _leaf_code(value):
     raise CheckpointError(
         f"checkpoint values must be numbers, got {type(value).__name__}"
     )
+
+
+def _all_zero_leaves(tree):
+    if isinstance(tree, list):
+        return all(_all_zero_leaves(item) for item in tree)
+    return not isinstance(tree, bool) and tree == 0
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +263,33 @@ def _freeze_layer(layer):
     return {"kind": kind, "shapes": [list(shape) for shape in shapes]}
 
 
+def _freeze_optim(optim, param_shapes, payload):
+    """Freeze the optimizer state; return its header fragment."""
+    _exact_keys(optim, _OPTIM_KEYS, "optimizer state")
+    t = _check_step_count(optim["t"])
+    if t < 0:
+        raise CheckpointError("optimizer step count must be non-negative")
+    moments = optim["m"]
+    velocities = optim["v"]
+    if not isinstance(moments, list) or not isinstance(velocities, list):
+        raise CheckpointError("optimizer moment lists must be lists")
+    if len(moments) != len(param_shapes) or len(velocities) != len(param_shapes):
+        raise CheckpointError("optimizer must keep one moment pair per parameter")
+    m_shapes = [_freeze_entry(entry, payload) for entry in moments]
+    v_shapes = [_freeze_entry(entry, payload) for entry in velocities]
+    if m_shapes != param_shapes or v_shapes != param_shapes:
+        raise CheckpointError("optimizer moment shapes must match parameter shapes")
+    if t == 0:
+        # Before the first step every moment must still be its start value.
+        if not all(_all_zero_leaves(entry["v"]) for entry in moments) or not all(
+            _all_zero_leaves(entry["v"]) for entry in velocities
+        ):
+            raise CheckpointError(
+                "optimizer moments must be all zeros when the step count is 0"
+            )
+    return {"t": t, "m": m_shapes, "v": v_shapes}
+
+
 def _freeze(document):
     if not isinstance(document, dict):
         raise CheckpointError("checkpoint document must be an object")
@@ -237,6 +307,8 @@ def _freeze(document):
     grad_shapes = [_freeze_entry(entry, payload) for entry in grads]
     if grad_shapes != param_shapes:
         raise CheckpointError("parameter and gradient shapes must match")
+
+    optim_header = _freeze_optim(document.get("optim"), param_shapes, payload)
 
     hidden = document.get("hidden")
     if hidden is None:
@@ -261,6 +333,7 @@ def _freeze(document):
         "v": FORMAT_VERSION,
         "params": param_shapes,
         "grads": grad_shapes,
+        "optim": optim_header,
         "hidden": hidden_shapes,
         "layers": header_layers,
         "pending": pending,
@@ -387,24 +460,21 @@ def _parse_shape_list(value, what, allow_empty=False):
     return shapes
 
 
-def _parse_full_header(header, version):
-    _exact_keys(header, _FULL_HEADER_KEYS, "checkpoint header")
-    if not isinstance(header["v"], int) or isinstance(header["v"], bool):
-        raise CheckpointError("checkpoint version must be an integer")
-    if header["v"] != version:
-        raise CheckpointError("checkpoint header version does not match")
-    params = _parse_shape_list(header["params"], "params", allow_empty=True)
-    grads = _parse_shape_list(header["grads"], "grads", allow_empty=True)
-    if len(params) != len(grads) or params != grads:
-        raise CheckpointError("parameter and gradient shape lists must match")
-    if header["hidden"] is not None:
-        hidden = _parse_shape_list(header["hidden"], "hidden")
-    else:
-        hidden = None
-    layers = header["layers"]
+def _parse_optim_header(header):
+    _exact_keys(header, _OPTIM_KEYS, "optimizer state header")
+    t = _check_step_count(header["t"])
+    if t < 0:
+        raise CheckpointError("optimizer step count must be non-negative")
+    m_shapes = _parse_shape_list(header["m"], "optimizer first moments", allow_empty=True)
+    v_shapes = _parse_shape_list(header["v"], "optimizer second moments", allow_empty=True)
+    return t, m_shapes, v_shapes
+
+
+def _parse_layer_header(layers):
     if not isinstance(layers, list) or not layers:
         raise CheckpointError("layer order must be a non-empty list")
     layer_shapes = []
+    parsed_layers = []
     for index, layer in enumerate(layers):
         _exact_keys(layer, _LAYER_KEYS, f"layer {index} descriptor")
         if not isinstance(layer["kind"], str) or not layer["kind"]:
@@ -413,23 +483,62 @@ def _parse_full_header(header, version):
             layer["shapes"], f"layer {index} shapes", allow_empty=True
         )
         layer_shapes.extend(shapes)
+        parsed_layers.append(
+            {"kind": layer["kind"], "shapes": [list(s) for s in shapes]}
+        )
+    return parsed_layers, layer_shapes
+
+
+def _parse_full_header(header, version):
+    if not isinstance(header["v"], int) or isinstance(header["v"], bool):
+        raise CheckpointError("checkpoint version must be an integer")
+    if header["v"] != version:
+        raise CheckpointError("checkpoint header version does not match")
+
+    if version >= 3:
+        _exact_keys(header, _FULL_HEADER_KEYS, "checkpoint header")
+        params = _parse_shape_list(header["params"], "params", allow_empty=True)
+        grads = _parse_shape_list(header["grads"], "grads", allow_empty=True)
+        if len(params) != len(grads) or params != grads:
+            raise CheckpointError("parameter and gradient shape lists must match")
+        t, m_shapes, v_shapes = _parse_optim_header(header["optim"])
+        if m_shapes != params or v_shapes != params:
+            raise CheckpointError(
+                "optimizer moment shape lists must match the parameter list"
+            )
+    else:
+        _exact_keys(header, _LEGACY_FULL_HEADER_KEYS, "checkpoint header")
+        params = _parse_shape_list(header["params"], "params", allow_empty=True)
+        grads = _parse_shape_list(header["grads"], "grads", allow_empty=True)
+        if len(params) != len(grads) or params != grads:
+            raise CheckpointError("parameter and gradient shape lists must match")
+        t = 0
+
+    if header["hidden"] is not None:
+        hidden = _parse_shape_list(header["hidden"], "hidden")
+    else:
+        hidden = None
+    parsed_layers, layer_shapes = _parse_layer_header(header["layers"])
     if layer_shapes != params:
         raise CheckpointError(
             "layer order/parameter shapes do not match the parameter tensor list"
         )
     if not isinstance(header["pending"], bool):
         raise CheckpointError("pending flag must be a boolean")
-    return params, hidden
+    return params, hidden, t, parsed_layers
 
 
 def parse_bytes(raw):
-    """Validate and decode a full snapshot (v1 or v2); return the document.
+    """Validate and decode a full snapshot (v1, v2 or v3); return the document.
 
-    A version-1 file is migrated item by item into the current document
-    shape.  Any failure while migrating rejects the whole file -- nothing
-    is partially returned or filled in.  The document itself carries no
-    source-version field; use :func:`load_bytes_with_source` when the
-    originating format version is needed.
+    Version-1 and version-2 files are migrated item by item into the
+    current document shape: every tensor, shape and descriptor is copied
+    and checked individually, and the missing optimizer state starts at
+    ``t == 0`` with all-zero moments.  Any failure while migrating
+    rejects the whole file -- nothing is partially returned or filled in.
+    The document itself carries no source-version field; use
+    :func:`load_bytes_with_source` when the originating format version is
+    needed.
     """
     document, _source = _decode_full(raw)
     return document
@@ -452,6 +561,14 @@ def load_bytes_with_source(source):
     raise TypeError("load source must be a path or bytes")
 
 
+def _read_entries(reader, shapes):
+    return [{"s": shape, "v": reader.tree(shape)} for shape in shapes]
+
+
+def _zero_entries(shapes):
+    return [{"s": list(shape), "v": _zero_tree(shape)} for shape in shapes]
+
+
 def _decode_full(raw):
     """Return ``(document, source_version)`` for one full snapshot."""
     if not isinstance(raw, (bytes, bytearray, memoryview)):
@@ -465,21 +582,32 @@ def _decode_full(raw):
             f"unsupported checkpoint version {version}; this build reads "
             f"versions {SUPPORTED_READ_VERSIONS}"
         )
-    param_shapes, hidden_shapes = _parse_full_header(header, version)
+    param_shapes, hidden_shapes, optim_t, parsed_layers = _parse_full_header(
+        header, version
+    )
 
-    total_leaves = sum(_shape_size(shape) for shape in param_shapes) * 2
+    moment_groups = 2 if version >= 3 else 0
+    total_leaves = sum(_shape_size(shape) for shape in param_shapes) * (
+        2 + moment_groups
+    )
     if hidden_shapes is not None:
         total_leaves += sum(_shape_size(shape) for shape in hidden_shapes)
     if total_leaves != leaf_count:
         raise CheckpointError("checkpoint leaf count does not match the header")
 
     reader = _LeafReader(payload)
-    params = [{"s": shape, "v": reader.tree(shape)} for shape in param_shapes]
-    grads = [{"s": shape, "v": reader.tree(shape)} for shape in param_shapes]
+    params = _read_entries(reader, param_shapes)
+    grads = _read_entries(reader, param_shapes)
+    if version >= 3:
+        moments = _read_entries(reader, param_shapes)
+        velocities = _read_entries(reader, param_shapes)
+    else:
+        moments = _zero_entries(param_shapes)
+        velocities = _zero_entries(param_shapes)
     hidden = (
         None
         if hidden_shapes is None
-        else [{"s": shape, "v": reader.tree(shape)} for shape in hidden_shapes]
+        else _read_entries(reader, hidden_shapes)
     )
     if reader.remaining() != 0:
         raise CheckpointError("checkpoint payload has trailing bytes")
@@ -487,29 +615,44 @@ def _decode_full(raw):
     document = {
         "params": params,
         "grads": grads,
+        "optim": {"t": optim_t, "m": moments, "v": velocities},
         "hidden": hidden,
-        "layers": [
-            {"kind": layer["kind"], "shapes": [list(s) for s in layer["shapes"]]}
-            for layer in header["layers"]
-        ],
+        "layers": parsed_layers,
         "pending": header["pending"],
     }
     if version == 1:
         document = _migrate_v1_document(document)
+    elif version == 2:
+        document = _migrate_v2_document(document)
+    _validate_optim_invariants(document)
     return document, version
 
 
-def _migrate_v1_document(document):
-    """Migrate a decoded version-1 document into the v2 shape, item by item.
+def _migrate_v2_document(document):
+    """Add the v3 optimizer state to a decoded version-2 document.
 
-    The two versions share the same tensor semantics, so migration is a
-    field-by-field re-validation rather than a guess: every tensor, shape
-    and descriptor is copied and checked individually.  A failure on any
-    item raises and the caller rejects the whole file.
+    Version 2 shares v3's tensor semantics exactly; the only added field
+    is the optimizer state, which starts at its beginning-of-training
+    values.
     """
+    return _migrate_legacy_document(document, "v2")
+
+
+def _migrate_v1_document(document):
+    """Migrate a decoded version-1 document into the v3 shape, item by item.
+
+    The tensor semantics never changed across versions, so migration is a
+    field-by-field re-validation rather than a guess: every tensor, shape
+    and descriptor is copied and checked individually.  The optimizer
+    state introduced in v3 starts at ``t == 0`` with all-zero moments.  A
+    failure on any item raises and the caller rejects the whole file.
+    """
+    return _migrate_legacy_document(document, "v1")
+
+
+def _migrate_legacy_document(document, label):
     if not isinstance(document, dict):
-        raise CheckpointError("v1 checkpoint is not a valid document")
-    migrated = {}
+        raise CheckpointError(f"{label} checkpoint is not a valid document")
     try:
         params = document["params"]
         grads = document["grads"]
@@ -518,80 +661,135 @@ def _migrate_v1_document(document):
         pending = document["pending"]
     except KeyError as exc:
         raise CheckpointError(
-            f"v1 checkpoint is missing field {exc.args[0]!r}; refusing to migrate"
+            f"{label} checkpoint is missing field {exc.args[0]!r}; refusing to migrate"
         ) from None
     if not isinstance(params, list) or not isinstance(grads, list):
-        raise CheckpointError("v1 checkpoint tensor lists are malformed")
+        raise CheckpointError(f"{label} checkpoint tensor lists are malformed")
     if len(params) != len(grads):
-        raise CheckpointError("v1 checkpoint param/gradient counts disagree")
+        raise CheckpointError(f"{label} checkpoint param/gradient counts disagree")
     m_params = []
     m_grads = []
     for index, (p_entry, g_entry) in enumerate(zip(params, grads)):
-        m_params.append(_migrate_v1_entry(p_entry, f"parameter {index}"))
-        m_grads.append(_migrate_v1_entry(g_entry, f"gradient {index}"))
+        m_params.append(_migrate_legacy_entry(p_entry, f"parameter {index}", label))
+        m_grads.append(_migrate_legacy_entry(g_entry, f"gradient {index}", label))
         if m_params[-1]["s"] != m_grads[-1]["s"]:
             raise CheckpointError(
-                f"v1 parameter {index} and its gradient disagree on shape"
+                f"{label} parameter {index} and its gradient disagree on shape"
             )
-    migrated["params"] = m_params
-    migrated["grads"] = m_grads
     if hidden is None:
-        migrated["hidden"] = None
+        m_hidden = None
     else:
         if not isinstance(hidden, list) or not hidden:
-            raise CheckpointError("v1 hidden state must be a non-empty list or null")
-        migrated["hidden"] = [
-            _migrate_v1_entry(entry, f"hidden slot {index}")
+            raise CheckpointError(f"{label} hidden state must be a non-empty list or null")
+        m_hidden = [
+            _migrate_legacy_entry(entry, f"hidden slot {index}", label)
             for index, entry in enumerate(hidden)
         ]
     if not isinstance(layers, list) or not layers:
-        raise CheckpointError("v1 checkpoint must record the layer order")
+        raise CheckpointError(f"{label} checkpoint must record the layer order")
     m_layers = []
     for index, layer in enumerate(layers):
-        _exact_keys(layer, _LAYER_KEYS, f"v1 layer {index} descriptor")
+        _exact_keys(layer, _LAYER_KEYS, f"{label} layer {index} descriptor")
         kind = layer["kind"]
         if not isinstance(kind, str) or not kind:
-            raise CheckpointError(f"v1 layer {index} kind must be a non-empty string")
+            raise CheckpointError(f"{label} layer {index} kind must be a non-empty string")
         shapes = layer["shapes"]
         if not isinstance(shapes, list):
-            raise CheckpointError(f"v1 layer {index} shapes must be a list")
+            raise CheckpointError(f"{label} layer {index} shapes must be a list")
         m_shapes = []
         for shape in shapes:
             _check_shape(shape)
             m_shapes.append(list(shape))
         m_layers.append({"kind": kind, "shapes": m_shapes})
-    migrated["layers"] = m_layers
     if not isinstance(pending, bool):
-        raise CheckpointError("v1 pending flag must be a boolean")
-    migrated["pending"] = pending
+        raise CheckpointError(f"{label} pending flag must be a boolean")
     if sum(len(layer["shapes"]) for layer in m_layers) != len(m_params):
-        raise CheckpointError("v1 layer parameter counts do not match the parameter list")
-    return migrated
+        raise CheckpointError(
+            f"{label} layer parameter counts do not match the parameter list"
+        )
+    return {
+        "params": m_params,
+        "grads": m_grads,
+        # Older files predate the optimizer: start from t == 0, moments 0.
+        "optim": {
+            "t": 0,
+            "m": _zero_entries([p["s"] for p in m_params]),
+            "v": _zero_entries([p["s"] for p in m_params]),
+        },
+        "hidden": m_hidden,
+        "layers": m_layers,
+        "pending": pending,
+    }
 
 
-def _migrate_v1_entry(entry, what):
-    _exact_keys(entry, {"s", "v"}, f"v1 {what} entry")
+def _migrate_legacy_entry(entry, what, label):
+    _exact_keys(entry, {"s", "v"}, f"{label} {what} entry")
     shape = entry["s"]
     _check_shape(shape)
     tree = entry["v"]
     if not _shape_matches(tree, shape):
-        raise CheckpointError(f"v1 {what} values do not match their declared shape")
+        raise CheckpointError(f"{label} {what} values do not match their declared shape")
     # Re-walk the leaves so oversized integers / non-finite values smuggled
-    # into a v1 payload are refused during migration, not after applying.
-    _validate_migrated_tree(tree, shape, what)
+    # into an old payload are refused during migration, not after applying.
+    _validate_migrated_tree(tree, shape, what, label)
     return {"s": list(shape), "v": _copy_tree(tree)}
 
 
-def _validate_migrated_tree(tree, shape, what):
+def _validate_migrated_tree(tree, shape, what, label):
     if shape:
         if not isinstance(tree, list) or len(tree) != shape[0]:
-            raise CheckpointError(f"v1 {what} values do not match their declared shape")
+            raise CheckpointError(
+                f"{label} {what} values do not match their declared shape"
+            )
         for item in tree:
-            _validate_migrated_tree(item, shape[1:], what)
+            _validate_migrated_tree(item, shape[1:], what, label)
     else:
         if isinstance(tree, list):
-            raise CheckpointError(f"v1 {what} values do not match their declared shape")
+            raise CheckpointError(
+                f"{label} {what} values do not match their declared shape"
+            )
         _check_leaf(tree)
+
+
+def _validate_optim_invariants(document):
+    """Structural optimizer checks shared by native loads and migrations."""
+    optim = document.get("optim")
+    if not isinstance(optim, dict):
+        raise CheckpointError("checkpoint optimizer state is malformed")
+    _exact_keys(optim, _OPTIM_KEYS, "optimizer state")
+    t = _check_step_count(optim["t"])
+    if t < 0:
+        raise CheckpointError("optimizer step count must be non-negative")
+    params = document["params"]
+    moments, velocities = optim["m"], optim["v"]
+    if (
+        not isinstance(moments, list)
+        or not isinstance(velocities, list)
+        or len(moments) != len(params)
+        or len(velocities) != len(params)
+    ):
+        raise CheckpointError("optimizer must keep one moment pair per parameter")
+    for index, (m_entry, v_entry, p_entry) in enumerate(
+        zip(moments, velocities, params)
+    ):
+        for name, entry in (("first moment", m_entry), ("second moment", v_entry)):
+            _exact_keys(entry, {"s", "v"}, f"optimizer {name} {index} entry")
+            _check_shape(entry["s"])
+            if entry["s"] != p_entry["s"]:
+                raise CheckpointError(
+                    f"optimizer {name} {index} shape does not match its parameter"
+                )
+            if not _shape_matches(entry["v"], entry["s"]):
+                raise CheckpointError(
+                    f"optimizer {name} {index} values do not match its shape"
+                )
+    if t == 0:
+        if not all(_all_zero_leaves(entry["v"]) for entry in moments) or not all(
+            _all_zero_leaves(entry["v"]) for entry in velocities
+        ):
+            raise CheckpointError(
+                "optimizer moments must be all zeros when the step count is 0"
+            )
 
 
 def _copy_tree(tree):
@@ -620,11 +818,12 @@ def _segment_index(name):
 
 
 def _freeze_delta(document, schema_shapes):
-    """Build delta framing from ``{b,n,hc,changed,pending}``.
+    """Build delta framing from ``{b,n,hc,t,changed,pending}``.
 
     *schema_shapes* maps the flat tensor index of every tensor the
-    post-delta state may contain to its shape: params then grads then the
-    (newly introduced, if any) hidden slots.
+    post-delta state may contain to its shape: params, then grads, then
+    first moments, then second moments, then the (newly introduced, if
+    any) hidden slots.
     """
     if not isinstance(document, dict):
         raise CheckpointError("delta document must be an object")
@@ -640,6 +839,9 @@ def _freeze_delta(document, schema_shapes):
     hc = document["hc"]
     if hc is not None and (isinstance(hc, bool) or not isinstance(hc, int) or hc < 0):
         raise CheckpointError("delta hidden count must be a non-negative int or null")
+    t = _check_step_count(document["t"])
+    if t < 0:
+        raise CheckpointError("delta optimizer step count must be non-negative")
     changed = document["changed"]
     if not isinstance(changed, list):
         raise CheckpointError("delta changed list must be a list")
@@ -682,6 +884,7 @@ def _freeze_delta(document, schema_shapes):
         "b": basis_name,
         "n": number,
         "hc": hc,
+        "t": t,
         "changed": header_entries,
         "pending": document["pending"],
     }
@@ -689,7 +892,7 @@ def _freeze_delta(document, schema_shapes):
 
 
 def _parse_delta(raw, segment_index_expected):
-    """Validate one delta segment and return ``(number, hc, pending, items)``.
+    """Validate one delta segment and return ``(number, hc, t, pending, items)``.
 
     *items* is a list of ``(flat_index, shape, tree)`` already decoded.
     """
@@ -718,6 +921,9 @@ def _parse_delta(raw, segment_index_expected):
     hc = header["hc"]
     if hc is not None and (isinstance(hc, bool) or not isinstance(hc, int) or hc < 0):
         raise CheckpointError("delta hidden count must be a non-negative int or null")
+    t = _check_step_count(header["t"])
+    if t < 0:
+        raise CheckpointError("delta optimizer step count must be non-negative")
     changed = header["changed"]
     if not isinstance(changed, list):
         raise CheckpointError("delta changed list must be a list")
@@ -752,7 +958,7 @@ def _parse_delta(raw, segment_index_expected):
     ]
     if reader.remaining() != 0:
         raise CheckpointError("delta payload has trailing bytes")
-    return number, hc, header["pending"], items
+    return number, hc, t, header["pending"], items
 
 
 # ---------------------------------------------------------------------------
@@ -761,13 +967,21 @@ def _parse_delta(raw, segment_index_expected):
 
 
 def _tensors_from_document(document):
-    """Return ``{flat_index: (shape, tree)}`` for one full state document."""
+    """Return ``{flat_index: (shape, tree)}`` for one full state document.
+
+    Index order: params, then grads, then first moments, then second
+    moments, then hidden slots.
+    """
     tensors = {}
     offset = 0
-    for entry in document["params"]:
+    for group in ("params", "grads"):
+        for entry in document[group]:
+            tensors[offset] = (entry["s"], entry["v"])
+            offset += 1
+    for entry in document["optim"]["m"]:
         tensors[offset] = (entry["s"], entry["v"])
         offset += 1
-    for entry in document["grads"]:
+    for entry in document["optim"]["v"]:
         tensors[offset] = (entry["s"], entry["v"])
         offset += 1
     hidden = document["hidden"]
@@ -795,13 +1009,16 @@ def _trees_differ(a, b, shape):
 def _assemble(basis_document, applied):
     """Build a full document from basis tensors plus per-index replacements.
 
-    *applied* maps a flat tensor index (params, then grads, then hidden) to
-    ``(shape, tree)``.  Hidden indices only exist once a delta introduced
-    hidden state; a complete set must be present at that point.
+    *applied* maps a flat tensor index (params, grads, first moments,
+    second moments, hidden) to ``(shape, tree)``.  Hidden indices only
+    exist once a delta introduced hidden state; a complete set must be
+    present at that point.
     """
     param_count = len(basis_document["params"])
     layers = basis_document["layers"]
-    hidden_count = len(basis_document["hidden"]) if basis_document["hidden"] is not None else None
+    hidden_count = (
+        len(basis_document["hidden"]) if basis_document["hidden"] is not None else None
+    )
 
     # The latest delta in the chain decides whether hidden state exists.
     final_hidden_count = applied.get("_hc", hidden_count)
@@ -809,8 +1026,10 @@ def _assemble(basis_document, applied):
 
     params = []
     grads = []
+    moments = []
+    velocities = []
     hidden = []
-    total = 2 * param_count + (final_hidden_count or 0)
+    total = 4 * param_count + (final_hidden_count or 0)
     for index in range(total):
         if index not in tensors:
             raise CheckpointError(
@@ -822,18 +1041,30 @@ def _assemble(basis_document, applied):
             params.append(entry)
         elif index < 2 * param_count:
             grads.append(entry)
+        elif index < 3 * param_count:
+            moments.append(entry)
+        elif index < 4 * param_count:
+            velocities.append(entry)
         else:
             hidden.append(entry)
 
-    if len(params) != param_count or len(grads) != param_count:
-        raise CheckpointError("chain did not preserve the parameter/gradient count")
-    return {
+    if (
+        len(params) != param_count
+        or len(grads) != param_count
+        or len(moments) != param_count
+        or len(velocities) != param_count
+    ):
+        raise CheckpointError("chain did not preserve the parameter/moment count")
+    document = {
         "params": params,
         "grads": grads,
+        "optim": {"t": applied["t"], "m": moments, "v": velocities},
         "hidden": hidden if final_hidden_count is not None else None,
         "layers": layers,
         "pending": applied["pending"],
     }
+    _validate_optim_invariants(document)
+    return document
 
 
 # ---------------------------------------------------------------------------
@@ -1057,6 +1288,19 @@ def _build_delta_between(previous, current, next_index):
     if len(previous["grads"]) != param_count or len(current["grads"]) != param_count:
         raise CheckpointError("gradient count changed inside the incremental chain")
 
+    prev_optim = previous["optim"]
+    cur_optim = current["optim"]
+    if (
+        len(prev_optim["m"]) != param_count
+        or len(cur_optim["m"]) != param_count
+        or len(prev_optim["v"]) != param_count
+        or len(cur_optim["v"]) != param_count
+    ):
+        raise CheckpointError("optimizer moment count changed inside the chain")
+    cur_t = _check_step_count(cur_optim["t"])
+    if cur_t < 0:
+        raise CheckpointError("optimizer step count must be non-negative")
+
     prev_layers = [
         (layer["kind"], [list(s) for s in layer["shapes"]])
         for layer in previous["layers"]
@@ -1089,15 +1333,14 @@ def _build_delta_between(previous, current, next_index):
 
     # Every tensor the post-state may name; needed both for the diff and
     # for shape validation while freezing.
-    hidden_shapes_introduced = (
-        cur_hc is not None and prev_hc is None
-    )
+    hidden_shapes_introduced = cur_hc is not None and prev_hc is None
+    hidden_base = 4 * param_count
     schema = {}
-    for index in range(2 * param_count):
+    for index in range(hidden_base):
         schema[index] = cur_tensors[index][0]
     if cur_hc is not None:
         for slot in range(cur_hc):
-            index = 2 * param_count + slot
+            index = hidden_base + slot
             schema[index] = cur_tensors[index][0]
 
     changed_entries = []
@@ -1110,7 +1353,7 @@ def _build_delta_between(previous, current, next_index):
                 f"tensor {index} changed shape inside the incremental chain; "
                 "save a full snapshot for the new model"
             )
-        if index >= 2 * param_count and hidden_shapes_introduced:
+        if index >= hidden_base and hidden_shapes_introduced:
             changed_entries.append({"i": index, "s": shape, "v": tree})
             continue
         if prev is None or _trees_differ(prev[1], tree, shape):
@@ -1121,10 +1364,11 @@ def _build_delta_between(previous, current, next_index):
         "b": _segment_name(_BASIS_INDEX),
         "n": next_index,
         "hc": cur_hc,
+        "t": cur_t,
         "changed": changed_entries,
         "pending": current["pending"],
     }
-    schema_shapes = [schema.get(i) for i in range((2 * param_count) + (cur_hc or 0))]
+    schema_shapes = [schema.get(i) for i in range(hidden_base + (cur_hc or 0))]
     return _freeze_delta(delta_doc, schema_shapes)
 
 
@@ -1182,11 +1426,13 @@ def _load_chain_store(store, head):
 
     tensors = _tensors_from_document(basis)
     current_hc = basis_hc
+    current_t = basis["optim"]["t"]
     pending = basis["pending"]
+    hidden_base = 4 * param_count
     for index in range(1, head + 1):
         name = _segment_name(index)
         raw = store.read_segment(name)
-        _number, delta_hc, delta_pending, items = _parse_delta(raw, index)
+        _number, delta_hc, delta_t, delta_pending, items = _parse_delta(raw, index)
 
         # Hidden-state transitions: absent -> present exactly once with a
         # full set of slots; afterwards the count is fixed.
@@ -1196,13 +1442,13 @@ def _load_chain_store(store, head):
                 f"delta {index} changes the hidden slot count; chain rejected"
             )
         if not introducing and delta_hc is None and current_hc is None:
-            expected_max = 2 * param_count - 1
+            expected_max = hidden_base - 1
         elif delta_hc is None:
             raise CheckpointError(
                 f"delta {index} drops hidden state the chain already fixed"
             )
         else:
-            expected_max = 2 * param_count + delta_hc - 1
+            expected_max = hidden_base + delta_hc - 1
 
         replaced_hidden = set()
         for flat_index, shape, tree in items:
@@ -1210,18 +1456,25 @@ def _load_chain_store(store, head):
                 raise CheckpointError(
                     f"delta {index} names tensor {flat_index} beyond its state"
                 )
-            if flat_index < 2 * param_count:
-                expected_shape = (
-                    basis["params"][flat_index]["s"]
-                    if flat_index < param_count
-                    else basis["grads"][flat_index - param_count]["s"]
-                )
+            if flat_index < hidden_base:
+                if flat_index < param_count:
+                    expected_shape = basis["params"][flat_index]["s"]
+                elif flat_index < 2 * param_count:
+                    expected_shape = basis["grads"][flat_index - param_count]["s"]
+                elif flat_index < 3 * param_count:
+                    expected_shape = basis["optim"]["m"][
+                        flat_index - 2 * param_count
+                    ]["s"]
+                else:
+                    expected_shape = basis["optim"]["v"][
+                        flat_index - 3 * param_count
+                    ]["s"]
                 if list(shape) != list(expected_shape):
                     raise CheckpointError(
                         f"delta {index} tensor {flat_index} shape disagrees with basis"
                     )
             else:
-                slot = flat_index - 2 * param_count
+                slot = flat_index - hidden_base
                 if slot >= delta_hc:
                     raise CheckpointError(
                         f"delta {index} names hidden slot {slot} beyond its count"
@@ -1247,9 +1500,15 @@ def _load_chain_store(store, head):
                     f"delta {index} introduces hidden state incompletely"
                 )
         current_hc = delta_hc
+        current_t = delta_t
         pending = delta_pending
 
-    applied = {"tensors": tensors, "pending": pending, "_hc": current_hc}
+    applied = {
+        "tensors": tensors,
+        "pending": pending,
+        "_hc": current_hc,
+        "t": current_t,
+    }
     return _assemble(basis, applied)
 
 
