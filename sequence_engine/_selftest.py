@@ -1,10 +1,17 @@
-"""Built-in self-checks for the engine. Runs in memory; writes no files."""
+"""Built-in self-checks for the engine. Runs in memory; writes no files.
+
+The concurrency/chain groups use temporary directories that are removed
+before the process returns, so no files are left behind.
+"""
 
 from __future__ import annotations
 
 import math
+import os
 import struct
 import sys
+import tempfile
+import threading
 
 from . import checkpoint as _checkpoint
 from .sequential import Sequential
@@ -689,6 +696,604 @@ def _check_checkpoint_roundtrip():
     )
 
 
+# ---------------------------------------------------------------------------
+# Concurrency checks
+# ---------------------------------------------------------------------------
+
+
+def _fixed_gradient_state():
+    """A trained boundary state with fixed, nonzero gradients."""
+    seq, _ = _fresh_stack()
+    out, _ = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out))
+    buf = bytearray()
+    seq.save(buf)
+    base_params = [p.tolist() for p in seq.parameters()]
+    grads = [p.grad.tolist() for p in seq.parameters()]
+    return seq, bytes(buf), base_params, grads
+
+
+def _subtract_path(base, grads, lr, steps):
+    """Reference path P_k = the engine's own repeated theta <- theta - lr*grad."""
+    current = [_deep(base_j) for base_j in base]
+    path = [[_deep(j) for j in current]]
+    for _ in range(steps):
+        current = [_elementwise_scale_sub(p, g, lr) for p, g in zip(current, grads)]
+        path.append([_deep(j) for j in current])
+    return path
+
+
+def _deep(value):
+    if isinstance(value, list):
+        return [_deep(item) for item in value]
+    return value
+
+
+def _find_path_k(observed_params, path):
+    """Return the unique k whose parameter vector equals *observed_params*."""
+    matches = []
+    for k, snapshot in enumerate(path):
+        if observed_params == snapshot:
+            matches.append(k)
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _check_concurrent_update_save_load():
+    # Fixed gradients: every update subtracts lr * grad along one
+    # deterministic path; a load() resets the model to k = 0. Any
+    # snapshot taken concurrently must therefore sit at a single integer
+    # position k on that path for EVERY parameter -- a half-applied
+    # update or load would put different parameters at different k.
+    seq, buf_b, base_params, grads = _fixed_gradient_state()
+    lr = 0.05
+    n_updates = 60
+    n_loads = 25
+    n_snaps = 400
+    path = _subtract_path(base_params, grads, lr, n_updates + 5)
+
+    snapshots = []
+    errors = []
+
+    def observer_stepped(barrier):
+        # Deterministic alternation: snapshot after every single update.
+        for _ in range(n_updates):
+            barrier.wait()
+            buf = bytearray()
+            seq.save(buf)
+            snapshots.append(bytes(buf))
+
+    def updater_stepped(barrier):
+        for _ in range(n_updates):
+            seq.update(lr)
+            barrier.wait()
+
+    barrier = threading.Barrier(2)
+    t_obs = threading.Thread(target=observer_stepped, args=(barrier,))
+    t_upd = threading.Thread(target=updater_stepped, args=(barrier,))
+    t_obs.start()
+    t_upd.start()
+    t_obs.join()
+    t_upd.join()
+    _check(not errors, f"stepped race raised: {errors!r}")
+    # Every interleaved snapshot is a complete boundary at one single
+    # position k on the serial path (never different parameters at
+    # different k's). When the observer reaches the barrier the next
+    # update may already have started, so k can be one step ahead.
+    seen_positions = []
+    for index, raw in enumerate(snapshots):
+        victim, _ = _fresh_stack()
+        hidden = victim.load(raw)
+        _check(hidden is not None, "raced snapshot must carry boundary hidden state")
+        observed = [p.tolist() for p in victim.parameters()]
+        k = _find_path_k(observed, path)
+        _check(
+            k is not None and k in (index + 1, index + 2),
+            f"raced snapshot {index} is not one whole state at a serial "
+            f"path position (found {k})",
+        )
+        seen_positions.append(k)
+
+    # Free-running three-way race: updates walk the path, loads reset to
+    # k = 0, snapshots must always be one globally consistent k.
+    seq, _, _, _ = _fixed_gradient_state()
+    snapshots = []
+
+    def updater():
+        try:
+            for _ in range(n_updates):
+                seq.update(lr)
+        except Exception as exc:  # pragma: no cover - reported as failure
+            errors.append(exc)
+
+    def loader():
+        try:
+            for _ in range(n_loads):
+                seq.load(buf_b)
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    def free_saver():
+        for _ in range(n_snaps):
+            buf = bytearray()
+            seq.save(buf)
+            snapshots.append(bytes(buf))
+
+    threads = [
+        threading.Thread(target=updater),
+        threading.Thread(target=loader),
+        threading.Thread(target=free_saver),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    _check(not errors, f"free race raised: {errors!r}")
+    _check(len(snapshots) == n_snaps, "every concurrent save must complete")
+    bad = 0
+    for raw in snapshots:
+        victim, _ = _fresh_stack()
+        victim.load(raw)
+        observed = [p.tolist() for p in victim.parameters()]
+        if _find_path_k(observed, path) is None:
+            bad += 1
+    _check(bad == 0, f"{bad}/{len(snapshots)} concurrent snapshots were torn")
+
+
+def _check_concurrent_writers():
+    # Two threads repeatedly save FULL checkpoints to the same path while
+    # a third walks parameters; the file must always be one complete
+    # checkpoint -- never half of one save mixed with another.
+    seq, _ = _fresh_stack()
+    out, _ = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out))
+
+    errors = []
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "shared.ckp")
+        seq.save(path)
+
+        def full_writer():
+            try:
+                for _ in range(40):
+                    try:
+                        seq.save(path)
+                    except RuntimeError:
+                        # The trainer may be mid-segment (forward without
+                        # backward); a boundary refusal is legal, retry.
+                        pass
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        def chain_writer():
+            try:
+                chain_dir = os.path.join(td, "chain")
+                for _ in range(40):
+                    try:
+                        seq.save_incremental(chain_dir)
+                    except RuntimeError:
+                        # Another thread may hold the container mid-segment
+                        # during its own forward/backward; a refused save is
+                        # a legal boundary outcome, just retry.
+                        pass
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        def trainer():
+            try:
+                for k in range(40):
+                    out, _ = seq.forward(Tensor(_SEG2 if k % 2 else _SEG1))
+                    seq.backward(_total(out))
+                    if k % 5 == 0:
+                        seq.update(0.01)
+                    seq.save(path)
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=full_writer),
+            threading.Thread(target=chain_writer),
+            threading.Thread(target=trainer),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        _check(not errors, f"concurrent writers raised: {errors!r}")
+
+        # Final full file is one complete, loadable boundary checkpoint.
+        final_raw = open(path, "rb").read()
+        victim, _ = _fresh_stack()
+        victim.load(final_raw)
+        _check(
+            _checkpoint.load_bytes(path)["pending"] is False,
+            "concurrent full saves always land on a segment boundary",
+        )
+        # The incremental chain reassembles without error.
+        rechain, _ = _fresh_stack()
+        rechain.load_incremental(os.path.join(td, "chain"))
+        full = bytearray()
+        rechain.save(full)
+        _check(
+            _checkpoint.load_bytes(bytes(full))["pending"] is False,
+            "concurrent incremental chain reassembles to a boundary state",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Version 1 reading / migration
+# ---------------------------------------------------------------------------
+
+
+def _forge_v1(document):
+    header, payload = _checkpoint._freeze(
+        document, version=1, source_version=None
+    )
+    return _checkpoint._frame(header, payload, 1)
+
+
+def _repack_full(raw, mutate_header, version=None):
+    """Rewrite a full checkpoint with a mutated header and valid CRC."""
+    if version is None:
+        version = struct.unpack("<I", raw[8:12])[0]
+    (hlen,) = struct.unpack("<Q", raw[12:20])
+    header = __import__("json").loads(raw[20 : 20 + hlen])
+    payload = raw[20 + hlen : raw.rfind(_checkpoint.END_MAGIC)]
+    mutate_header(header)
+    new_header = __import__("json").dumps(
+        header, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    body = (
+        raw[:8]
+        + struct.pack("<I", version)
+        + struct.pack("<Q", len(new_header))
+        + new_header
+        + payload
+    )
+    crc = __import__("zlib").crc32(body[20:])
+    leaf_count = len(payload) // 9
+    return body + _checkpoint.END_MAGIC + struct.pack("<QI", leaf_count, crc)
+
+
+def _check_version1_migration():
+    seq, _ = _fresh_stack()
+    out1, hidden1 = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out1))
+    v2_buf = bytearray()
+    seq.save(v2_buf)
+    document = _checkpoint.load_bytes(bytes(v2_buf))
+    _check(document["src"] == 2, "native checkpoints record source version 2")
+
+    raw_v1 = _forge_v1(document)
+    _check(struct.unpack("<I", raw_v1[8:12])[0] == 1, "forged file really is v1")
+    migrated = _checkpoint.parse_bytes(raw_v1)
+    _check(migrated["src"] == 1, "loaded v1 file records source version 1")
+
+    # Item-by-item migration reproduces state and boundary hidden exactly.
+    restored, _ = _fresh_stack()
+    restored_hidden = restored.load(raw_v1)
+    _check(restored._loaded_src == 1, "model remembers the migration source")
+    _check(
+        [p.tolist() for p in restored.parameters()]
+        == [p.tolist() for p in seq.parameters()],
+        "v1 parameters migrate unchanged",
+    )
+    _check(
+        [p.grad.tolist() for p in restored.parameters()]
+        == [p.grad.tolist() for p in seq.parameters()],
+        "v1 gradients migrate unchanged",
+    )
+    _check(
+        [s.tolist() for s in restored_hidden] == [s.tolist() for s in hidden1],
+        "v1 boundary hidden migrates unchanged",
+    )
+
+    # Continuity through a migrated checkpoint is bitwise identical.
+    migrated_buf = bytearray()
+    restored.save(migrated_buf)
+    resumed = _continuity_run(resume_from=raw_v1)
+    _check(
+        resumed == _continuity_run(),
+        "training continued after a v1 load matches an uninterrupted run",
+    )
+
+    # Migration failures reject the WHOLE file; the model is untouched.
+    victim, _ = _fresh_stack()
+    before = [p.tolist() for p in victim.parameters()]
+
+    def reject(raw, message):
+        _expect(ValueError, lambda: _checkpoint.parse_bytes(raw), message)
+        fresh, _ = _fresh_stack()
+        _expect(ValueError, lambda: fresh.load(raw), message + " via model.load")
+
+    # shape/value disagreement introduced mid-document
+    reject(
+        _repack_full(raw_v1, lambda h: h["params"].__setitem__(0, [7])),
+        "half-applicable v1 migration (parameter shape disagreement)",
+    )
+    # field added and field removed at the version boundary
+    reject(
+        _repack_full(raw_v1, lambda h: h.update(src=1)),
+        "v1 header with an unexpected new field",
+    )
+    reject(
+        _repack_full(raw_v1, lambda h: h.pop("pending")),
+        "v1 header missing a field",
+    )
+    reject(
+        _repack_full(bytes(v2_buf), lambda h: h.pop("src"), version=2),
+        "v2 header missing the source version",
+    )
+    reject(
+        _repack_full(bytes(v2_buf), lambda h: h.update(extra=1), version=2),
+        "v2 header with an unknown field",
+    )
+
+    # Non-finite leaf smuggled past the framing CRC is caught item by item.
+    import zlib
+
+    broken = bytearray(raw_v1)
+    (hlen,) = struct.unpack("<Q", bytes(broken[12:20]))
+    pstart, pend = 20 + hlen, broken.rfind(_checkpoint.END_MAGIC)
+    planted = False
+    for i in range(pstart, pend, 9):
+        if broken[i] == ord("f"):
+            broken[i + 1 : i + 9] = struct.pack("<d", float("inf"))
+            planted = True
+            break
+    _check(planted, "test fixture must contain a float leaf")
+    broken[-4:] = struct.pack("<I", zlib.crc32(bytes(broken[20:pend])))
+    reject(bytes(broken), "non-finite float in migrated v1 payload")
+
+    _check(
+        [p.tolist() for p in victim.parameters()] == before,
+        "rejected migrations leave the container untouched",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Incremental chain checks
+# ---------------------------------------------------------------------------
+
+
+class _StatelessScale:
+    """Layer with ZERO parameters: y = 0.5 * x; the hidden slot is y."""
+
+    def __init__(self):
+        self._cache = None
+
+    def parameters(self):
+        return []
+
+    def forward(self, x, hidden):
+        xs = x.tolist()
+        y = [[0.5 * v for v in row] for row in xs]
+        self._cache = xs
+        return Tensor(y), Tensor(y)
+
+    def backward(self, upstream):
+        if isinstance(upstream, Tensor):
+            dy = upstream.tolist()
+        elif isinstance(upstream, bool):
+            raise ValueError("upstream must be numeric")
+        else:
+            dy = [[float(upstream)] * len(self._cache[0]) for _ in self._cache]
+        return Tensor([[0.5 * v for v in row] for row in dy])
+
+
+def _check_incremental_chains():
+    with tempfile.TemporaryDirectory() as td:
+        chain_dir = os.path.join(td, "chain")
+        seq, _ = _fresh_stack()
+
+        seq1 = seq.save_incremental(chain_dir)
+        _check(seq1 == 1, "first chain entry is sequence 1")
+        files = sorted(os.listdir(chain_dir))
+        _check(
+            files == [".seqckp.lock", "00000001.delta", "base.ckp", "manifest.json"],
+            f"chain directory layout: {files}",
+        )
+
+        # No state change: the delta writes no layer bodies but the chain
+        # advances and reassembly is still bitwise identical to a full save.
+        no_change_size = os.path.getsize(os.path.join(chain_dir, "00000001.delta"))
+        seq.save_incremental(chain_dir)
+        delta2_size = os.path.getsize(os.path.join(chain_dir, "00000002.delta"))
+        _check(
+            delta2_size < os.path.getsize(os.path.join(chain_dir, "base.ckp")),
+            "an unchanged snapshot writes far less than a full checkpoint",
+        )
+        _check(no_change_size > 0, "first delta still fixes references/state")
+
+        def full_bytes(model):
+            buf = bytearray()
+            model.save(buf)
+            return bytes(buf)
+
+        # Walk several segments + updates, chaining between each step.
+        history = []
+        segments = (_SEG1, _SEG2, _SEG3, _SEG1)
+        for index, segment in enumerate(segments):
+            out, hidden = seq.forward(Tensor(segment))
+            seq.backward(_total(out))
+            if index % 2 == 1:
+                seq.update(0.1)
+            new_seq = seq.save_incremental(chain_dir)
+            history.append((new_seq, full_bytes(seq)))
+            # Loading the chain at every intermediate step must match.
+            reader, _ = _fresh_stack()
+            reader.load_incremental(chain_dir)
+            _check(
+                full_bytes(reader) == full_bytes(seq),
+                f"chain reassembly after entry {new_seq} is bitwise identical "
+                f"to the full save",
+            )
+        _check(
+            [n for n, _ in history] == [3, 4, 5, 6],
+            "chain sequence ids advance one per snapshot",
+        )
+
+        # Hidden state survives an incremental-only round trip.
+        reader, _ = _fresh_stack()
+        restored_hidden = reader.load_incremental(chain_dir)
+        _check(
+            [s.tolist() for s in restored_hidden] == [s.tolist() for s in hidden],
+            "incremental load restores boundary hidden state",
+        )
+
+        # Empty-parameter layers take part deterministically.
+        weights = _base_weights()
+        rnn = _RNNStep(_N_IN, _N_H1, weights["wxh1"], weights["whh1"], weights["b1"])
+        stateless = _StatelessScale()
+        mixed = Sequential([rnn, stateless])
+        mixed_dir = os.path.join(td, "mixed")
+        mixed.save_incremental(mixed_dir)
+        out, _ = mixed.forward(Tensor(_SEG1))
+        mixed.backward(_total(out))
+        mixed.update(0.1)
+        mixed.save_incremental(mixed_dir)
+        got, _ = _fresh_stack()  # wrong model on purpose; build matching one:
+        rebuilt = Sequential(
+            [
+                _RNNStep(
+                    _N_IN, _N_H1,
+                    weights["wxh1"], weights["whh1"], weights["b1"],
+                ),
+                _StatelessScale(),
+            ]
+        )
+        rebuilt.load_incremental(mixed_dir)
+        expected_buf = bytearray()
+        mixed.save(expected_buf)
+        actual_buf = bytearray()
+        rebuilt.save(actual_buf)
+        _check(
+            bytes(actual_buf) == bytes(expected_buf),
+            "zero-parameter layers are referenced deterministically and "
+            "reassemble bitwise",
+        )
+
+        # Missing directory/path is FileNotFoundError, not ValueError.
+        _expect(
+            FileNotFoundError,
+            lambda: rebuilt.load_incremental(os.path.join(td, "no-such-chain")),
+            "missing incremental chain directory",
+        )
+
+        # Incremental save into an impossible directory is OSError (a file
+        # blocks the chain's parent path).
+        blocker = os.path.join(td, "blocker")
+        with open(blocker, "wb") as fh:
+            fh.write(b"x")
+        _expect(
+            OSError,
+            lambda: seq.save_incremental(os.path.join(blocker, "chain")),
+            "unwritable chain dir",
+        )
+
+
+def _check_incremental_corruption():
+    import json
+    import zlib
+
+    with tempfile.TemporaryDirectory() as td:
+        chain_dir = os.path.join(td, "chain")
+        seq, _ = _fresh_stack()
+        seq.save_incremental(chain_dir)
+        for segment in (_SEG1, _SEG2, _SEG3):
+            out, _ = seq.forward(Tensor(segment))
+            seq.backward(_total(out))
+            seq.update(0.05)
+            seq.save_incremental(chain_dir)
+        tip_full = bytearray()
+        seq.save(tip_full)
+
+        def expect_chain_rejected(message):
+            fresh, _ = _fresh_stack()
+            _expect(ValueError, lambda: fresh.load_incremental(chain_dir), message)
+
+        # Truncated middle delta.
+        delta2 = os.path.join(chain_dir, "00000002.delta")
+        good = open(delta2, "rb").read()
+        open(delta2, "wb").write(good[: len(good) // 2])
+        expect_chain_rejected("truncated delta")
+        open(delta2, "wb").write(good)
+
+        # Flipped byte inside a delta (CRC catches it).
+        flipped = bytearray(good)
+        flipped[len(flipped) // 2] ^= 0xFF
+        open(delta2, "wb").write(bytes(flipped))
+        expect_chain_rejected("corrupt delta byte")
+        open(delta2, "wb").write(good)
+
+        # Missing middle delta file but manifest ahead of it.
+        os.unlink(delta2)
+        expect_chain_rejected("missing delta member")
+        open(delta2, "wb").write(good)
+
+        # Manifest field removed / oversized integer / garbage JSON.
+        manifest_path = os.path.join(chain_dir, "manifest.json")
+        good_manifest = open(manifest_path, "rb").read()
+        manifest = json.loads(good_manifest.decode("utf-8"))
+        del manifest["prev_crc"]
+        open(manifest_path, "w").write(json.dumps(manifest))
+        expect_chain_rejected("manifest missing field")
+        manifest["prev_crc"] = 10**40  # oversized integer
+        open(manifest_path, "w").write(json.dumps(manifest))
+        expect_chain_rejected("manifest oversized integer")
+        open(manifest_path, "wb").write(b"{not json")
+        expect_chain_rejected("garbage manifest")
+        open(manifest_path, "wb").write(good_manifest)
+
+        # Tampered base.
+        base_path = os.path.join(chain_dir, "base.ckp")
+        good_base = open(base_path, "rb").read()
+        open(base_path, "wb").write(good_base[:-8])
+        expect_chain_rejected("truncated base")
+        open(base_path, "wb").write(good_base)
+
+        # Chain still intact after restoring everything.
+        fresh, _ = _fresh_stack()
+        fresh.load_incremental(chain_dir)
+        buf = bytearray()
+        fresh.save(buf)
+        _check(bytes(buf) == bytes(tip_full), "chain heals back to the tip")
+
+        # Crash mid-write: an orphan truncated next delta exists but the
+        # manifest still points at the previous complete entry.
+        orphan = os.path.join(chain_dir, "00000005.delta")
+        open(orphan, "wb").write(b"SEQDELTA1\x00\x00")
+        fresh, _ = _fresh_stack()
+        fresh.load_incremental(chain_dir)  # ignores the unreferenced orphan
+        buf = bytearray()
+        fresh.save(buf)
+        _check(
+            bytes(buf) == bytes(tip_full),
+            "an interrupted append leaves the previous complete entry usable",
+        )
+        # A new append atomically replaces the orphan and continues.
+        out, _ = seq.forward(Tensor(_SEG2))
+        seq.backward(_total(out))
+        next_seq = seq.save_incremental(chain_dir)
+        _check(next_seq == 5, "chain continues from the last published entry")
+
+        # Non-finite state is refused at write time and leaves no trace.
+        poison, _ = _fresh_stack()
+        poison.parameters()[0]._set_values(
+            [[float("nan"), 0.0, 0.0], [0.0, 0.0, 0.0]]
+        )
+        _expect(
+            ValueError,
+            lambda: poison.save_incremental(os.path.join(td, "poison")),
+            "non-finite parameter refused for incremental save",
+        )
+        _check(
+            not os.path.exists(os.path.join(td, "poison")),
+            "a refused incremental save creates no chain directory state",
+        )
+
+
 _GROUPS = [
     ("tensor basics", _check_tensor_basics),
     ("tensor validation", _check_tensor_validation),
@@ -702,6 +1307,11 @@ _GROUPS = [
     ("tuple loss and backward retry", _check_tuple_loss_and_retry),
     ("checkpoint bitwise continuity", _check_checkpoint_continuity),
     ("checkpoint round-trip and rejection", _check_checkpoint_roundtrip),
+    ("concurrent update/save/load", _check_concurrent_update_save_load),
+    ("version 1 migration", _check_version1_migration),
+    ("incremental chains", _check_incremental_chains),
+    ("incremental corruption and recovery", _check_incremental_corruption),
+    ("concurrent checkpoint writers", _check_concurrent_writers),
 ]
 
 
