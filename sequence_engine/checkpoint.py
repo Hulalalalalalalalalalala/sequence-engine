@@ -43,9 +43,19 @@ Two on-disk shapes share the same leaf encoding and trailer:
   Reclamation is a pure reachability function, so sweeping again changes
   nothing; segments no head can reach (orphans left by a hard kill) and
   staging directories from a killed fork, delete or compaction are swept
-  deterministically on the next fork, compaction or deletion.  A family
-  of chains can also be verified read-only in one call, with the first
-  bad segment reported together with every chain that reaches it.
+  deterministically on the next fork, compaction, deletion or merge.  A
+  family of chains can also be verified read-only in one call, with the
+  first bad segment reported together with every chain that reaches it.
+* **Branch merges** -- one chain's current state can be merged onto
+  another: the target keeps every segment it had and receives one new,
+  target-owned delta segment after its head carrying only the tensors in
+  which the source's head state genuinely differs (an empty delta when
+  the states already agree), so loading the target is bit for bit the
+  source's merge-time state while the source's head and files never move
+  and shared segments are never written twice.  The merge uses the same
+  segment-then-head append commit a save does -- a kill leaves only the
+  old or the new head, both one complete chain -- and its orphan residue
+  is reclaimed by the next fork, compaction, deletion or merge.
 
 Full snapshot wire format (all integers little-endian)::
 
@@ -3321,6 +3331,207 @@ def delete_chain_memory(store):
         for name in list(store._objects):
             if _segment_index(name) is not None:
                 del store._objects[name]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Branch merge: landing one chain's current state onto another
+#
+# A merge appends exactly one segment to the target chain: the delta
+# between the target's head state and the source chain's head state,
+# encoded by the same leaf-identity diff a plain save uses.  The target's
+# existing segments are all kept and the new delta is the only segment
+# added, so loading the target reassembles bit for bit to the state the
+# source held at merge time while the source's head and segment files are
+# never touched.  Segments the family already shares (the hard-linked
+# fork prefix) are never rewritten; the new delta carries only tensors
+# the source alone owned that genuinely differ from the target's current
+# state, and is empty (but still appended) when the two states already
+# agree -- so merging the same state twice keeps the state unchanged.
+#
+# The merge runs as two independently serialised steps rather than one
+# critical section over both directories: the source chain's current
+# state is assembled under the source lock (a live fold is waited out
+# first, exactly as for a fork), and only then is the one merge delta
+# appended to the target under the target lock (segment-then-head, as a
+# save does).  Serialising the steps instead of holding the two locks
+# together is deadlock-free for any two merges, including a pair
+# running in opposite directions at once; the captured source state is
+# a fully materialised document, so a later move of the source chain
+# cannot disturb the append.  A process killed before the head moves
+# leaves only an orphan segment beyond the old head (reclaimed like any
+# save residue by the next fork, compaction, deletion or merge), and
+# the head never names anything but a complete chain, old or new.
+# ---------------------------------------------------------------------------
+
+
+def merge_chains(source, target):
+    """Merge the current state of chain *source* onto chain *target*.
+
+    Every segment *target* already had is kept; one new delta segment is
+    appended after its head carrying the tensors in which the source
+    chain's head state differs from the target's head state (an empty
+    delta when the two already agree).  Loading *target* afterwards
+    reassembles bit for bit to the state *source* held at merge time,
+    while *source* -- its head and its segment files -- is not modified
+    at all, and the two chains keep evolving independently.  Segments
+    the family already shares are never stored twice: the appended
+    segment belongs to the target alone and holds only the part the
+    source alone owned that genuinely differs.  The merge advances no
+    optimizer step -- the target simply inherits the source's complete
+    state, its step count included; a subsequent full save lands exactly
+    the merged state.
+
+    The read of the source and the append to the target are two steps,
+    each serialised by its chain directory lock (a live fold is waited
+    out first), so merges -- even two merging the same two chains in
+    opposite directions at once -- and forks, compactions, deletions and
+    saves serialise without deadlocking and every chain always loads as
+    one complete state.
+
+    Repeating the merge of the same state appends another empty delta
+    and changes nothing else.  A missing source or target directory, or
+    a segment either head reaches that is absent, raises
+    ``FileNotFoundError`` and leaves every other chain untouched.
+    Merging a chain into itself, two chains whose parameter shapes or
+    layer order disagree, or an unparseable chain structure rejects the
+    whole merge with ``ValueError`` before one byte of the target is
+    rewritten.  An unwritable directory or a full disk raises
+    ``OSError``; a process killed mid-merge leaves only the old head
+    (plus orphan segment residue) or the new head, both one complete
+    chain, and the residue is reclaimed deterministically by the next
+    fork, compaction, deletion or merge.
+    """
+    if not isinstance(source, (str, os.PathLike)):
+        raise TypeError("merge source must be a chain directory path")
+    if not isinstance(target, (str, os.PathLike)):
+        raise TypeError("merge target must be a chain directory path")
+    source = os.fspath(source)
+    target = os.fspath(target)
+    if not os.path.isdir(source):
+        raise FileNotFoundError(
+            f"incremental checkpoint directory not found: {source!r}"
+        )
+    if not os.path.isdir(target):
+        raise FileNotFoundError(
+            f"incremental checkpoint directory not found: {target!r}"
+        )
+    source_abs = os.path.abspath(source)
+    target_abs = os.path.abspath(target)
+    if source_abs == target_abs:
+        raise CheckpointError("a chain cannot be merged into itself")
+    # Deterministic GC of killed fork/delete staging in the family
+    # directory the merge writes into, exactly as the other writers do.
+    _sweep_parent_staging(os.path.dirname(target_abs))
+
+    # Step 1: capture the source's current state under its own lock.
+    source_doc = _capture_chain_state(source_abs)
+    # Step 2: append the one merge delta under the target lock.
+    _append_merge_delta(target_abs, source_doc)
+    return None
+
+
+def _capture_chain_state(directory):
+    """Assemble a chain's current head state, waiting out a live fold.
+
+    The directory is opened exactly the way a fork opens its source: any
+    interrupted fold is rolled forward and a live one is waited out, so
+    the captured document comes from a quiescent chain.  A missing
+    referenced segment raises ``FileNotFoundError``; any other defect
+    raises :class:`CheckpointError`.
+    """
+    while True:
+        with _DirectoryChainLock(directory):
+            store = _DirectoryChainStore(directory)
+            _recover_directory_chain(directory, store)
+            if not _marker_exists(directory):
+                head = _read_head_optional(store)
+                if head is None:
+                    raise CheckpointError(
+                        "chain has no head pointer (no basis segment committed)"
+                    )
+                return _load_chain_store(store, head)
+        _wait_for_live_marker(directory)
+
+
+def _append_merge_delta(directory, source_doc):
+    """Validate *source_doc* against the target and append the merge delta.
+
+    The target is opened quiescent and the whole append runs in one lock
+    acquisition: the target head is read, its current state assembled and
+    the delta frozen (the pure diff is also the full compatibility
+    check) before a single byte is written, so a rejected merge leaves
+    the target byte for byte untouched.
+    """
+    while True:
+        with _DirectoryChainLock(directory):
+            store = _DirectoryChainStore(directory)
+            _recover_directory_chain(directory, store)
+            if not _marker_exists(directory):
+                target_head = _read_head_optional(store)
+                if target_head is None:
+                    raise CheckpointError(
+                        "chain has no head pointer (no basis segment committed)"
+                    )
+                target_doc = _load_chain_store(store, target_head)
+                next_index = target_head + 1
+                # The diff is also the compatibility check: equal
+                # parameter counts, equal layer order, consistent
+                # hidden-slot transitions and matching tensor shapes are
+                # all required before the delta can be frozen.
+                delta_bytes = _build_delta_between(
+                    target_doc, source_doc, next_index
+                )
+                # Validation is complete; only now may crash residue be
+                # reclaimed (unreachable files only -- no reachable
+                # segment is touched).
+                _sweep_chain_debris(directory, target_head)
+                store.write_segment(_segment_name(next_index), delta_bytes)
+                _commit_head(store, next_index)
+                return None
+        _wait_for_live_marker(directory)
+
+
+def merge_chains_memory(source, target):
+    """Merge an in-memory chain's state onto another; same semantics as
+    :func:`merge_chains`.
+
+    The source state is captured under the source store lock and the one
+    merge delta is then appended under the target store lock, so the two
+    steps are serialised independently and opposing merges cannot
+    deadlock.  The target receives exactly one new delta segment (empty
+    when the two states already agree) and reassembles afterwards to the
+    source's head state; the source store is never modified.  Merging a
+    store into itself raises ``ValueError``.
+    """
+    if not isinstance(source, MemoryChain):
+        raise TypeError("merge source must be a MemoryChain")
+    if not isinstance(target, MemoryChain):
+        raise TypeError("merge target must be a MemoryChain")
+    if source is target:
+        raise CheckpointError("a chain cannot be merged into itself")
+    with source._lock:
+        source_head = _read_head_optional(source)
+        if source_head is None:
+            raise CheckpointError(
+                "merge source chain has no head pointer "
+                "(no basis segment committed)"
+            )
+        source_doc = _load_chain_store(source, source_head)
+    with target._lock:
+        target_head = _read_head_optional(target)
+        if target_head is None:
+            raise CheckpointError(
+                "merge target chain has no head pointer "
+                "(no basis segment committed)"
+            )
+        target_doc = _load_chain_store(target, target_head)
+        next_index = target_head + 1
+        delta_bytes = _build_delta_between(
+            target_doc, source_doc, next_index
+        )
+        target.write_segment(_segment_name(next_index), delta_bytes)
+        _commit_head(target, next_index)
     return None
 
 

@@ -165,6 +165,33 @@ checkpoint path) and writes no files.
   never a half-written one. Deleting a `MemoryChain` drops its head
   and segments in one critical section, and the emptied chain can be
   reused.
+- `Sequential.merge(source, target) -> None` merges one chain's current
+  state onto another chain (two chain directories, or two
+  `MemoryChain` stores). The target keeps every segment it already had
+  and exactly one new delta segment is appended after its head,
+  carrying only the tensors in which the source chain's head state
+  differs from the target's current state (an empty delta when the two
+  already agree). Loading the target afterwards is bit for bit
+  identical to loading the source at merge time; the source chain --
+  its head and its segment files -- is not modified at all, and the two
+  chains then evolve independently. Segments the family already shares
+  are never stored twice: the appended segment belongs to the target
+  alone and holds only the part the source alone owned that genuinely
+  differs. Repeating the merge of the same state appends another empty
+  delta and changes nothing, and the number of segments grows exactly
+  with the difference (always by one segment). The merge advances no
+  optimizer step: the target inherits the source's complete state, its
+  step count included, and a full save right afterwards lands exactly
+  the merged state. A missing source or target directory or a missing
+  referenced segment raises `FileNotFoundError` and leaves every other
+  chain untouched; merging a chain into itself, two chains whose
+  parameter shapes or layer order disagree, or an unparseable chain
+  structure rejects the whole merge with `ValueError` before one target
+  byte is rewritten; an unwritable directory or a full disk raises
+  `OSError`. A process killed mid-merge leaves only the old head or the
+  new head reachable (both one complete chain), and the residue -- an
+  orphan segment beyond the old head -- is reclaimed deterministically
+  by the next fork, compaction, deletion or merge.
 - `Sequential.verify(source)` verifies an existing incremental checkpoint
   chain (a chain directory or a `MemoryChain`) strictly read-only. It
   walks the basis and every delta through the `head`, checking each
@@ -272,7 +299,15 @@ branch of the family -- its directory, its head and the segments it
 alone owned -- atomically with respect to concurrent forks and
 compactions, and deterministically sweeps crash residue (staging
 directories of killed forks/deletes, segments no head can reach) on
-every fork, compaction and deletion. `checkpoint.verify_chain` (or
+every fork, compaction, deletion and merge. `Sequential.merge` (or
+`checkpoint.merge_chains`) lands one chain's current state onto another
+inside the family: the target keeps all of its segments and gains one
+target-owned delta carrying only the genuine difference from the
+source, so the target then loads to the source's state bit for bit
+while the source is untouched and the shared prefix is stored once;
+the merge uses the same segment-then-head append commit a save does,
+so a kill leaves only the old or the new head and its orphan residue
+is swept on the next family operation. `checkpoint.verify_chain` (or
 `Sequential.verify`) accepts a list of chain directories to verify a
 whole family read-only, reporting the first bad segment with every chain
 that reaches it.

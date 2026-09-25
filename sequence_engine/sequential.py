@@ -132,6 +132,11 @@ class Sequential:
       segments stay while any chain's head can reach them, and crash
       residue (staging directories, unreachable orphan segments) is
       swept deterministically.
+    * ``merge(source, target)`` -- lands one chain's current state onto
+      another chain by appending exactly one delta segment to the
+      target; the target reassembles afterwards to the source's state
+      bit for bit while the source is untouched and shared segments are
+      never stored twice.
 
     All public operations are serialised by one re-entrant lock, so
     several threads may interleave ``forward``, ``backward``, ``update``,
@@ -802,6 +807,55 @@ class Sequential:
                 return _checkpoint.delete_chain(target)
             raise TypeError(
                 "delete target must be a chain directory or a MemoryChain"
+            )
+
+    def merge(self, source, target):
+        """Merge one chain's current state onto another chain.
+
+        *source* and *target* are both existing chain directories, or
+        both ``MemoryChain`` stores.  The merge lands the state the
+        source chain holds at this moment onto the target chain: every
+        segment the target already had is kept and exactly one new delta
+        segment is appended after its head, carrying the tensors in
+        which the source state differs from the target's current state
+        (an empty delta when they already agree).  Loading *target*
+        afterwards is bit for bit identical to loading *source* at
+        merge time, while *source* -- its head and its segment files --
+        is not modified at all, and the two chains then keep evolving
+        independently.  Segments the family already shares are never
+        stored twice; the appended segment belongs to the target alone
+        and holds only the part the source alone owned that genuinely
+        differs.  The merge advances no optimizer step (the target
+        inherits the source's complete state, its step count included);
+        a full save right after the merge lands exactly the merged
+        state.
+
+        Merging the same state again appends another empty delta and
+        otherwise changes nothing.  A missing source or target
+        directory, or a segment either head reaches that is absent,
+        raises ``FileNotFoundError`` and leaves every other chain
+        untouched; merging a chain into itself, two chains whose
+        parameter shapes or layer order disagree, or an unparseable
+        chain structure rejects the whole merge with ``ValueError``
+        before one target byte is rewritten.  An unwritable directory
+        or a full disk raises ``OSError``; a process killed mid-merge
+        leaves only the old head or the new head reachable (both one
+        complete chain), and the residue -- an orphan segment beyond
+        the old head -- is reclaimed deterministically by the next
+        fork, compaction, deletion or merge.
+        """
+        with self._lock:
+            if isinstance(source, _checkpoint.MemoryChain) and isinstance(
+                target, _checkpoint.MemoryChain
+            ):
+                return _checkpoint.merge_chains_memory(source, target)
+            if isinstance(source, (str, os.PathLike)) and isinstance(
+                target, (str, os.PathLike)
+            ):
+                return _checkpoint.merge_chains(source, target)
+            raise TypeError(
+                "merge source and target must both be chain directories "
+                "or both MemoryChains"
             )
 
     def verify(self, source):

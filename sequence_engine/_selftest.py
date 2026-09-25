@@ -2120,6 +2120,232 @@ def _check_chain_delete_memory():
     )
 
 
+def _check_chain_merge_memory():
+    # Merging a source chain onto a target keeps the target's old
+    # segments, appends exactly one target-owned delta and makes the
+    # target load to the source's merge-time state bit for bit; the
+    # source chain (head and files) is never modified and the two chains
+    # keep evolving independently.
+    seq, _ = _fresh_stack()
+    source = _checkpoint.MemoryChain()
+    seq.save(source)  # seg 0
+    out, _ = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out))
+    seq.update(_LR)
+    seq.save(source)  # seg 1 (hidden introduced)
+    seq.adam_step(_ADAM_LR)
+    seq.save(source)  # seg 2 (optimizer state moves)
+
+    # The target forks at seg 1 and then diverges on its own.
+    target = _checkpoint.fork_chain_memory(source, up_to=1)
+    branch_seq, _ = _fresh_stack()
+    branch_hidden = branch_seq.load(target)
+    out2, branch_hidden = branch_seq.forward(Tensor(_SEG2), branch_hidden)
+    branch_seq.backward(_total(out2))
+    branch_seq.adam_step(_ADAM_LR)
+    branch_seq.save(target)  # target seg 2 differs from source seg 2
+
+    source_state = _checkpoint.build_bytes(
+        _checkpoint.load_chain_memory(source)
+    )
+    source_head_before = source.read_head()
+    target_head_before = int(target.read_head())
+    segments_before = len(target)
+
+    _checkpoint.merge_chains_memory(source, target)
+
+    _check(
+        target.read_head() == str(target_head_before + 1).encode("ascii"),
+        "a merge advances the target head by exactly one",
+    )
+    _check(
+        len(target) == segments_before + 1,
+        "a merge appends exactly one segment",
+    )
+    _check(
+        source.read_head() == source_head_before,
+        "a merge never moves the source head",
+    )
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(target))
+        == source_state,
+        "the merged target loads to the source's merge-time state bit for bit",
+    )
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(source))
+        == source_state,
+        "a merge leaves the source chain state untouched",
+    )
+    source_doc = _checkpoint.load_chain_memory(source)
+    target_doc = _checkpoint.load_chain_memory(target)
+    _check(
+        target_doc["optim"]["t"] == source_doc["optim"]["t"],
+        "a merge inherits the step count rather than advancing it",
+    )
+
+    # A full save after the merge lands exactly the merged state.
+    merged_seq, _ = _fresh_stack()
+    merged_seq.load(target)
+    full = bytearray()
+    merged_seq.save(full)
+    _check(
+        bytes(full) == source_state,
+        "a full save after a merge lands exactly the merged state",
+    )
+
+    # Re-merging the same state appends an empty delta and changes the
+    # state not at all; the segment count still grows with the call.
+    _checkpoint.merge_chains_memory(source, target)
+    empty_index = target_head_before + 2
+    _n, _hc, _p, empty_items = _checkpoint._parse_delta(
+        target.read_segment(_checkpoint._segment_name(empty_index)), empty_index
+    )
+    _check(empty_items == [], "re-merging an equal state appends an empty delta")
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(target))
+        == source_state,
+        "an empty merge delta keeps the state exactly the same",
+    )
+
+    # Both chains then evolve independently; the merge target never
+    # shares state by mutation with the source.
+    source_seq, _ = _fresh_stack()
+    source_seq.load(source)
+    source_seq.update(_LR)
+    source_seq.save(source)
+    target_seq, _ = _fresh_stack()
+    target_seq.load(target)
+    target_seq.update(_LR)
+    target_seq.save(target)
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(source))
+        == _checkpoint.build_bytes(_checkpoint.load_chain_memory(target)),
+        "identical post-merge steps keep the chains in lockstep",
+    )
+    target_seq.adam_step(_ADAM_LR)
+    target_seq.save(target)
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(source))
+        != _checkpoint.build_bytes(_checkpoint.load_chain_memory(target)),
+        "a later change on one chain leaves the other independent",
+    )
+    _check(
+        _checkpoint.verify_chain_memory(source).ok
+        and _checkpoint.verify_chain_memory(target).ok,
+        "both chains verify after a merge and independent evolution",
+    )
+
+    # Merging a fork point straight across needs no change at all: the
+    # appended delta is empty even when the target had a different tail.
+    ancestor = _checkpoint.MemoryChain()
+    base_seq, _ = _fresh_stack()
+    base_seq.save(ancestor)
+    out, hidden = base_seq.forward(Tensor(_SEG1))
+    base_seq.backward(_total(out))
+    base_seq.update(_LR)
+    base_seq.save(ancestor)  # seg 1
+    twin = _checkpoint.fork_chain_memory(ancestor, up_to=1)
+    _checkpoint.merge_chains_memory(ancestor, twin)
+    _n, _hc, _p, items = _checkpoint._parse_delta(
+        twin.read_segment(_checkpoint._segment_name(2)), 2
+    )
+    _check(items == [], "merging an equal head state appends an empty delta")
+
+    # Error taxonomy.
+    _expect(
+        ValueError,
+        lambda: _checkpoint.merge_chains_memory(source, source),
+        "merging a chain into itself is rejected",
+    )
+    empty = _checkpoint.MemoryChain()
+    _expect(
+        ValueError,
+        lambda: _checkpoint.merge_chains_memory(source, empty),
+        "merging onto a chain with no committed basis is rejected",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.merge_chains_memory(empty, target),
+        "merging from a chain with no committed basis is rejected",
+    )
+    _expect(
+        TypeError,
+        lambda: _checkpoint.merge_chains_memory(object(), target),
+        "merge rejects a non-MemoryChain source",
+    )
+    _expect(
+        TypeError,
+        lambda: _checkpoint.merge_chains_memory(source, object()),
+        "merge rejects a non-MemoryChain target",
+    )
+
+    # Two chains whose parameter shapes disagree are rejected wholesale
+    # and leave the target byte for byte untouched.
+    other_weights = _base_weights()
+    other_weights["b1"] = [0.01, -0.02]  # shape [2] instead of [3]
+    shaped_seq, _ = _fresh_stack(other_weights)
+    shaped = _checkpoint.MemoryChain()
+    shaped_seq.save(shaped)
+    target_bytes_before = sorted(
+        (name, target.read_segment(name))
+        for name in target._objects
+        if _checkpoint._segment_index(name) is not None
+    )
+    target_head_saved = target.read_head()
+    _expect(
+        ValueError,
+        lambda: _checkpoint.merge_chains_memory(shaped, target),
+        "chains with mismatched parameter shapes refuse a merge",
+    )
+    _check(
+        target.read_head() == target_head_saved
+        and sorted(
+            (name, target.read_segment(name))
+            for name in target._objects
+            if _checkpoint._segment_index(name) is not None
+        )
+        == target_bytes_before,
+        "a rejected merge leaves the target untouched",
+    )
+
+    # A missing referenced segment in the source is a FileNotFoundError
+    # (a directory or a referenced segment that is absent) and leaves
+    # the target untouched.
+    hole = _checkpoint.fork_chain_memory(source)
+    del hole._objects[_checkpoint._segment_name(1)]
+    head_saved = target.read_head()
+    _expect(
+        FileNotFoundError,
+        lambda: _checkpoint.merge_chains_memory(hole, target),
+        "a source missing a referenced segment raises FileNotFoundError",
+    )
+    _check(target.read_head() == head_saved, "target unchanged after a bad source")
+
+    # The container-level entry point merges memory chains too.
+    via_seq, _ = _fresh_stack()
+    c1 = _checkpoint.MemoryChain()
+    via_seq.save(c1)
+    via_seq.update(_LR)
+    via_seq.save(c1)
+    c2 = _checkpoint.fork_chain_memory(c1, up_to=0)
+    via_seq.merge(c1, c2)
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(c2))
+        == _checkpoint.build_bytes(_checkpoint.load_chain_memory(c1)),
+        "Sequential.merge merges two memory chains",
+    )
+    _expect(
+        TypeError,
+        lambda: via_seq.merge(c1, bytearray()),
+        "merge rejects mismatched target kinds",
+    )
+    _expect(
+        TypeError,
+        lambda: via_seq.merge(bytearray(), c2),
+        "merge rejects mismatched source kinds",
+    )
+
+
 def _check_streaming_compaction_interleaves():
     # The streaming fold keeps working through concurrent appends and
     # reads: a compactor, an appender and readers run at once against one
@@ -2387,6 +2613,7 @@ _GROUPS = [
     ("in-memory chain compaction", _check_chain_compaction_memory),
     ("in-memory chain fork", _check_chain_fork_memory),
     ("in-memory chain delete", _check_chain_delete_memory),
+    ("in-memory chain merge", _check_chain_merge_memory),
     ("streaming compaction interleave", _check_streaming_compaction_interleaves),
     ("chain verification", _check_chain_verification),
     ("backward replay failure surfaced", _check_backward_replay_failure_is_surfaced),

@@ -13,8 +13,10 @@ Public interface (see README.md):
   (deriving a branch chain that shares the source chain's prefix
   segments and then evolves independently), ``delete`` (removing a
   branch chain and deterministically reclaiming the segments no
-  remaining chain can reach) and ``verify`` (strictly read-only
-  verification of an incremental chain or a chain family).
+  remaining chain can reach), ``merge`` (landing one chain's current
+  state onto another by appending one target-owned delta segment) and
+  ``verify`` (strictly read-only verification of an incremental chain
+  or a chain family).
 """
 
 from .checkpoint import MemoryChain
