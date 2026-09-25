@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import struct
 import threading
 
@@ -118,6 +119,9 @@ class Sequential:
       parameters, accumulated gradients, optimizer state and
       slice-boundary hidden state, to a filesystem path, an
       incremental-chain directory or to an in-memory ``bytearray``.
+    * ``compact(target, up_to=None)`` -- folds an incremental chain's
+      basis and a prefix of its deltas into one new basis segment,
+      crash-safely; the reassembled state is bit for bit unchanged.
 
     All public operations are serialised by one re-entrant lock, so
     several threads may interleave ``forward``, ``backward``, ``update``,
@@ -162,6 +166,12 @@ class Sequential:
         self._segment_recompute = False
         self._anchors = None
         self._forward_fingerprint = None
+        # Retry anchors (segment input + incoming hidden values) kept in
+        # every mode while a backward is pending: if a layer raises
+        # mid-backward the segment's forward is replayed from them, so
+        # layer caches a failed pass destroyed are rebuilt before the
+        # caller retries.
+        self._retry_anchors = None
         # Optimizer state: first/second moment trees per parameter plus the
         # step count.  Lazily sized to the parameter list on first use.
         self._adam_t = 0
@@ -208,6 +218,10 @@ class Sequential:
             self._hidden_shapes = [slot.shape for slot in new_hidden]
             self._last_output = x
             self._last_hidden = new_hidden
+            self._retry_anchors = (
+                batch.tolist(),
+                [None if slot is None else slot.tolist() for slot in slots],
+            )
             if self._recompute:
                 # Bounded-memory mode: keep only the anchors needed to
                 # recompute this segment's activations at backward time --
@@ -276,10 +290,48 @@ class Sequential:
             except BaseException:
                 for param, saved in zip(self.parameters(), grad_snapshot):
                     param.grad = None if saved is None else Tensor(saved)
+                # A layer's failed backward may also have destroyed caches a
+                # retry would need (its own, or a layer's that already ran).
+                # Replay the segment's forward from the retry anchors so every
+                # layer cache is rebuilt exactly as the recorded forward left
+                # it.  The replay only re-runs layer forwards -- parameters,
+                # gradients and the recorded boundary state stay untouched --
+                # and a replay failure never masks the original error.
+                try:
+                    self._replay_forward()
+                except BaseException:
+                    pass
                 raise
             self._pending_backward = False
             self._anchors = None
             self._forward_fingerprint = None
+            self._retry_anchors = None
+
+    def _replay_forward(self):
+        """Re-run the in-flight segment's forward to rebuild layer caches.
+
+        Uses the retry anchors recorded at forward time.  The container's
+        own recorded state (``_last_output``, ``_last_hidden``, the
+        anchors) is left exactly as it was, so a retried backward observes
+        the same boundary and the tuple-loss identity check still passes.
+        """
+        if self._retry_anchors is None:
+            return
+        batch_values, slot_values = self._retry_anchors
+        x = Tensor(batch_values)
+        slots = [None if value is None else Tensor(value) for value in slot_values]
+        for module, slot in zip(self._modules, slots):
+            result = module.forward(x, slot)
+            try:
+                x, slot_out = result
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "each layer's forward must return an (output, hidden) pair"
+                ) from exc
+            if not isinstance(x, Tensor) or not isinstance(slot_out, Tensor):
+                raise ValueError(
+                    "each layer's forward must return (Tensor, Tensor)"
+                )
 
     def _recompute_activations(self):
         """Rebuild the in-flight segment's activations from its anchors.
@@ -600,10 +652,44 @@ class Sequential:
             self._segment_recompute = False
             self._anchors = None
             self._forward_fingerprint = None
+            self._retry_anchors = None
             self._loaded_from_version = source_version
             if new_hidden is None:
                 return None
             return [Tensor(slot.tolist()) for slot in new_hidden]
+
+    def compact(self, target, up_to=None):
+        """Compact an incremental checkpoint chain in place.
+
+        *target* is an existing chain directory or a ``MemoryChain``.  The
+        basis segment and the deltas through *up_to* (the current head
+        when omitted) are folded into one new basis segment and the
+        remaining deltas are renumbered after it.  The state the chain
+        reassembles to -- parameters, gradients, optimizer moments and
+        step count, hidden state -- is bit for bit identical before and
+        after, and compaction advances no optimizer step; only the
+        segment count changes, decreasing deterministically by the merged
+        range.  Repeating the same compaction is a no-op, as is a chain
+        with nothing to merge.  Old-version segments participate exactly
+        as on load and the compacted chain is rewritten in the current
+        format version.
+
+        A process killed mid-compaction leaves either the old or the new
+        head reachable; the next open of the chain finishes the
+        roll-forward, so the directory always holds one complete chain.
+        A missing directory raises ``FileNotFoundError``, an unwritable
+        directory or a full disk raises ``OSError``, and any corrupt or
+        inconsistent segment rejects the whole compaction with
+        ``ValueError`` before anything is written.
+        """
+        with self._lock:
+            if isinstance(target, _checkpoint.MemoryChain):
+                return _checkpoint.compact_chain_memory(target, up_to)
+            if isinstance(target, (str, os.PathLike)):
+                return _checkpoint.compact_chain(target, up_to)
+            raise TypeError(
+                "compact target must be a chain directory or a MemoryChain"
+            )
 
     def _validate_against_model(self, document):
         if not isinstance(document, dict):

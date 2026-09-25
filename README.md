@@ -27,7 +27,8 @@ checkpoint path) and writes no files.
   carrying the exact Tensor returned by the preceding `forward`.
   Calling `backward` without a preceding `forward`, or twice for one
   `forward`, raises `RuntimeError`. If a layer raises mid-pass the partial
-  gradients are rolled back and the same `backward` may be retried; a retry
+  gradients are rolled back, the layer caches are restored by replaying
+  the segment's forward, and the same `backward` may be retried; a retry
   is not a second backward.
 - `Sequential.zero_grad() -> None` clears accumulated gradients.
 - `Sequential.update(learning_rate) -> None` performs one in-place step
@@ -87,6 +88,25 @@ checkpoint path) and writes no files.
   forward. Any mismatch, truncation, corruption or missing field rejects
   the whole checkpoint with `ValueError` -- nothing is partially applied
   or silently filled in. A missing path raises `FileNotFoundError`.
+- `Sequential.compact(target, up_to=None) -> None` compacts an existing
+  incremental checkpoint chain (a chain directory or a `MemoryChain`) in
+  place: the basis segment and the deltas through `up_to` (the current
+  head when omitted) are folded into one new basis segment and the
+  remaining deltas are renumbered after it. The reassembled state --
+  parameters, gradients, optimizer moments and step count, hidden state
+  -- is bit for bit identical before and after, compaction advances no
+  optimizer step, and the segment count decreases deterministically by
+  exactly the merged range. Repeating the same compaction is a no-op, as
+  is a chain with nothing to merge (basis only, or `up_to=0`).
+  Old-version segments participate exactly as on load, and the compacted
+  chain is rewritten in the current format version. A process killed
+  mid-compaction leaves either the old or the new head reachable -- the
+  next open of the chain finishes the roll-forward -- so the directory
+  always holds one complete chain. A missing directory raises
+  `FileNotFoundError`, an unwritable directory or a full disk raises
+  `OSError`, and any corrupt, truncated or shape-inconsistent segment
+  rejects the whole compaction with `ValueError` before anything is
+  written.
 
 ### Threading
 
@@ -146,7 +166,18 @@ incremental chain instead of one self-contained file:
 - a `head` pointer names the newest committed segment. Each segment file is
   written completely and atomically before the head is advanced, so a crash,
   a full disk or two saves racing into one directory always leave a single
-  complete chain reachable from `head`.
+  complete chain reachable from `head`. A training process killed at any
+  point therefore leaves a chain that loads to exactly the last complete
+  commit, and continuing from it -- appending deltas or taking full saves
+  -- stays bit for bit identical to the uninterrupted run.
+
+`Sequential.compact` (or `checkpoint.compact_chain`) folds the basis and a
+prefix of the deltas into one new basis segment in place; see its entry in
+the interface list above. Compaction commits through a stage-then-roll-
+forward protocol guarded by a cross-process directory lock: concurrent
+saves, loads and compactions on one directory are serialised, a compaction
+killed at any point is completed by the next open, and `head` always
+points at one complete chain.
 
 Loading walks the basis and every delta up to the head and reassembles the
 state by layer (parameters, gradients, optimizer moments and step count,

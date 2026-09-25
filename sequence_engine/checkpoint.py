@@ -18,7 +18,13 @@ Two on-disk shapes share the same leaf encoding and trailer:
   (``seg-00000000.seqd``) followed by delta segments that only encode the
   tensors that changed.  A small ``head`` pointer names the newest
   committed segment, so a crash between the segment write and the pointer
-  update always recovers the previous complete state.
+  update always recovers the previous complete state.  A chain can be
+  **compacted** in place: the basis and a prefix of the deltas are folded
+  into one new basis segment and the remaining deltas are renumbered.
+  Compaction stages every new segment, records the new head in a marker
+  and only then replaces the live segments, so a crash mid-compaction is
+  rolled forward on the next open and the directory always holds exactly
+  one complete chain -- the old head's or the new head's.
 
 Full snapshot wire format (all integers little-endian)::
 
@@ -65,6 +71,11 @@ import tempfile
 import threading
 import zlib
 
+try:
+    import fcntl
+except ImportError:  # non-POSIX platforms: in-process locking only
+    fcntl = None
+
 MAGIC = b"SEQECKP1"
 END_MAGIC = b"SEQECKP1END"
 DELTA_MAGIC = b"SEQDELTA"
@@ -87,6 +98,13 @@ _SEG_SUFFIX = ".seqd"
 _SEG_WIDTH = 10
 _HEAD_NAME = "head"
 _BASIS_INDEX = 0
+# Compaction commit protocol: new segments are staged under this prefix,
+# then a marker file records the new head, then the staged files are
+# copied over the live segment names and the head is advanced.  The
+# marker is the last thing removed, so any crash is rolled forward by
+# re-running the recovery step.
+_STAGED_PREFIX = ".seqc-"
+_COMPACT_MARKER = ".seqcompact"
 
 _BASE_HEADER_KEYS = frozenset(("v", "params", "grads", "hidden", "layers", "pending"))
 _FULL_HEADER_KEYS = frozenset(_BASE_HEADER_KEYS | {"optim"})
@@ -743,6 +761,10 @@ def _segment_index(name):
     return int(match.group(1))
 
 
+def _staged_name(index):
+    return _STAGED_PREFIX + _segment_name(index)
+
+
 def _freeze_delta(document, schema_shapes):
     """Build delta framing from ``{b,n,hc,changed,pending}``.
 
@@ -1042,6 +1064,57 @@ def _chain_lock(directory):
     return lock
 
 
+class _DirectoryChainLock:
+    """Mutual exclusion for one chain directory, in-process and across
+    processes.
+
+    The per-process threading lock serialises this process; an advisory
+    ``flock`` on the directory's own file descriptor serialises
+    cooperating processes (no extra lock file is created, so a chain
+    directory never gains visible entries).  Where the directory cannot
+    be locked -- a platform without ``fcntl``, or a filesystem that
+    refuses the lock -- the in-process lock alone is used.  Every
+    directory-chain operation (save, load, compact) runs entirely under
+    this lock, so a reader never observes a half-committed chain and a
+    compaction never races a save.
+    """
+
+    def __init__(self, directory):
+        self._directory = directory
+        self._thread_lock = _chain_lock(directory)
+        self._fd = None
+
+    def __enter__(self):
+        self._thread_lock.acquire()
+        if fcntl is not None:
+            try:
+                fd = os.open(
+                    self._directory,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                )
+            except OSError:
+                fd = None
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                except OSError:
+                    os.close(fd)
+                else:
+                    self._fd = fd
+        return self
+
+    def __exit__(self, *exc_info):
+        if self._fd is not None:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(self._fd)
+            self._fd = None
+        self._thread_lock.release()
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Chain storage seam: one append/read protocol, two backends.
 #
@@ -1079,7 +1152,9 @@ class MemoryChain(_ChainStoreBase):
 
     def __init__(self):
         self._objects: dict[str, bytes] = {}
-        self._lock = threading.Lock()
+        # Re-entrant so a whole compaction can run under the store lock
+        # while calling the per-operation methods.
+        self._lock = threading.RLock()
 
     def read_head(self):
         with self._lock:
@@ -1155,8 +1230,10 @@ def save_chain(document, directory):
             errno.ENOENT,
             f"incremental checkpoint directory does not exist: {directory!r}",
         )
-    with _chain_lock(directory):
-        _save_chain_store(document, _DirectoryChainStore(directory))
+    with _DirectoryChainLock(directory):
+        store = _DirectoryChainStore(directory)
+        _recover_directory_chain(directory, store)
+        _save_chain_store(document, store)
     return None
 
 
@@ -1164,7 +1241,10 @@ def save_chain_memory(document, store):
     """Append *document* to an in-memory chain (used by the self-checks)."""
     if not isinstance(store, MemoryChain):
         raise TypeError("store must be a MemoryChain")
-    _save_chain_store(document, store)
+    # The whole append runs under the store lock so a concurrent
+    # compaction can never swap the chain between the diff and the commit.
+    with store._lock:
+        _save_chain_store(document, store)
     return None
 
 
@@ -1302,15 +1382,18 @@ def load_chain(directory, up_to=None):
         raise FileNotFoundError(
             f"incremental checkpoint directory not found: {directory!r}"
         )
-    with _chain_lock(directory):
-        return _load_chain_root(_DirectoryChainStore(directory), up_to)
+    with _DirectoryChainLock(directory):
+        store = _DirectoryChainStore(directory)
+        _recover_directory_chain(directory, store)
+        return _load_chain_root(store, up_to)
 
 
 def load_chain_memory(store, up_to=None):
     """Reassemble a full state document from an in-memory chain."""
     if not isinstance(store, MemoryChain):
         raise TypeError("store must be a MemoryChain")
-    return _load_chain_root(store, up_to)
+    with store._lock:
+        return _load_chain_root(store, up_to)
 
 
 def _load_chain_root(store, up_to):
@@ -1456,6 +1539,192 @@ def _load_chain_store(store, head):
 
 
 # ---------------------------------------------------------------------------
+# Chain compaction
+# ---------------------------------------------------------------------------
+
+
+def _plan_compaction(store, up_to):
+    """Validate the chain and compute the compacted segment contents.
+
+    Returns ``None`` when there is nothing to merge (a basis-only chain,
+    or ``up_to=0``); otherwise ``(new_head, segments)`` where *segments*
+    holds the full new content of every segment ``0..new_head``: a folded
+    basis (segments ``0..up_to`` reassembled and re-frozen as one native
+    current-version snapshot) followed by the remaining deltas, rebuilt
+    deterministically against their new predecessors.  Every segment of
+    the chain is validated (and old versions migrated) exactly as a load
+    would, so any corruption or shape drift rejects the whole compaction
+    before anything is written.
+    """
+    head = _read_head_optional(store)
+    if head is None:
+        raise CheckpointError(
+            "chain has no head pointer (no basis segment committed)"
+        )
+    if up_to is None:
+        up_to = head
+    if isinstance(up_to, bool) or not isinstance(up_to, int) or up_to < 0:
+        raise CheckpointError("up_to must be a non-negative segment index")
+    if up_to > head:
+        raise CheckpointError(
+            f"up_to segment {up_to} is beyond the chain head {head}"
+        )
+    if up_to == 0 or head == 0:
+        return None
+    folded = _load_chain_store(store, up_to)
+    segments = [build_bytes(folded)]
+    previous = folded
+    for index in range(up_to + 1, head + 1):
+        document = _load_chain_store(store, index)
+        segments.append(_build_delta_between(previous, document, index - up_to))
+        previous = document
+    return head - up_to, segments
+
+
+def compact_chain(directory, up_to=None):
+    """Fold the basis and the deltas through *up_to* into one new basis.
+
+    The reassembled state -- parameters, gradients, optimizer moments and
+    step count, hidden state -- is bit for bit identical before and after;
+    only the segment count changes (deterministically, by exactly the
+    merged range).  ``up_to=None`` folds everything through the current
+    head, leaving a single basis segment.  A chain with nothing to merge
+    (basis only, or ``up_to=0``) is left untouched.  Old-version segments
+    participate exactly as on load and the compacted chain is rewritten
+    in the current format version.
+
+    The compaction commits through a stage-then-roll-forward protocol:
+    a process killed at any point leaves either the old or the new head
+    reachable, and the next open of the chain finishes the roll-forward.
+    A missing directory raises FileNotFoundError; an unwritable
+    directory or a full disk raises OSError; any corrupt, truncated or
+    inconsistent segment rejects the whole compaction with ValueError
+    and leaves the chain untouched.
+    """
+    if not isinstance(directory, (str, os.PathLike)):
+        raise TypeError("chain directory must be a path")
+    directory = os.fspath(directory)
+    if not os.path.isdir(directory):
+        raise FileNotFoundError(
+            f"incremental checkpoint directory not found: {directory!r}"
+        )
+    with _DirectoryChainLock(directory):
+        store = _DirectoryChainStore(directory)
+        _recover_directory_chain(directory, store)
+        plan = _plan_compaction(store, up_to)
+        if plan is not None:
+            new_head, segments = plan
+            _commit_compaction(directory, store, new_head, segments)
+    return None
+
+
+def compact_chain_memory(store, up_to=None):
+    """Compact an in-memory chain; same semantics as :func:`compact_chain`."""
+    if not isinstance(store, MemoryChain):
+        raise TypeError("store must be a MemoryChain")
+    with store._lock:
+        plan = _plan_compaction(store, up_to)
+        if plan is None:
+            return None
+        new_head, segments = plan
+        for index, raw in enumerate(segments):
+            store.write_segment(_segment_name(index), raw)
+        for name in list(store._objects):
+            index = _segment_index(name)
+            if index is not None and index > new_head:
+                del store._objects[name]
+        _commit_head(store, new_head)
+    return None
+
+
+def _commit_compaction(directory, store, new_head, segments):
+    """Atomically replace the live chain with the compacted *segments*.
+
+    Phase one stages every new segment under a private name (each write
+    is complete and durable on its own) and records the new head in the
+    compaction marker.  Phase two is exactly the recovery routine: copy
+    the staged segments over the live names, advance the head, clean up.
+    A crash before the marker leaves the old chain untouched; a crash
+    after it is rolled forward by the next open.
+    """
+    for index, raw in enumerate(segments):
+        _atomic_write(directory, _staged_name(index), raw)
+    _atomic_write(directory, _COMPACT_MARKER, str(new_head).encode("ascii"))
+    _recover_directory_chain(directory, store)
+
+
+def _recover_directory_chain(directory, store):
+    """Roll an interrupted compaction forward to one complete chain state.
+
+    Runs at the start of every directory-chain operation, under the
+    directory lock.  With no marker the live chain is already one
+    complete state (any staged leftovers come from a compaction that
+    crashed before its marker and are simply dropped).  With a marker,
+    the staged chain is complete on disk, so finishing the copy -- every
+    write is atomic and idempotent -- and advancing the head restores
+    exactly the post-compaction state.  The marker is removed last, so a
+    crash anywhere in the roll-forward is itself recovered by the next
+    open.
+    """
+    leftovers = [
+        name
+        for name in os.listdir(directory)
+        if name.startswith(_STAGED_PREFIX)
+    ]
+    marker_path = os.path.join(directory, _COMPACT_MARKER)
+    if not os.path.exists(marker_path):
+        for name in leftovers:
+            _unlink_quietly(os.path.join(directory, name))
+        if leftovers:
+            _fsync_directory(directory)
+        return
+    with open(marker_path, "rb") as fh:
+        raw = fh.read()
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        raise CheckpointError("compaction marker is corrupt") from None
+    if not re.fullmatch(r"\d+", text):
+        raise CheckpointError("compaction marker is corrupt")
+    new_head = int(text)
+    if _read_head_optional(store) != new_head:
+        # The head was never advanced: finish the roll-forward.  The
+        # marker is only written after every staged segment, so a missing
+        # staged file here means the staging area itself is damaged.
+        for index in range(new_head + 1):
+            staged_path = os.path.join(directory, _staged_name(index))
+            try:
+                with open(staged_path, "rb") as fh:
+                    raw_segment = fh.read()
+            except FileNotFoundError:
+                raise CheckpointError(
+                    "compaction staging area is incomplete; the chain "
+                    "cannot be rolled forward"
+                ) from None
+            _atomic_write(directory, _segment_name(index), raw_segment)
+        _commit_head(store, new_head)
+    # Committed (or just finished): drop the staging area, the segments
+    # the compaction made unreachable, and finally the marker.
+    for name in os.listdir(directory):
+        index = _segment_index(name)
+        if name.startswith(_STAGED_PREFIX) or (
+            index is not None and index > new_head
+        ):
+            _unlink_quietly(os.path.join(directory, name))
+    _unlink_quietly(marker_path)
+    _fsync_directory(directory)
+
+
+def _unlink_quietly(path):
+    # Garbage collection only: a file that cannot be removed (a read-only
+    # directory, say) is unreachable anyway and must not fail the open.
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Full / chain dispatch and file / memory IO
 # ---------------------------------------------------------------------------
 
@@ -1470,8 +1739,7 @@ def save_bytes(document, target):
     (see :func:`save_chain`).
     """
     if isinstance(target, MemoryChain):
-        _save_chain_store(document, target)
-        return None
+        return save_chain_memory(document, target)
     if isinstance(target, bytearray):
         raw = build_bytes(document)
         target.clear()

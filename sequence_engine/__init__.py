@@ -6,9 +6,10 @@ Public interface (see README.md):
 - ``Sequential(modules)`` with ``forward``, ``backward``, ``zero_grad``,
   ``parameters``, ``update`` (one in-place gradient step), ``adam_step``
   (one in-place Adam step with fixed coefficients), ``set_recompute``
-  (bounded-memory activation recomputation), and ``save`` / ``load``
+  (bounded-memory activation recomputation), ``save`` / ``load``
   (versioned atomic checkpoints to a path, a chain directory, a
-  ``MemoryChain`` or a bytearray).
+  ``MemoryChain`` or a bytearray) and ``compact`` (in-place, crash-safe
+  compaction of an incremental checkpoint chain).
 """
 
 from .checkpoint import MemoryChain

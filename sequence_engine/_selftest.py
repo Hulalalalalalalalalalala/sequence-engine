@@ -530,6 +530,72 @@ def _check_tuple_loss_and_retry():
     )
 
 
+class _CacheWreckingRNN(_RNNStep):
+    """RNN step whose first backward wrecks its own cache, then raises."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._boom = True
+
+    def backward(self, upstream):
+        if self._boom:
+            self._boom = False
+            self._cache = None  # a failed pass may destroy what it cached
+            raise RuntimeError("transient failure during backward")
+        return super().backward(upstream)
+
+
+def _check_backward_retry_restores_caches():
+    # A layer whose backward fails after destroying its cache: the retry
+    # must still work, because the engine replays the segment's forward to
+    # rebuild every layer cache before handing the error back.
+    weights = _base_weights()
+    wrecker = _CacheWreckingRNN(
+        _N_IN, _N_H1, weights["wxh1"], weights["whh1"], weights["b1"]
+    )
+    quiet = _RNNStep(_N_H1, _N_H2, weights["wxh2"], weights["whh2"], weights["b2"])
+    broken = Sequential([wrecker, quiet])
+    out, _ = broken.forward(Tensor(_SEG1))
+    _expect(
+        RuntimeError,
+        lambda: broken.backward((out, 1.0)),
+        "first attempt fails",
+    )
+    # The quiet layer ran before the failure; its partial grad is rolled back.
+    _check(quiet.wxh.grad is None, "failed backward rolls partial gradients back")
+    # The wrecked cache was rebuilt by replaying the segment's forward.
+    _check(wrecker._cache is not None, "a failed backward rebuilds layer caches")
+    # The tuple-loss identity still refers to the recorded forward output.
+    broken.backward((out, 1.0))
+    good, _ = _fresh_stack(weights)
+    good_out, _ = good.forward(Tensor(_SEG1))
+    good.backward((good_out, 1.0))
+    _check(
+        [p.grad.tolist() for p in broken.parameters()]
+        == [p.grad.tolist() for p in good.parameters()],
+        "a retried backward matches the uninterrupted pass bit for bit",
+    )
+    _expect(
+        RuntimeError, lambda: broken.backward(1.0), "the retry consumed the pass"
+    )
+
+    # The same contract holds in recompute mode.
+    wrecker2 = _CacheWreckingRNN(
+        _N_IN, _N_H1, weights["wxh1"], weights["whh1"], weights["b1"]
+    )
+    quiet2 = _RNNStep(_N_H1, _N_H2, weights["wxh2"], weights["whh2"], weights["b2"])
+    tuned = Sequential([wrecker2, quiet2])
+    tuned.set_recompute(True)
+    tuned.forward(Tensor(_SEG1))
+    _expect(RuntimeError, lambda: tuned.backward(1.0), "recompute attempt fails")
+    tuned.backward(1.0)
+    _check(
+        [p.grad.tolist() for p in tuned.parameters()]
+        == [p.grad.tolist() for p in good.parameters()],
+        "a retried backward in recompute mode matches bit for bit",
+    )
+
+
 def _continuity_run(resume_from=None):
     """Three segments with an update between segments two and three."""
     seq, _ = _fresh_stack()
@@ -1551,49 +1617,7 @@ def _check_recompute_bounded_memory_and_guards():
 def _check_v2_chain_migration():
     # Assemble a genuine version-2 chain (basis + empty delta + the delta
     # that first introduces hidden state) entirely in memory.
-    seq, _ = _fresh_stack()
-    basis_raw = bytearray()
-    seq.save(basis_raw)
-    basis_v2 = _downgrade_full_to_v2(bytes(basis_raw))
-
-    param_count = len(seq.parameters())
-
-    def v2_delta_frame(number, hc, changed_entries):
-        payload = []
-        header_entries = []
-        for index, shape, tree in changed_entries:
-            _checkpoint._freeze_tree(tree, shape, payload)
-            header_entries.append({"i": index, "s": shape})
-        header = {
-            "v": 2,
-            "b": _checkpoint._segment_name(0),
-            "n": number,
-            "hc": hc,
-            "changed": header_entries,
-            "pending": False,
-        }
-        return _checkpoint._frame(
-            _checkpoint.DELTA_MAGIC, _checkpoint.DELTA_END_MAGIC, header, payload
-        )
-
-    chain = _checkpoint.MemoryChain()
-    chain.write_segment(_checkpoint._segment_name(0), basis_v2)
-    chain.write_head(b"0")
-    chain.write_segment(
-        _checkpoint._segment_name(1), v2_delta_frame(1, None, [])
-    )
-    chain.write_head(b"1")
-
-    out, hidden = seq.forward(Tensor(_SEG1))
-    seq.backward(_total(out))
-    hidden_entries = [
-        (2 * param_count + slot, slot_tensor.shape, slot_tensor.tolist())
-        for slot, slot_tensor in enumerate(hidden)
-    ]
-    chain.write_segment(
-        _checkpoint._segment_name(2), v2_delta_frame(2, 2, hidden_entries)
-    )
-    chain.write_head(b"2")
+    chain, hidden = _make_v2_chain()
 
     # Reassembling the old chain yields the migrated state: optimizer at
     # t=0 with zero moments, hidden slots exactly as written.
@@ -1630,6 +1654,241 @@ def _check_v2_chain_migration():
         _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
         == bytes(full),
         "a migrated v2 chain continues with v3 deltas bit for bit",
+    )
+
+
+def _make_v2_chain():
+    """A genuine version-2 chain (basis + empty delta + hidden-introducing
+    delta), assembled in memory; returns ``(chain, hidden)``."""
+    seq, _ = _fresh_stack()
+    basis_raw = bytearray()
+    seq.save(basis_raw)
+    basis_v2 = _downgrade_full_to_v2(bytes(basis_raw))
+    param_count = len(seq.parameters())
+
+    def v2_delta_frame(number, hc, changed_entries):
+        payload = []
+        header_entries = []
+        for index, shape, tree in changed_entries:
+            _checkpoint._freeze_tree(tree, shape, payload)
+            header_entries.append({"i": index, "s": shape})
+        header = {
+            "v": 2,
+            "b": _checkpoint._segment_name(0),
+            "n": number,
+            "hc": hc,
+            "changed": header_entries,
+            "pending": False,
+        }
+        return _checkpoint._frame(
+            _checkpoint.DELTA_MAGIC, _checkpoint.DELTA_END_MAGIC, header, payload
+        )
+
+    chain = _checkpoint.MemoryChain()
+    chain.write_segment(_checkpoint._segment_name(0), basis_v2)
+    chain.write_segment(_checkpoint._segment_name(1), v2_delta_frame(1, None, []))
+    out, hidden = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out))
+    hidden_entries = [
+        (2 * param_count + slot, slot_tensor.shape, slot_tensor.tolist())
+        for slot, slot_tensor in enumerate(hidden)
+    ]
+    chain.write_segment(
+        _checkpoint._segment_name(2), v2_delta_frame(2, 2, hidden_entries)
+    )
+    chain.write_head(b"2")
+    return chain, hidden
+
+
+def _check_chain_compaction_memory():
+    # Full compaction: basis + deltas fold into one native-v3 basis.
+    seq, _ = _fresh_stack()
+    chain = _checkpoint.MemoryChain()
+    seq.save(chain)  # basis: no hidden, t=0
+    out, hidden = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out))
+    seq.save(chain)  # delta 1: introduces hidden state
+    seq.update(_LR)
+    seq.save(chain)  # delta 2
+    seq.adam_step(_ADAM_LR)
+    seq.save(chain)  # delta 3: optimizer state moves
+    full_head = bytearray()
+    seq.save(full_head)
+    _check(len(chain) == 4, "the chain grows one segment per save")
+
+    _checkpoint.compact_chain_memory(chain)
+    _check(len(chain) == 1, "full compaction leaves a single basis segment")
+    _check(chain.read_head() == b"0", "the compacted head points at the basis")
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+        == bytes(full_head),
+        "compaction preserves the reassembled state bit for bit",
+    )
+    basis_raw = chain.read_segment(_checkpoint._segment_name(0))
+    _check(
+        struct.unpack("<I", basis_raw[8:12])[0] == _checkpoint.FORMAT_VERSION,
+        "the compacted basis is written in the current format version",
+    )
+    _check(
+        _checkpoint.load_chain_memory(chain)["optim"]["t"] == 1,
+        "compaction preserves the optimizer step count",
+    )
+    # Repeating the same compaction is a deterministic no-op.
+    _checkpoint.compact_chain_memory(chain)
+    _check(len(chain) == 1, "repeated compaction changes nothing")
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+        == bytes(full_head),
+        "repeated compaction keeps the exact state",
+    )
+
+    # Partial compaction: fold basis..2, renumber the remaining deltas.
+    seq2, _ = _fresh_stack()
+    chain2 = _checkpoint.MemoryChain()
+    seq2.save(chain2)  # seg 0 (basis, no hidden)
+    out2, hidden2 = seq2.forward(Tensor(_SEG1))
+    seq2.backward(_total(out2))
+    seq2.save(chain2)  # seg 1 (hidden introduced)
+    seq2.update(_LR)
+    seq2.save(chain2)  # seg 2
+    seq2.adam_step(_ADAM_LR)
+    seq2.save(chain2)  # seg 3
+    seq2.update(_LR)
+    seq2.save(chain2)  # seg 4
+    full2_head = bytearray()
+    seq2.save(full2_head)
+    folded_at2 = _checkpoint.build_bytes(
+        _checkpoint.load_chain_memory(chain2, up_to=2)
+    )
+    _checkpoint.compact_chain_memory(chain2, up_to=2)
+    _check(len(chain2) == 3, "partial compaction folds exactly the merged range")
+    _check(chain2.read_head() == b"2", "partial compaction renumbers the head")
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain2))
+        == bytes(full2_head),
+        "partial compaction preserves the head state bit for bit",
+    )
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain2, up_to=0))
+        == folded_at2,
+        "the folded basis reassembles to the state at the fold point",
+    )
+    _check(
+        _checkpoint.load_chain_memory(chain2)["optim"]["t"] == 1,
+        "partial compaction preserves the optimizer step count",
+    )
+
+    # Appending after compaction keeps matching full snapshots bit for bit.
+    out3, _ = seq2.forward(Tensor(_SEG2), hidden2)
+    seq2.backward(_total(out3))
+    seq2.adam_step(_ADAM_LR)
+    full2_final = bytearray()
+    seq2.save(full2_final)
+    seq2.save(chain2)
+    _check(len(chain2) == 4, "appending after compaction adds one delta")
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain2))
+        == bytes(full2_final),
+        "the compacted chain keeps matching full snapshots bit for bit",
+    )
+
+    # A chain that never stepped keeps t=0 and zero moments through compaction.
+    unstepped, _ = _fresh_stack()
+    chain3 = _checkpoint.MemoryChain()
+    unstepped.save(chain3)
+    unstepped.update(_LR)
+    unstepped.save(chain3)
+    _checkpoint.compact_chain_memory(chain3)
+    doc3 = _checkpoint.load_chain_memory(chain3)
+    _check(
+        doc3["optim"]["t"] == 0,
+        "an unstepped chain stays at t=0 through compaction",
+    )
+    _check(
+        all(value == 0 for entry in doc3["optim"]["m"] for value in _flatten(entry["v"])),
+        "an unstepped chain keeps zero moments through compaction",
+    )
+
+    # Old-version segments participate and are rewritten as the current version.
+    v2_chain, v2_hidden = _make_v2_chain()
+    before = _checkpoint.build_bytes(_checkpoint.load_chain_memory(v2_chain))
+    _checkpoint.compact_chain_memory(v2_chain)
+    _check(len(v2_chain) == 1, "a v2 chain compacts to one segment")
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(v2_chain)) == before,
+        "compacting a v2 chain preserves its state bit for bit",
+    )
+    _check(
+        struct.unpack("<I", v2_chain.read_segment(_checkpoint._segment_name(0))[8:12])[0]
+        == _checkpoint.FORMAT_VERSION,
+        "the compacted v2 chain is rewritten in the current format version",
+    )
+    doc_v2 = _checkpoint.load_chain_memory(v2_chain)
+    _check(doc_v2["optim"]["t"] == 0, "a compacted v2 chain stays at t=0")
+    _check(
+        [entry["v"] for entry in doc_v2["hidden"]]
+        == [slot.tolist() for slot in v2_hidden],
+        "a compacted v2 chain keeps its hidden state",
+    )
+
+    # A corrupt chain is rejected wholesale and left untouched.
+    corrupt = _checkpoint.MemoryChain()
+    broken_seq, _ = _fresh_stack()
+    broken_seq.save(corrupt)
+    broken_seq.update(_LR)
+    broken_seq.save(corrupt)
+    seg1 = corrupt.read_segment(_checkpoint._segment_name(1))
+    corrupt.write_segment(
+        _checkpoint._segment_name(1), seg1[: len(seg1) // 2]
+    )
+    head_before = corrupt.read_head()
+    _expect(
+        ValueError,
+        lambda: _checkpoint.compact_chain_memory(corrupt),
+        "a corrupt chain rejects compaction",
+    )
+    _check(
+        corrupt.read_head() == head_before,
+        "a rejected compaction leaves the chain untouched",
+    )
+
+    # Deterministic edge cases: empty chain, basis-only chain, bad ranges.
+    _expect(
+        ValueError,
+        lambda: _checkpoint.compact_chain_memory(_checkpoint.MemoryChain()),
+        "an empty chain has nothing to compact",
+    )
+    basis_only = _checkpoint.MemoryChain()
+    solo, _ = _fresh_stack()
+    solo.save(basis_only)
+    _checkpoint.compact_chain_memory(basis_only)  # nothing to merge: no-op
+    _check(len(basis_only) == 1, "a basis-only chain is left untouched")
+    _checkpoint.compact_chain_memory(chain2, up_to=0)  # folds nothing: no-op
+    _check(len(chain2) == 4, "up_to=0 is a deterministic no-op")
+    for bad in (-1, True, 0.5, "1"):
+        _expect(
+            ValueError,
+            lambda bad=bad: _checkpoint.compact_chain_memory(chain2, bad),
+            f"invalid up_to {bad!r} is rejected",
+        )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.compact_chain_memory(chain2, 99),
+        "up_to beyond the head is rejected",
+    )
+
+    # The container-level entry point compacts memory chains too.
+    via_seq, _ = _fresh_stack()
+    chain4 = _checkpoint.MemoryChain()
+    via_seq.save(chain4)
+    via_seq.update(_LR)
+    via_seq.save(chain4)
+    via_seq.compact(chain4)
+    _check(len(chain4) == 1, "Sequential.compact folds a memory chain")
+    _expect(
+        TypeError,
+        lambda: via_seq.compact(bytearray()),
+        "compact rejects a non-chain target",
     )
 
 
@@ -1727,6 +1986,8 @@ _GROUPS = [
     ("adam checkpoint continuity", _check_adam_checkpoint_continuity),
     ("recompute mode equivalence", _check_recompute_equivalence),
     ("recompute bounded memory and guards", _check_recompute_bounded_memory_and_guards),
+    ("backward retry restores layer caches", _check_backward_retry_restores_caches),
+    ("in-memory chain compaction", _check_chain_compaction_memory),
     ("concurrent update/save/load", _check_concurrent_updates_saves_loads),
     ("concurrent adam/save/load", _check_concurrent_adam_saves_loads),
     ("boundary save and eager hidden shapes", _check_boundary_save_and_eager_hidden_shapes),
