@@ -43,9 +43,14 @@ Two on-disk shapes share the same leaf encoding and trailer:
   Reclamation is a pure reachability function, so sweeping again changes
   nothing; segments no head can reach (orphans left by a hard kill) and
   staging directories from a killed fork, delete or compaction are swept
-  deterministically on the next fork, compaction or deletion.  A family
-  of chains can also be verified read-only in one call, with the first
-  bad segment reported together with every chain that reaches it.
+  deterministically on the next fork, compaction, deletion or merge.  A
+  family of chains can also be verified read-only in one call, with the
+  first bad segment reported together with every chain that reaches it.
+  A chain can also be **merged** into another: the source chain's current
+  state is landed on the target as exactly one new target-owned delta
+  segment (empty when the states already agree), the source chain is not
+  modified, shared prefix segments are never stored twice, and a kill
+  mid-merge leaves the target at its old or its new head only.
 
 Full snapshot wire format (all integers little-endian)::
 
@@ -3321,6 +3326,181 @@ def delete_chain_memory(store):
         for name in list(store._objects):
             if _segment_index(name) is not None:
                 del store._objects[name]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Chain merges: landing one chain's current state onto another
+#
+# A merge appends exactly one delta segment -- owned by the target chain
+# alone -- to the target: the delta carries precisely the tensors that
+# differ between the target chain's head state and the source chain's
+# head state (compared by encoded leaf identity, so the float sign bit
+# counts).  Every segment the target already had is kept; the new segment
+# is appended after them and reassembles bit for bit to the source's
+# current state.  When the two states are identical the appended delta is
+# empty, so merging the same state twice changes nothing beyond the first
+# empty segment: a merge is idempotent on states.
+#
+# Nothing of the source chain is copied, linked or rewritten: its head and
+# segment files stay exactly as they were, and the two chains keep
+# evolving independently.  Segments the family already shares through an
+# earlier fork are not stored again -- the merge appends one target-owned
+# delta rather than duplicating any segment -- and a shared segment's
+# bytes continue to be reclaimed by reachability exactly as before.
+#
+# The append uses the same segment-then-head commit as every save: the
+# new segment file is complete (a temp file plus an atomic rename) before
+# the head can name it, so a kill mid-merge leaves the target at exactly
+# one of the old or the new head, both complete states.  Crash residue
+# (an appended segment a kill left beyond the head, temp files, staging
+# directories) is swept deterministically by the next fork, compaction,
+# deletion or merge.
+# ---------------------------------------------------------------------------
+
+
+def merge_chain(source, target):
+    """Merge the source chain's current state onto the target chain.
+
+    The target keeps every segment it had and gains exactly one new delta
+    segment appended after them; the delta carries only the tensors that
+    differ between the target's head state and the source's head state,
+    so loading the target afterwards reassembles bit for bit to the
+    source state at merge time.  Identical states append an empty delta,
+    and merging the same state repeatedly is a no-op on the state.
+
+    Only the target chain changes: the source chain's head and segment
+    files are never modified, and the appended segment belongs to the
+    target alone (shared prefix segments are never stored twice).  The
+    two chains continue to evolve independently afterwards.
+
+    A missing source or target directory, or a segment either head
+    reaches, raises ``FileNotFoundError`` and leaves every other chain
+    untouched.  Merging a chain into itself, two chains whose shapes or
+    layer order disagree, or a chain that cannot be parsed, rejects the
+    whole merge with ``ValueError`` before the target changes by a byte.
+    An unwritable directory or a full disk raises ``OSError``; an
+    interrupted merge leaves only whole segment files behind.
+    """
+    if not isinstance(source, (str, os.PathLike)):
+        raise TypeError("merge source must be a chain directory path")
+    if not isinstance(target, (str, os.PathLike)):
+        raise TypeError("merge target must be a chain directory path")
+    source = os.fspath(source)
+    target = os.fspath(target)
+    if not os.path.isdir(source):
+        raise FileNotFoundError(
+            f"incremental checkpoint directory not found: {source!r}"
+        )
+    if not os.path.isdir(target):
+        raise FileNotFoundError(
+            f"incremental checkpoint directory not found: {target!r}"
+        )
+    source_abs = os.path.abspath(source)
+    target_abs = os.path.abspath(target)
+    if source_abs == target_abs:
+        raise CheckpointError("a chain cannot be merged into itself")
+    if target_abs.startswith(source_abs + os.sep) or source_abs.startswith(
+        target_abs + os.sep
+    ):
+        raise CheckpointError(
+            "the two merge chains must not live inside one another's "
+            "chain directories"
+        )
+
+    # Deterministic GC of kill residue.  A merge creates residue only in
+    # the target family's directory (its atomic-write temp and, on a
+    # kill, an orphan segment), so only that family directory is swept:
+    # the source side is left byte for byte untouched.
+    _sweep_parent_staging(os.path.dirname(target_abs))
+
+    # Acquire both chain locks in one canonical order, so two merges
+    # running in opposite directions cannot deadlock.  A live streaming
+    # fold needs no wait: the source is read through its marker and the
+    # target append follows the same mid-fold path as an ordinary save.
+    first, second = sorted((source_abs, target_abs))
+    with _DirectoryChainLock(first):
+        with _DirectoryChainLock(second):
+            source_store = _DirectoryChainStore(source)
+            target_store = _DirectoryChainStore(target)
+            _recover_directory_chain(source, source_store)
+            _recover_directory_chain(target, target_store)
+            if _read_head_optional(source_store) is None:
+                raise CheckpointError(
+                    "merge source chain has no head pointer "
+                    "(no basis segment committed)"
+                )
+            target_head = _read_head_optional(target_store)
+            if target_head is None:
+                raise CheckpointError(
+                    "merge target chain has no head pointer "
+                    "(no basis segment committed)"
+                )
+            # Read the source head state (through any live fold).  A
+            # missing referenced segment is a FileNotFoundError; any
+            # structural defect a ValueError -- both before the target is
+            # touched.
+            source_doc = _load_chain_directory_root(
+                source, source_store, None
+            )
+            # Deterministic GC: target debris (an append a kill left
+            # beyond the head, temp files) is reclaimed on every merge;
+            # only safe while no fold marker is in force.  The source
+            # directory itself is never modified by a merge.
+            if not _marker_exists(target):
+                _sweep_chain_debris(target, target_head)
+            # Append one target-owned delta; the mid-fold-aware save path
+            # validates shape/layer compatibility (ValueError) and commits
+            # the segment before the head.  A write failure (OSError)
+            # leaves the target at its old head with no half segment.
+            _save_chain_directory(source_doc, target, target_store)
+    return None
+
+
+def merge_chain_memory(source, target):
+    """Merge one in-memory chain's state onto another.
+
+    Same semantics as :func:`merge_chain`: the target keeps all its
+    segments and gains exactly one delta (empty when the states already
+    agree), reassembling afterwards to the source's state; only the
+    target changes and the source keeps evolving independently.
+    """
+    if not isinstance(source, MemoryChain):
+        raise TypeError("merge source must be a MemoryChain")
+    if not isinstance(target, MemoryChain):
+        raise TypeError("merge target must be a MemoryChain")
+    if source is target:
+        raise CheckpointError("a chain cannot be merged into itself")
+    # Canonical lock order prevents two reverse-direction merges from
+    # deadlocking; the store locks are re-entrant.
+    first, second = (
+        (source, target) if id(source) < id(target) else (target, source)
+    )
+    with first._lock:
+        with second._lock:
+            source_head = _read_head_optional(source)
+            target_head = _read_head_optional(target)
+            if source_head is None:
+                raise CheckpointError(
+                    "merge source chain has no head pointer "
+                    "(no basis segment committed)"
+                )
+            if target_head is None:
+                raise CheckpointError(
+                    "merge target chain has no head pointer "
+                    "(no basis segment committed)"
+                )
+            source_doc = _load_chain_root(source, None)
+            target_doc = _load_chain_root(target, None)
+            next_index = target_head + 1
+            # Building the delta validates the two chains' shapes and
+            # layer order before anything is written; an empty delta is
+            # produced when the states already agree bit for bit.
+            delta_bytes = _build_delta_between(
+                target_doc, source_doc, next_index
+            )
+            target.write_segment(_segment_name(next_index), delta_bytes)
+            _commit_head(target, next_index)
     return None
 
 
