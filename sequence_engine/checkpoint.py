@@ -21,10 +21,15 @@ Two on-disk shapes share the same leaf encoding and trailer:
   update always recovers the previous complete state.  A chain can be
   **compacted** in place: the basis and a prefix of the deltas are folded
   into one new basis segment and the remaining deltas are renumbered.
-  Compaction stages every new segment, records the new head in a marker
-  and only then replaces the live segments, so a crash mid-compaction is
-  rolled forward on the next open and the directory always holds exactly
-  one complete chain -- the old head's or the new head's.
+  The fold is streamed -- the chain is walked and validated in order and
+  the folded basis is written out as soon as the walk reaches the fold
+  point, so peak disk usage never exceeds the original chain plus one new
+  basis segment -- and commits through a marker that records the fold
+  point and the number of tail segments already settled, so any crash is
+  deterministically rolled forward on the next open and the directory
+  always holds exactly one complete chain -- the old head's or the new
+  head's.  Chains can also be audited strictly read-only
+  (:func:`verify_chain`), localising the first damaged segment.
 
 Full snapshot wire format (all integers little-endian)::
 
@@ -1414,39 +1419,98 @@ def _load_chain_root(store, up_to):
 
 
 def _load_chain_store(store, head):
-    basis_name = _segment_name(_BASIS_INDEX)
-    basis_raw = store.read_segment(basis_name)
-    basis = parse_bytes(basis_raw)
-    param_count = len(basis["params"])
-    basis_hc = len(basis["hidden"]) if basis["hidden"] is not None else None
+    walker = _ChainAssembly.from_store(store)
+    walker.run_through(store, head)
+    return walker.document()
 
-    tensors = _tensors_from_document(basis)
-    current_hc = basis_hc
-    pending = basis["pending"]
-    hidden_base = _flat_hidden_base(param_count)
-    for index in range(1, head + 1):
-        name = _segment_name(index)
-        raw = store.read_segment(name)
-        _number, delta_hc, delta_pending, items = _parse_delta(raw, index)
-        segment_version = struct.unpack("<I", raw[8:12])[0]
+
+class _ChainAssembly:
+    """Incremental chain walker: apply one validated segment at a time.
+
+    Shared by loads, streaming compaction and verification.  The basis is
+    read and validated in ``__init__``; each :meth:`apply` walks exactly
+    one more delta in chain order, so callers can inspect the folded
+    state at any prefix (this is what lets compaction write the new basis
+    out *while* walking, instead of rebuilding every segment in memory
+    first).  Every segment is validated exactly as a load would -- old
+    versions migrated, segment order, references, shapes and the layer
+    order checked -- and a failure names the offending segment position.
+    """
+
+    def __init__(self, basis_raw):
+        basis = parse_bytes(basis_raw)
+        self.basis = basis
+        self.param_count = len(basis["params"])
+        self.hidden_base = _flat_hidden_base(self.param_count)
+        self.tensors = _tensors_from_document(basis)
+        self.current_hc = (
+            len(basis["hidden"]) if basis["hidden"] is not None else None
+        )
+        self.pending = basis["pending"]
+        self.head = _BASIS_INDEX
+
+    @classmethod
+    def from_store(cls, store):
+        return cls(store.read_segment(_segment_name(_BASIS_INDEX)))
+
+    def run_through(self, store, head):
+        """Validate and apply deltas ``self.head + 1`` through *head*."""
+        while self.head < head:
+            index = self.head + 1
+            raw = store.read_segment(_segment_name(index))
+            self.apply(raw, index)
+        return self
+
+    def apply(self, raw, index, what="delta"):
+        if index != self.head + 1:
+            raise CheckpointError(
+                f"{what} {index} is out of order: expected segment {self.head + 1}"
+            )
+        number, delta_hc, delta_pending, items = _parse_delta(raw, index)
+        segment_version = struct.unpack("<I", bytes(raw)[8:12])[0]
+        self._apply_items(
+            number, delta_hc, delta_pending, items, segment_version, what
+        )
+
+    def apply_parsed(self, parsed, segment_version, index, what="delta"):
+        """Apply an already-parsed delta at walker position *index*.
+
+        Used when a segment was parsed under its on-disk number (an old
+        tail source during a streaming roll-forward) but must extend the
+        folded chain at a different, renumbered position.  The carried
+        tensor items are identical; only the segment number changes.
+        """
+        if index != self.head + 1:
+            raise CheckpointError(
+                f"{what} {index} is out of order: expected segment {self.head + 1}"
+            )
+        _number, delta_hc, delta_pending, items = parsed
+        self._apply_items(
+            index, delta_hc, delta_pending, items, segment_version, what
+        )
+
+    def _apply_items(
+        self, number, delta_hc, delta_pending, items, segment_version, what
+    ):
+        index = number
 
         # Hidden-state transitions: absent -> present exactly once with a
         # full set of slots; afterwards the count is fixed.
-        introducing = delta_hc is not None and current_hc is None
-        if current_hc is not None and delta_hc != current_hc:
+        introducing = delta_hc is not None and self.current_hc is None
+        if self.current_hc is not None and delta_hc != self.current_hc:
             raise CheckpointError(
-                f"delta {index} changes the hidden slot count; chain rejected"
+                f"{what} {index} changes the hidden slot count; chain rejected"
             )
         # v2 segments index hidden slots right after the gradients; v3
         # segments place the optimizer state in between.
         seg_hidden_base = (
-            hidden_base if segment_version >= 3 else 2 * param_count
+            self.hidden_base if segment_version >= 3 else 2 * self.param_count
         )
-        if not introducing and delta_hc is None and current_hc is None:
+        if not introducing and delta_hc is None and self.current_hc is None:
             expected_max = seg_hidden_base - 1
         elif delta_hc is None:
             raise CheckpointError(
-                f"delta {index} drops hidden state the chain already fixed"
+                f"{what} {index} drops hidden state the chain already fixed"
             )
         else:
             expected_max = seg_hidden_base + delta_hc - 1
@@ -1455,42 +1519,41 @@ def _load_chain_store(store, head):
         for flat_index, shape, tree in items:
             if flat_index > expected_max:
                 raise CheckpointError(
-                    f"delta {index} names tensor {flat_index} beyond its state"
+                    f"{what} {index} names tensor {flat_index} beyond its state"
                 )
-            if segment_version < 3 and flat_index >= 2 * param_count:
+            if segment_version < 3 and flat_index >= 2 * self.param_count:
                 # Remap a v2 hidden index into the current flat layout.
-                slot = flat_index - 2 * param_count
+                slot = flat_index - 2 * self.param_count
                 if slot >= delta_hc:
                     raise CheckpointError(
-                        f"delta {index} names hidden slot {slot} beyond its count"
+                        f"{what} {index} names hidden slot {slot} beyond its count"
                     )
-                flat_index = hidden_base + slot
-                prior = tensors.get(flat_index)
-                if prior is not None and list(prior[0]) != list(shape):
-                    raise CheckpointError(
-                        f"delta {index} hidden slot {slot} shape disagrees with "
-                        "the slot introduced earlier in the chain"
-                    )
+                flat_index = self.hidden_base + slot
+                self._check_hidden_slot(index, slot, shape, what)
                 replaced_hidden.add(slot)
-                tensors[flat_index] = (list(shape), tree)
+                self.tensors[flat_index] = (list(shape), tree)
                 continue
-            if flat_index < 2 * param_count:
+            if flat_index < 2 * self.param_count:
                 expected_shape = (
-                    basis["params"][flat_index]["s"]
-                    if flat_index < param_count
-                    else basis["grads"][flat_index - param_count]["s"]
+                    self.basis["params"][flat_index]["s"]
+                    if flat_index < self.param_count
+                    else self.basis["grads"][flat_index - self.param_count]["s"]
                 )
                 if list(shape) != list(expected_shape):
                     raise CheckpointError(
-                        f"delta {index} tensor {flat_index} shape disagrees with basis"
+                        f"{what} {index} tensor {flat_index} shape disagrees with basis"
                     )
-            elif flat_index < hidden_base:
+            elif flat_index < self.hidden_base:
                 # Optimizer state: the moments mirror the parameter shapes
                 # and the step count is a scalar.
-                if flat_index < 3 * param_count:
-                    expected_shape = basis["params"][flat_index - 2 * param_count]["s"]
-                elif flat_index < 4 * param_count:
-                    expected_shape = basis["params"][flat_index - 3 * param_count]["s"]
+                if flat_index < 3 * self.param_count:
+                    expected_shape = self.basis["params"][
+                        flat_index - 2 * self.param_count
+                    ]["s"]
+                elif flat_index < 4 * self.param_count:
+                    expected_shape = self.basis["params"][
+                        flat_index - 3 * self.param_count
+                    ]["s"]
                 else:
                     expected_shape = []
                     if (
@@ -1499,107 +1562,124 @@ def _load_chain_store(store, head):
                         or tree < 0
                     ):
                         raise CheckpointError(
-                            f"delta {index} carries an invalid optimizer step count"
+                            f"{what} {index} carries an invalid optimizer step count"
                         )
                 if list(shape) != list(expected_shape):
                     raise CheckpointError(
-                        f"delta {index} tensor {flat_index} shape disagrees with basis"
+                        f"{what} {index} tensor {flat_index} shape disagrees with basis"
                     )
             else:
-                slot = flat_index - hidden_base
+                slot = flat_index - self.hidden_base
                 if slot >= delta_hc:
                     raise CheckpointError(
-                        f"delta {index} names hidden slot {slot} beyond its count"
+                        f"{what} {index} names hidden slot {slot} beyond its count"
                     )
-                prior = tensors.get(flat_index)
-                if prior is not None and list(prior[0]) != list(shape):
-                    raise CheckpointError(
-                        f"delta {index} hidden slot {slot} shape disagrees with "
-                        "the slot introduced earlier in the chain"
-                    )
+                self._check_hidden_slot(index, slot, shape, what)
                 replaced_hidden.add(slot)
-            tensors[flat_index] = (list(shape), tree)
+            self.tensors[flat_index] = (list(shape), tree)
 
         if introducing:
-            layer_count = len(basis["layers"])
+            layer_count = len(self.basis["layers"])
             if delta_hc != layer_count:
                 raise CheckpointError(
-                    f"delta {index} introduces {delta_hc} hidden slots for "
+                    f"{what} {index} introduces {delta_hc} hidden slots for "
                     f"{layer_count} layers"
                 )
             if replaced_hidden != set(range(delta_hc)):
                 raise CheckpointError(
-                    f"delta {index} introduces hidden state incompletely"
+                    f"{what} {index} introduces hidden state incompletely"
                 )
-        current_hc = delta_hc
-        pending = delta_pending
+        self.current_hc = delta_hc
+        self.pending = delta_pending
+        self.head = number
 
-    applied = {"tensors": tensors, "pending": pending, "_hc": current_hc}
-    return _assemble(basis, applied)
+    def _check_hidden_slot(self, index, slot, shape, what):
+        prior = self.tensors.get(self.hidden_base + slot)
+        if prior is not None and list(prior[0]) != list(shape):
+            raise CheckpointError(
+                f"{what} {index} hidden slot {slot} shape disagrees with the "
+                "slot introduced earlier in the chain"
+            )
+
+    def document(self):
+        applied = {
+            "tensors": self.tensors,
+            "pending": self.pending,
+            "_hc": self.current_hc,
+        }
+        return _assemble(self.basis, applied)
 
 
 # ---------------------------------------------------------------------------
-# Chain compaction
+# Chain compaction (streaming / online)
 # ---------------------------------------------------------------------------
+#
+# Streaming compaction never rebuilds the whole chain in memory or stages
+# the whole new chain on disk.  One single walk validates the segments in
+# chain order; the moment the walk reaches ``up_to`` the folded basis is
+# staged as the one and only extra segment file, so peak disk usage never
+# exceeds the original chain plus one new basis segment.  Only after the
+# rest of the chain has been walked and validated does the commit marker
+# appear; the tail deltas are then rebuilt in place -- each atomic write
+# replaces one live segment and the bytes it replaces can always be
+# recomputed from segments the rewrite has not touched yet -- and the
+# head is advanced last.  A process killed at any instant therefore
+# leaves exactly one complete chain: the old head (before the marker) or
+# the new head (rolled forward by the next open).
+#
+# Two on-disk marker shapes are understood on recovery:
+#
+# * legacy markers hold the decimal new head index and name a complete
+#   staged chain (``.seqc-seg-*`` for every new segment);
+# * streaming markers are JSON ``{"h": new_head, "u": up_to}`` and only
+#   the staged folded basis (``.seqc-seg-0000000000.seqd``) is required.
+#
+# A streaming roll-forward is deterministic and needs no checksums: the
+# folded staged basis is the state at ``up_to`` and doubles as the old
+# walker's position there; the surviving old deltas replayed on top of
+# it rebuild every tail state, and each new delta is the deterministic
+# re-encoding of that state against its new predecessor.
 
 
-def _plan_compaction(store, up_to):
-    """Validate the chain and compute the compacted segment contents.
-
-    Returns ``None`` when there is nothing to merge (a basis-only chain,
-    or ``up_to=0``); otherwise ``(new_head, segments)`` where *segments*
-    holds the full new content of every segment ``0..new_head``: a folded
-    basis (segments ``0..up_to`` reassembled and re-frozen as one native
-    current-version snapshot) followed by the remaining deltas, rebuilt
-    deterministically against their new predecessors.  Every segment of
-    the chain is validated (and old versions migrated) exactly as a load
-    would, so any corruption or shape drift rejects the whole compaction
-    before anything is written.
-    """
-    head = _read_head_optional(store)
-    if head is None:
-        raise CheckpointError(
-            "chain has no head pointer (no basis segment committed)"
-        )
+def _resolve_up_to(head, up_to):
     if up_to is None:
-        up_to = head
+        return head
     if isinstance(up_to, bool) or not isinstance(up_to, int) or up_to < 0:
         raise CheckpointError("up_to must be a non-negative segment index")
     if up_to > head:
         raise CheckpointError(
             f"up_to segment {up_to} is beyond the chain head {head}"
         )
-    if up_to == 0 or head == 0:
-        return None
-    folded = _load_chain_store(store, up_to)
-    segments = [build_bytes(folded)]
-    previous = folded
-    for index in range(up_to + 1, head + 1):
-        document = _load_chain_store(store, index)
-        segments.append(_build_delta_between(previous, document, index - up_to))
-        previous = document
-    return head - up_to, segments
+    return up_to
 
 
 def compact_chain(directory, up_to=None):
     """Fold the basis and the deltas through *up_to* into one new basis.
 
-    The reassembled state -- parameters, gradients, optimizer moments and
-    step count, hidden state -- is bit for bit identical before and after;
-    only the segment count changes (deterministically, by exactly the
-    merged range).  ``up_to=None`` folds everything through the current
-    head, leaving a single basis segment.  A chain with nothing to merge
-    (basis only, or ``up_to=0``) is left untouched.  Old-version segments
-    participate exactly as on load and the compacted chain is rewritten
-    in the current format version.
+    The fold runs as a streaming online compaction: the chain is walked
+    and validated in segment order, and the folded basis is written out
+    as soon as the walk reaches *up_to* -- peak disk usage never exceeds
+    the original chain plus one new basis segment -- while saves and
+    loads keep working (serialised on the chain lock as always).  The
+    reassembled state -- parameters, gradients, optimizer moments and
+    step count, hidden state -- is bit for bit identical before and
+    after, compaction advances no optimizer step, and the segment count
+    decreases deterministically by exactly the merged range.
+    ``up_to=None`` folds everything through the current head, leaving a
+    single basis segment.  A chain with nothing to merge (basis only, or
+    ``up_to=0``) is left untouched.  Old-version segments participate
+    exactly as on load and the compacted chain is rewritten in the
+    current format version.
 
     The compaction commits through a stage-then-roll-forward protocol:
     a process killed at any point leaves either the old or the new head
-    reachable, and the next open of the chain finishes the roll-forward.
-    A missing directory raises FileNotFoundError; an unwritable
-    directory or a full disk raises OSError; any corrupt, truncated or
-    inconsistent segment rejects the whole compaction with ValueError
-    and leaves the chain untouched.
+    reachable, and the next open of the chain finishes the roll-forward,
+    so the directory always holds one complete chain.  A missing
+    directory raises FileNotFoundError; an unwritable directory or a
+    full disk raises OSError; any corrupt, truncated or inconsistent
+    segment rejects the compaction with ValueError and leaves the
+    reachable chain intact (an unreachable staged file from an
+    interrupted attempt is discarded by the next open).
     """
     if not isinstance(directory, (str, os.PathLike)):
         raise TypeError("chain directory must be a path")
@@ -1611,24 +1691,95 @@ def compact_chain(directory, up_to=None):
     with _DirectoryChainLock(directory):
         store = _DirectoryChainStore(directory)
         _recover_directory_chain(directory, store)
-        plan = _plan_compaction(store, up_to)
-        if plan is not None:
-            new_head, segments = plan
-            _commit_compaction(directory, store, new_head, segments)
+        head = _read_head_optional(store)
+        if head is None:
+            raise CheckpointError(
+                "chain has no head pointer (no basis segment committed)"
+            )
+        fold_at = _resolve_up_to(head, up_to)
+        if fold_at == 0 or head == 0:
+            return None
+        new_head = head - fold_at
+
+        # Single streaming walk.  Up to the fold point the segments are
+        # validated in chain order and folded; as soon as the walk reaches
+        # fold_at the folded basis is staged -- the one and only extra
+        # segment file, so peak disk usage is the original chain plus one
+        # new basis segment.  The old chain stays complete and reachable.
+        walker = _ChainAssembly.from_store(store)
+        for index in range(1, fold_at + 1):
+            walker.apply(store.read_segment(_segment_name(index)), index)
+        folded_raw = build_bytes(walker.document())
+        staged_basis = os.path.join(directory, _staged_name(0))
+        _atomic_write(directory, _staged_name(0), folded_raw)
+
+        # Continue the same walk over the tail and validate all of it
+        # BEFORE the commit marker appears.  A corrupt tail rejects the
+        # compaction here: the marker is never written, the old chain
+        # stays reachable and the staged basis is discarded.
+        try:
+            for old_index in range(fold_at + 1, head + 1):
+                walker.apply(
+                    store.read_segment(_segment_name(old_index)), old_index
+                )
+        except BaseException:
+            _unlink_quietly(staged_basis)
+            raise
+
+        # Marker first (d = 0 tail positions settled); from here on a
+        # crash is rolled forward by the next open.  Roll-forward swaps
+        # the basis, rebuilds the tail in place and advances the head.
+        _atomic_write(
+            directory,
+            _COMPACT_MARKER,
+            _streaming_marker(new_head, fold_at, 0),
+        )
+        _recover_directory_chain(directory, store)
     return None
 
 
 def compact_chain_memory(store, up_to=None):
-    """Compact an in-memory chain; same semantics as :func:`compact_chain`."""
+    """Compact an in-memory chain; same semantics as :func:`compact_chain`.
+
+    Uses the same single streaming walk; the head is committed last.
+    """
     if not isinstance(store, MemoryChain):
         raise TypeError("store must be a MemoryChain")
     with store._lock:
-        plan = _plan_compaction(store, up_to)
-        if plan is None:
+        head = _read_head_optional(store)
+        if head is None:
+            raise CheckpointError(
+                "chain has no head pointer (no basis segment committed)"
+            )
+        fold_at = _resolve_up_to(head, up_to)
+        if fold_at == 0 or head == 0:
             return None
-        new_head, segments = plan
-        for index, raw in enumerate(segments):
-            store.write_segment(_segment_name(index), raw)
+        new_head = head - fold_at
+
+        walker = _ChainAssembly.from_store(store)
+        for index in range(1, fold_at + 1):
+            walker.apply(store.read_segment(_segment_name(index)), index)
+        folded_raw = build_bytes(walker.document())
+
+        new_walker = _ChainAssembly(folded_raw)
+        rebuilt = []
+        for position in range(1, new_head + 1):
+            old_index = fold_at + position
+            walker.apply(
+                store.read_segment(_segment_name(old_index)), old_index
+            )
+            delta_raw = _build_delta_between(
+                new_walker.document(), walker.document(), position
+            )
+            new_walker.apply(delta_raw, position)
+            rebuilt.append((position, delta_raw))
+
+        # Commit order mirrors the directory store: segments first, head
+        # last; target names never alias a not-yet-read source because an
+        # old source always sits fold_at positions ahead of its target.
+        for position, delta_raw in rebuilt:
+            store.write_segment(_segment_name(position), delta_raw)
+        store.write_segment(_segment_name(_BASIS_INDEX), folded_raw)
         for name in list(store._objects):
             index = _segment_index(name)
             if index is not None and index > new_head:
@@ -1637,20 +1788,45 @@ def compact_chain_memory(store, up_to=None):
     return None
 
 
-def _commit_compaction(directory, store, new_head, segments):
-    """Atomically replace the live chain with the compacted *segments*.
+def _streaming_marker(new_head, up_to, done):
+    marker = {"h": new_head, "u": up_to, "d": done}
+    return json.dumps(marker, separators=(",", ":"), sort_keys=True).encode("ascii")
 
-    Phase one stages every new segment under a private name (each write
-    is complete and durable on its own) and records the new head in the
-    compaction marker.  Phase two is exactly the recovery routine: copy
-    the staged segments over the live names, advance the head, clean up.
-    A crash before the marker leaves the old chain untouched; a crash
-    after it is rolled forward by the next open.
+
+def _parse_compaction_marker(raw):
+    """Return ``(new_head, up_to, done)``.
+
+    Streaming markers carry ``d`` -- the number of tail positions already
+    renamed home on a previous attempt; legacy decimal markers name a
+    fully staged chain and decode as ``(new_head, None, 0)``.
     """
-    for index, raw in enumerate(segments):
-        _atomic_write(directory, _staged_name(index), raw)
-    _atomic_write(directory, _COMPACT_MARKER, str(new_head).encode("ascii"))
-    _recover_directory_chain(directory, store)
+    try:
+        text = bytes(raw).decode("ascii")
+    except UnicodeDecodeError:
+        raise CheckpointError("compaction marker is corrupt") from None
+    if text[:1] == "{":
+        try:
+            marker = json.loads(text)
+        except json.JSONDecodeError:
+            raise CheckpointError("compaction marker is corrupt") from None
+        if (
+            not isinstance(marker, dict)
+            or set(marker) != {"h", "u", "d"}
+            or isinstance(marker["h"], bool)
+            or not isinstance(marker["h"], int)
+            or marker["h"] < 0
+            or isinstance(marker["u"], bool)
+            or not isinstance(marker["u"], int)
+            or marker["u"] <= 0
+            or isinstance(marker["d"], bool)
+            or not isinstance(marker["d"], int)
+            or not 0 <= marker["d"] <= marker["h"]
+        ):
+            raise CheckpointError("compaction marker is corrupt")
+        return marker["h"], marker["u"], marker["d"]
+    if re.fullmatch(r"\d+", text):
+        return int(text), None, 0
+    raise CheckpointError("compaction marker is corrupt")
 
 
 def _recover_directory_chain(directory, store):
@@ -1660,11 +1836,13 @@ def _recover_directory_chain(directory, store):
     directory lock.  With no marker the live chain is already one
     complete state (any staged leftovers come from a compaction that
     crashed before its marker and are simply dropped).  With a marker,
-    the staged chain is complete on disk, so finishing the copy -- every
-    write is atomic and idempotent -- and advancing the head restores
-    exactly the post-compaction state.  The marker is removed last, so a
-    crash anywhere in the roll-forward is itself recovered by the next
-    open.
+    the staged content is complete on disk, so finishing the commit --
+    every write is atomic and idempotent -- and advancing the head
+    restores exactly the post-compaction state.  Legacy markers name a
+    fully staged chain; streaming markers only carry the folded basis and
+    the surviving old segments are replayed to rebuild the tail.  The
+    marker is removed last, so a crash anywhere in the roll-forward is
+    itself recovered by the next open.
     """
     leftovers = [
         name
@@ -1680,29 +1858,16 @@ def _recover_directory_chain(directory, store):
         return
     with open(marker_path, "rb") as fh:
         raw = fh.read()
-    try:
-        text = raw.decode("ascii")
-    except UnicodeDecodeError:
-        raise CheckpointError("compaction marker is corrupt") from None
-    if not re.fullmatch(r"\d+", text):
-        raise CheckpointError("compaction marker is corrupt")
-    new_head = int(text)
-    if _read_head_optional(store) != new_head:
-        # The head was never advanced: finish the roll-forward.  The
-        # marker is only written after every staged segment, so a missing
-        # staged file here means the staging area itself is damaged.
-        for index in range(new_head + 1):
-            staged_path = os.path.join(directory, _staged_name(index))
-            try:
-                with open(staged_path, "rb") as fh:
-                    raw_segment = fh.read()
-            except FileNotFoundError:
-                raise CheckpointError(
-                    "compaction staging area is incomplete; the chain "
-                    "cannot be rolled forward"
-                ) from None
-            _atomic_write(directory, _segment_name(index), raw_segment)
-        _commit_head(store, new_head)
+    new_head, up_to, done = _parse_compaction_marker(raw)
+
+    # A marker is the commit point: always (idempotently) finish the
+    # roll-forward.  Legacy markers stage the whole new chain; streaming
+    # markers stage only the folded basis and rebuild the tail by replay.
+    if up_to is None:
+        _roll_forward_legacy(directory, store, new_head)
+    else:
+        _roll_forward_streaming(directory, store, up_to, new_head, done)
+
     # Committed (or just finished): drop the staging area, the segments
     # the compaction made unreachable, and finally the marker.
     for name in os.listdir(directory):
@@ -1715,6 +1880,170 @@ def _recover_directory_chain(directory, store):
     _fsync_directory(directory)
 
 
+def _roll_forward_legacy(directory, store, new_head):
+    """Finish a legacy (fully-staged) compaction: staged chain over live.
+
+    Each staged segment is renamed straight onto its live name (the
+    staging temp and the target never coexist, so the extra footprint is
+    the one segment being committed); a staged file that is gone because
+    an earlier roll-forward already moved it is fine as long as the live
+    segment is present.
+    """
+    for index in range(new_head + 1):
+        staged_path = os.path.join(directory, _staged_name(index))
+        live_path = os.path.join(directory, _segment_name(index))
+        if os.path.exists(staged_path):
+            os.replace(staged_path, live_path)
+            _fsync_directory(directory)
+        elif not os.path.exists(live_path):
+            raise CheckpointError(
+                "compaction staging area is incomplete; the chain "
+                "cannot be rolled forward"
+            )
+    _commit_head(store, new_head)
+
+
+def _roll_forward_streaming(directory, store, up_to, new_head, done):
+    """Finish a streaming compaction, deterministically and idempotently.
+
+    The streaming marker records ``d``: the number of tail positions
+    already renamed home by an earlier attempt (advanced atomically,
+    one per rename).  That count removes the only ambiguity in the
+    overlapping-number range -- a renamed segment ``p`` and an
+    unconsumed source can otherwise share a file name.
+
+    On entry the folded basis (chain state at ``up_to``) is staged under
+    the private basis name or already swapped onto the live name.
+    Recovery:
+
+    1. Swap the staged basis onto the live name.
+    2. Fast-forward both walkers over the ``done`` settled positions by
+       reading their renamed (current-numbered) deltas.
+    3. For each remaining position ``p`` (old source ``up_to + p``):
+       if the old source survives it is the truth -- rebuild the
+       renumbered delta, stage it, drop the source, rename home; if the
+       source is gone a staged replacement wins, else the segment is
+       already home.  Each rename durably advances ``d``.
+    4. Advance the head.
+
+    The new tail delta carries the exact same leaves as the old segment
+    (only its number changes), so the extra on-disk footprint never
+    grows past one basis segment.  A kill at any point re-enters here to
+    the same result; a position whose source is gone with neither a
+    staged nor a final replacement is a damaged staging area.
+    """
+    staged_basis = os.path.join(directory, _staged_name(_BASIS_INDEX))
+    live_basis = os.path.join(directory, _segment_name(_BASIS_INDEX))
+    if os.path.exists(staged_basis):
+        folded_raw = _read_staged_basis(directory)
+        os.replace(staged_basis, live_basis)
+        _fsync_directory(directory)
+    else:
+        try:
+            with open(live_basis, "rb") as fh:
+                folded_raw = fh.read()
+        except FileNotFoundError:
+            raise CheckpointError(
+                "compaction staging area is incomplete; the chain "
+                "cannot be rolled forward"
+            ) from None
+
+    new_walker = _ChainAssembly(folded_raw)
+    old_walker = _ChainAssembly(folded_raw)
+    old_walker.head = up_to
+
+    # Replay the settled prefix from its renamed final segments.
+    for settled in range(1, done + 1):
+        final_path = os.path.join(directory, _segment_name(settled))
+        try:
+            with open(final_path, "rb") as fh:
+                canonical = fh.read()
+        except FileNotFoundError:
+            raise CheckpointError(
+                f"compaction staging area is incomplete: settled segment "
+                f"{settled} is missing; the chain cannot be rolled forward"
+            ) from None
+        parsed = _parse_delta(canonical, settled)
+        new_walker.apply(canonical, settled)
+        old_walker.apply_parsed(parsed, FORMAT_VERSION, up_to + settled)
+
+    for position in range(done + 1, new_head + 1):
+        old_index = up_to + position
+        staged_path = os.path.join(directory, _staged_name(position))
+        final_path = os.path.join(directory, _segment_name(position))
+        source_path = os.path.join(directory, _segment_name(old_index))
+
+        if os.path.exists(source_path):
+            # Old source is the truth: rebuild the renumbered delta and
+            # stage it (clearing any stale staged artifact first).
+            with open(source_path, "rb") as fh:
+                old_raw = fh.read()
+            old_parsed = _parse_delta(old_raw, old_index)
+            old_version = struct.unpack("<I", old_raw[8:12])[0]
+            old_walker.apply_parsed(old_parsed, old_version, old_index)
+            canonical = _build_delta_between(
+                new_walker.document(), old_walker.document(), position
+            )
+            if os.path.exists(staged_path):
+                os.unlink(staged_path)
+            _atomic_write(directory, _staged_name(position), canonical)
+            new_walker.apply(canonical, position)
+            try:
+                os.unlink(source_path)
+            except FileNotFoundError:
+                pass
+            os.replace(staged_path, final_path)
+            _fsync_directory(directory)
+            # Record progress durably before moving on.
+            _atomic_write(
+                directory,
+                _COMPACT_MARKER,
+                _streaming_marker(new_head, up_to, position),
+            )
+            continue
+
+        # Source already consumed.  A staged replacement (rename pending)
+        # wins; otherwise the renamed final segment is the truth.  In
+        # both cases it must parse as the current-numbered delta.
+        if os.path.exists(staged_path):
+            with open(staged_path, "rb") as fh:
+                canonical = fh.read()
+        elif os.path.exists(final_path):
+            with open(final_path, "rb") as fh:
+                canonical = fh.read()
+        else:
+            raise CheckpointError(
+                f"compaction staging area is incomplete at new segment "
+                f"{position} (old segment {old_index} is gone and no "
+                "replacement was staged); the chain cannot be rolled forward"
+            )
+        parsed = _parse_delta(canonical, position)
+        new_walker.apply(canonical, position)
+        old_walker.apply_parsed(parsed, FORMAT_VERSION, old_index)
+        if os.path.exists(staged_path):
+            os.replace(staged_path, final_path)
+            _fsync_directory(directory)
+        _atomic_write(
+            directory,
+            _COMPACT_MARKER,
+            _streaming_marker(new_head, up_to, position),
+        )
+
+    _commit_head(store, new_head)
+
+
+def _read_staged_basis(directory):
+    staged_path = os.path.join(directory, _staged_name(_BASIS_INDEX))
+    try:
+        with open(staged_path, "rb") as fh:
+            return fh.read()
+    except FileNotFoundError:
+        raise CheckpointError(
+            "compaction staging area is incomplete; the chain "
+            "cannot be rolled forward"
+        ) from None
+
+
 def _unlink_quietly(path):
     # Garbage collection only: a file that cannot be removed (a read-only
     # directory, say) is unreachable anyway and must not fail the open.
@@ -1722,6 +2051,131 @@ def _unlink_quietly(path):
         os.unlink(path)
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Read-only chain verification
+# ---------------------------------------------------------------------------
+
+
+class ChainReport:
+    """Result of a successful read-only chain verification."""
+
+    __slots__ = ("head", "segments", "basis_version", "has_hidden")
+
+    def __init__(self, head, basis_version, has_hidden):
+        self.head = head
+        self.segments = head + 1
+        self.basis_version = basis_version
+        self.has_hidden = has_hidden
+
+    def __repr__(self):
+        return (
+            f"ChainReport(head={self.head!r}, segments={self.segments!r}, "
+            f"basis_version={self.basis_version!r}, has_hidden={self.has_hidden!r})"
+        )
+
+    def __eq__(self, other):
+        if not isinstance(other, ChainReport):
+            return NotImplemented
+        return (
+            self.head == other.head
+            and self.segments == other.segments
+            and self.basis_version == other.basis_version
+            and self.has_hidden == other.has_hidden
+        )
+
+
+def verify_chain_memory(store):
+    """Validate an in-memory chain read-only; see :func:`verify_chain`."""
+    if not isinstance(store, MemoryChain):
+        raise TypeError("store must be a MemoryChain")
+    with store._lock:
+        return _verify_chain_store(store)
+
+
+def verify_chain(directory):
+    """Verify an incremental checkpoint chain directory, read-only.
+
+    Walks the basis and every delta reachable from ``head`` and checks
+    each segment's integrity (framing, trailer and CRC), segment order
+    and numbering, references (the basis name, tensor and hidden-slot
+    indices), declared shapes against the basis, and the layer order.
+    Nothing in the directory is created, modified or deleted: staged
+    compaction files and an in-flight compaction marker are not part of
+    the reachable chain and are ignored, not completed.
+
+    A sound chain returns a :class:`ChainReport`.  A missing chain
+    directory raises FileNotFoundError; the first damaged segment
+    rejects the whole chain with ValueError whose message names the
+    segment position and the reason.
+    """
+    if not isinstance(directory, (str, os.PathLike)):
+        raise TypeError("chain directory must be a path")
+    directory = os.fspath(directory)
+    if not os.path.isdir(directory):
+        raise FileNotFoundError(
+            f"incremental checkpoint directory not found: {directory!r}"
+        )
+    # Deliberately no recovery and no write lock acquisition: verification
+    # never changes a byte, so it neither rolls an interrupted compaction
+    # forward nor blocks a compaction that is mid-flight in another thread.
+    store = _DirectoryChainStore(directory)
+    with _DirectoryChainLock(directory):
+        return _verify_chain_store(store)
+
+
+def _verify_chain_store(store):
+    head = _read_head_optional(store)
+    if head is None:
+        raise CheckpointError(
+            "chain verification failed at head: no valid head pointer "
+            "(no basis segment committed)"
+        )
+    basis_name = _segment_name(_BASIS_INDEX)
+    try:
+        basis_raw = store.read_segment(basis_name)
+    except FileNotFoundError:
+        raise CheckpointError(
+            f"chain verification failed at segment 0 ({basis_name}): "
+            "the basis segment named by the chain is missing"
+        ) from None
+    try:
+        walker = _ChainAssembly(basis_raw)
+    except CheckpointError as exc:
+        raise CheckpointError(
+            f"chain verification failed at segment 0 ({basis_name}): {exc}"
+        ) from None
+    basis_version = struct.unpack("<I", bytes(basis_raw)[8:12])[0]
+    for index in range(1, head + 1):
+        name = _segment_name(index)
+        try:
+            raw = store.read_segment(name)
+        except FileNotFoundError:
+            raise CheckpointError(
+                f"chain verification failed at segment {index} ({name}): "
+                "the segment is referenced by the chain but missing"
+            ) from None
+        try:
+            walker.apply(raw, index, what="chain segment")
+        except CheckpointError as exc:
+            raise CheckpointError(
+                f"chain verification failed at segment {index} ({name}): {exc}"
+            ) from None
+    # Reassemble once at the head so an incomplete tensor set or a bad
+    # step count is caught too, not just the per-segment checks.
+    try:
+        walker.document()
+    except CheckpointError as exc:
+        raise CheckpointError(
+            f"chain verification failed at segment {head} "
+            f"({_segment_name(head)}): {exc}"
+        ) from None
+    return ChainReport(
+        head=head,
+        basis_version=basis_version,
+        has_hidden=walker.current_hc is not None,
+    )
 
 
 # ---------------------------------------------------------------------------

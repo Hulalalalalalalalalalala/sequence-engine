@@ -1965,6 +1965,120 @@ def _check_concurrent_adam_saves_loads():
     _check(errors == [], f"concurrent adam run raised: {errors!r}")
 
 
+def _check_chain_verification_memory():
+    # A sound chain verifies and reports its shape.
+    seq, _ = _fresh_stack()
+    chain = _checkpoint.MemoryChain()
+    seq.save(chain)
+    out, hidden = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out))
+    seq.save(chain)
+    seq.update(_LR)
+    seq.save(chain)
+    report = _checkpoint.verify_chain_memory(chain)
+    _check(report.head == 2 and report.segments == 3, "verify reports head/segments")
+    _check(report.basis_version == 3, "verify reports the basis format version")
+    _check(report.has_hidden is True, "verify reports hidden state presence")
+
+    # A truncated middle delta localises the first bad segment and
+    # rejects the whole chain; nothing about the MemoryChain is changed.
+    good1 = chain.read_segment(_checkpoint._segment_name(1))
+    chain.write_segment(_checkpoint._segment_name(1), good1[: len(good1) // 2])
+    try:
+        _checkpoint.verify_chain_memory(chain)
+    except ValueError as exc:
+        message = str(exc)
+        _check("segment 1" in message, "verify names the first bad segment")
+        _check(_checkpoint._segment_name(1) in message, "verify names the file")
+    else:
+        raise _SelfTestFailure("verify accepted a truncated segment")
+
+    # Restore: the chain verifies clean again and still reassembles.
+    chain.write_segment(_checkpoint._segment_name(1), good1)
+    report = _checkpoint.verify_chain_memory(chain)
+    _check(report.head == 2, "the repaired chain verifies again")
+
+    # A corrupt basis localises segment 0.
+    basis = chain.read_segment(_checkpoint._segment_name(0))
+    chain.write_segment(
+        _checkpoint._segment_name(0), basis[: len(basis) // 2]
+    )
+    try:
+        _checkpoint.verify_chain_memory(chain)
+    except ValueError as exc:
+        _check("segment 0" in str(exc), "basis damage localises segment 0")
+    else:
+        raise _SelfTestFailure("verify accepted a truncated basis")
+    chain.write_segment(_checkpoint._segment_name(0), basis)
+
+    # An empty chain (no head) is rejected with ValueError.
+    try:
+        _checkpoint.verify_chain_memory(_checkpoint.MemoryChain())
+    except ValueError:
+        pass
+    else:
+        raise _SelfTestFailure("verify accepted a chain with no head")
+
+    # An old-version chain verifies and reports its origin version.
+    v2_chain, _v2_hidden = _make_v2_chain()
+    v2_report = _checkpoint.verify_chain_memory(v2_chain)
+    _check(v2_report.basis_version == 2, "a v2 chain reports basis version 2")
+    _check(v2_report.head == 2, "a v2 chain reports its head")
+    _check(v2_report.has_hidden, "a v2 chain reports its hidden state")
+
+    # The container-level entry point returns the same report.
+    probe, _ = _fresh_stack()
+    _check(probe.verify(chain) == report, "Sequential.verify reports the chain")
+    _expect(TypeError, lambda: probe.verify(bytearray()), "verify rejects a buffer")
+
+
+def _check_backward_replay_failure_surfaced():
+    weights = _base_weights()
+
+    class _BoomLayer(_RNNStep):
+        """Backward always raises; the replay forward raises the 2nd time."""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._forward_calls = 0
+
+        def forward(self, x, hidden):
+            self._forward_calls += 1
+            if self._forward_calls >= 2:
+                raise ValueError("replay forward blew up")
+            return super().forward(x, hidden)
+
+        def backward(self, upstream):
+            raise RuntimeError("layer backward blew up")
+
+    wrecker = _BoomLayer(
+        _N_IN, _N_H1, weights["wxh1"], weights["whh1"], weights["b1"]
+    )
+    quiet = _RNNStep(_N_H1, _N_H2, weights["wxh2"], weights["whh2"], weights["b2"])
+    seq = Sequential([wrecker, quiet])
+    seq.forward(Tensor(_SEG1))
+    try:
+        seq.backward(1.0)
+    except ValueError as exc:
+        _check("rebuild" in str(exc), "the surfaced error names the rebuild stage")
+        _check(
+            "replay forward blew up" in str(exc),
+            "the surfaced error carries the replay failure reason",
+        )
+        _check(
+            isinstance(exc.__cause__, RuntimeError)
+            and str(exc.__cause__) == "layer backward blew up",
+            "the original layer error reaches the caller as __cause__",
+        )
+        _check(
+            isinstance(exc.__context__, ValueError),
+            "the replay error is reachable as __context__",
+        )
+        _check(quiet.wxh.grad is None, "partial gradients were rolled back first")
+    else:
+        raise _SelfTestFailure("a failing replay was swallowed")
+
+
 _GROUPS = [
     ("tensor basics", _check_tensor_basics),
     ("tensor validation", _check_tensor_validation),
@@ -1987,7 +2101,9 @@ _GROUPS = [
     ("recompute mode equivalence", _check_recompute_equivalence),
     ("recompute bounded memory and guards", _check_recompute_bounded_memory_and_guards),
     ("backward retry restores layer caches", _check_backward_retry_restores_caches),
+    ("backward replay failure is surfaced", _check_backward_replay_failure_surfaced),
     ("in-memory chain compaction", _check_chain_compaction_memory),
+    ("read-only chain verification", _check_chain_verification_memory),
     ("concurrent update/save/load", _check_concurrent_updates_saves_loads),
     ("concurrent adam/save/load", _check_concurrent_adam_saves_loads),
     ("boundary save and eager hidden shapes", _check_boundary_save_and_eager_hidden_shapes),

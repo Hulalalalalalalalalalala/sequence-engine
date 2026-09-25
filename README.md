@@ -29,7 +29,11 @@ checkpoint path) and writes no files.
   `forward`, raises `RuntimeError`. If a layer raises mid-pass the partial
   gradients are rolled back, the layer caches are restored by replaying
   the segment's forward, and the same `backward` may be retried; a retry
-  is not a second backward.
+  is not a second backward. If that cache-rebuild replay itself fails,
+  the rebuild failure is not swallowed: it surfaces as a `ValueError`
+  naming the cache-rebuild stage (the replay error is in the message),
+  while the original layer exception is still handed to the caller as
+  the `ValueError`'s `__cause__`.
 - `Sequential.zero_grad() -> None` clears accumulated gradients.
 - `Sequential.update(learning_rate) -> None` performs one in-place step
   `theta <- theta - learning_rate * grad` on every parameter. Gradients are
@@ -99,14 +103,32 @@ checkpoint path) and writes no files.
   exactly the merged range. Repeating the same compaction is a no-op, as
   is a chain with nothing to merge (basis only, or `up_to=0`).
   Old-version segments participate exactly as on load, and the compacted
-  chain is rewritten in the current format version. A process killed
-  mid-compaction leaves either the old or the new head reachable -- the
-  next open of the chain finishes the roll-forward -- so the directory
-  always holds one complete chain. A missing directory raises
-  `FileNotFoundError`, an unwritable directory or a full disk raises
-  `OSError`, and any corrupt, truncated or shape-inconsistent segment
-  rejects the whole compaction with `ValueError` before anything is
-  written.
+  chain is rewritten in the current format version. Compaction is a
+  streaming online fold: the chain is walked and validated in segment
+  order and the folded basis is written out as soon as the walk reaches
+  the fold point, so peak disk usage never exceeds the original chain
+  plus one new basis segment; saves and loads keep working the whole
+  time (serialised on the chain lock). A process killed mid-compaction
+  leaves either the old or the new head reachable -- the next open of
+  the chain finishes the roll-forward -- so the directory always holds
+  one complete chain. A missing directory raises `FileNotFoundError`, an
+  unwritable directory or a full disk raises `OSError`, and any corrupt,
+  truncated or shape-inconsistent segment rejects the whole compaction
+  with `ValueError` before the commit point.
+- `Sequential.verify(source) -> ChainReport` (and
+  `checkpoint.verify_chain(directory)` /
+  `checkpoint.verify_chain_memory(chain)`) audits an existing
+  incremental checkpoint chain strictly read-only. It walks the basis
+  and every delta reachable from `head`, checking each segment's
+  integrity, segment order and numbering, references (the basis name,
+  tensor and hidden-slot indices), declared shapes and the layer order.
+  A sound chain returns a report (`head`, `segments`, `basis_version`,
+  `has_hidden`); the first damaged segment rejects the whole chain with
+  `ValueError` whose message names the segment position, file and
+  reason. Verification creates, modifies and deletes nothing -- not a
+  single byte changes, and an in-flight compaction marker or staged
+  files are ignored rather than completed. A missing chain directory
+  raises `FileNotFoundError`; a corrupt `head` pointer is a `ValueError`.
 
 ### Threading
 
@@ -173,11 +195,20 @@ incremental chain instead of one self-contained file:
 
 `Sequential.compact` (or `checkpoint.compact_chain`) folds the basis and a
 prefix of the deltas into one new basis segment in place; see its entry in
-the interface list above. Compaction commits through a stage-then-roll-
-forward protocol guarded by a cross-process directory lock: concurrent
-saves, loads and compactions on one directory are serialised, a compaction
-killed at any point is completed by the next open, and `head` always
-points at one complete chain.
+the interface list above. The fold is streamed: segments are checked in
+order while walking the chain and the folded basis is written out as soon
+as the walk reaches the fold point, so peak disk usage stays within the
+original chain plus one new basis segment, and saves and loads proceed
+normally while the fold runs. Compaction commits through a
+stage-then-roll-forward protocol guarded by a cross-process directory
+lock: concurrent saves, loads and compactions on one directory are
+serialised, a compaction killed at any point is completed by the next
+open, and `head` always points at one complete chain.
+
+`Sequential.verify` (or `checkpoint.verify_chain`) audits a chain
+directory strictly read-only -- nothing is created, modified or deleted
+-- and reports the first damaged segment's position and reason; staged
+files and an in-flight compaction marker are ignored, not completed.
 
 Loading walks the basis and every delta up to the head and reassembles the
 state by layer (parameters, gradients, optimizer moments and step count,

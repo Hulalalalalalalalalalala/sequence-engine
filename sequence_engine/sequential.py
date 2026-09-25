@@ -287,7 +287,7 @@ class Sequential:
             try:
                 for module in reversed(self._modules):
                     upstream = module.backward(upstream)
-            except BaseException:
+            except BaseException as layer_exc:
                 for param, saved in zip(self.parameters(), grad_snapshot):
                     param.grad = None if saved is None else Tensor(saved)
                 # A layer's failed backward may also have destroyed caches a
@@ -295,12 +295,20 @@ class Sequential:
                 # Replay the segment's forward from the retry anchors so every
                 # layer cache is rebuilt exactly as the recorded forward left
                 # it.  The replay only re-runs layer forwards -- parameters,
-                # gradients and the recorded boundary state stay untouched --
-                # and a replay failure never masks the original error.
+                # gradients and the recorded boundary state stay untouched.
+                # If the replay itself fails that failure must never be
+                # swallowed: surface it as a ValueError naming the rebuild
+                # stage, with the original layer error still attached as
+                # __cause__ and the replay error reachable as __context__.
                 try:
                     self._replay_forward()
-                except BaseException:
-                    pass
+                except BaseException as replay_exc:
+                    raise ValueError(
+                        "a layer raised during backward and rebuilding the "
+                        "layer caches by replaying the segment's forward then "
+                        f"also failed during cache rebuild: {replay_exc!r}; "
+                        "the original layer error is attached as __cause__"
+                    ) from layer_exc
                 raise
             self._pending_backward = False
             self._anchors = None
@@ -689,6 +697,32 @@ class Sequential:
                 return _checkpoint.compact_chain(target, up_to)
             raise TypeError(
                 "compact target must be a chain directory or a MemoryChain"
+            )
+
+    def verify(self, source):
+        """Verify an incremental checkpoint chain read-only, without loading.
+
+        *source* is an existing chain directory or a ``MemoryChain``.  The
+        chain is walked segment by segment -- basis then every delta
+        reachable from ``head`` -- and each segment's integrity, segment
+        order, references, shapes and layer order are checked.  The
+        container is not consulted or modified and the chain directory is
+        not written: not a single byte changes and an interrupted
+        compaction is left exactly as found.
+
+        Returns a small report (``head``, ``segments``, ``basis_version``
+        and ``has_hidden``) for a sound chain.  A missing chain directory
+        raises ``FileNotFoundError``; the first damaged segment rejects
+        the whole chain with ``ValueError`` whose message names the
+        segment position and the reason.
+        """
+        with self._lock:
+            if isinstance(source, _checkpoint.MemoryChain):
+                return _checkpoint.verify_chain_memory(source)
+            if isinstance(source, (str, os.PathLike)):
+                return _checkpoint.verify_chain(source)
+            raise TypeError(
+                "verify source must be a chain directory or a MemoryChain"
             )
 
     def _validate_against_model(self, document):
