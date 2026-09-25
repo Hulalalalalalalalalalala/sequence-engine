@@ -122,6 +122,11 @@ class Sequential:
     * ``compact(target, up_to=None)`` -- folds an incremental chain's
       basis and a prefix of its deltas into one new basis segment,
       crash-safely; the reassembled state is bit for bit unchanged.
+    * ``derive(source, target, at=None)`` -- forks an incremental chain
+      into a new chain directory (or a new ``MemoryChain``) that shares
+      the segments up to the fork point and then evolves independently.
+    * ``drop(target)`` -- removes a chain, reclaiming only the segments
+      no remaining chain of its family can reach.
 
     All public operations are serialised by one re-entrant lock, so
     several threads may interleave ``forward``, ``backward``, ``update``,
@@ -733,6 +738,67 @@ class Sequential:
                 return _checkpoint.verify_chain(source)
             raise TypeError(
                 "verify source must be a chain directory or a MemoryChain"
+            )
+
+    def derive(self, source, target=None, at=None):
+        """Fork an incremental checkpoint chain into a new chain.
+
+        *source* is an existing chain directory or a ``MemoryChain``;
+        *at* is the segment to fork from (the source head when omitted).
+        The new chain shares every segment up to the fork point with the
+        source chain -- the segment files are shared, never copied -- and
+        then evolves independently: each chain maintains only its own
+        head and its own appended deltas, saves, loads, verifications and
+        streaming compactions on either chain never disturb the other,
+        and the reassembled state of each chain stays bit for bit the
+        state an unforked chain with the same saves would hold.  A shared
+        segment is reclaimed exactly when no chain's head can reach it
+        any more, so dropping a branch or compacting the source never
+        disturbs the remaining chains.
+
+        For a directory source, *target* is the new chain directory (it
+        must not exist yet) and the call returns ``None``; for a
+        ``MemoryChain`` source the new ``MemoryChain`` is returned.  A
+        fork point that is not a committed segment boundary or names a
+        segment beyond the source head, and an already existing target
+        directory, raise ``ValueError``; a missing source directory or
+        referenced segment raises ``FileNotFoundError``; an unwritable
+        destination or a full disk raises ``OSError``.
+        """
+        with self._lock:
+            if isinstance(source, _checkpoint.MemoryChain):
+                if target is not None:
+                    raise TypeError(
+                        "deriving a MemoryChain returns the new chain; "
+                        "target must be None"
+                    )
+                return _checkpoint.derive_chain_memory(source, at)
+            if isinstance(source, (str, os.PathLike)):
+                if target is None:
+                    raise TypeError(
+                        "deriving a chain directory requires a target "
+                        "directory"
+                    )
+                return _checkpoint.derive_chain(source, target, at)
+            raise TypeError(
+                "derive source must be a chain directory or a MemoryChain"
+            )
+
+    def drop(self, target):
+        """Remove a chain, reclaiming only unreachable shared segments.
+
+        *target* is a chain directory or a ``MemoryChain``.  Segments
+        shared with other chains of the family stay alive through those
+        chains' own references; everything else is reclaimed.  A missing
+        directory raises ``FileNotFoundError``.
+        """
+        with self._lock:
+            if isinstance(target, _checkpoint.MemoryChain):
+                return _checkpoint.drop_chain_memory(target)
+            if isinstance(target, (str, os.PathLike)):
+                return _checkpoint.drop_chain(target)
+            raise TypeError(
+                "drop target must be a chain directory or a MemoryChain"
             )
 
     def _validate_against_model(self, document):

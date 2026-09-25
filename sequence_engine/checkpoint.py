@@ -30,6 +30,14 @@ Two on-disk shapes share the same leaf encoding and trailer:
   the old head's or the new head's.  A chain directory can also be
   **verified** strictly read-only: each segment is walked like a load and
   the first bad one is located and reported without a single write.
+  A chain can be **derived**: a new chain directory is forked off at any
+  committed segment, sharing the segments up to the fork point (hard
+  links, never copies) and then evolving independently -- each chain
+  keeps only its own head and its own appended deltas, saves, loads,
+  verifications and streaming compactions on sibling chains never
+  interfere, and a shared segment's storage is reclaimed exactly when no
+  chain's head can reach it any more.  Verifying a family member reports
+  the first bad segment's position, reason and owning chain.
 
 Full snapshot wire format (all integers little-endian)::
 
@@ -71,6 +79,7 @@ import json
 import math
 import os
 import re
+import shutil
 import struct
 import tempfile
 import threading
@@ -111,6 +120,23 @@ _BASIS_INDEX = 0
 # re-running the recovery step.
 _STAGED_PREFIX = ".seqc-"
 _COMPACT_MARKER = ".seqcompact"
+
+# Chain families.  ``derive_chain`` forks a chain directory into a new
+# chain directory: the segments up to the fork point are hard-linked into
+# the new directory (one inode, two directory entries -- the segment files
+# are *shared*, never copied), and from then on each chain maintains only
+# its own ``head`` pointer and its own appended deltas.  Every write in
+# the engine is a temp file plus an atomic rename, so one chain's save or
+# compaction can never rewrite a segment another chain still references;
+# unlinking a shared segment from one directory merely drops that chain's
+# own reference, and the storage is reclaimed by the filesystem exactly
+# when no chain's head can reach it any more.  A small ``.seqfamily``
+# marker labels family members so read-only verification can name the
+# chain a bad segment belongs to.  A derive stages the new directory
+# under this prefix and publishes it with one directory rename, so a
+# crash leaves either no new chain or a complete one.
+_FAMILY_NAME = ".seqfamily"
+_DERIVE_TMP_PREFIX = ".seqderive.tmp-"
 
 # Streaming-compaction leases.  A compaction no longer folds the chain in
 # one critical section: it stages a new basis and then converts one tail
@@ -1751,32 +1777,45 @@ def _load_chain_store(store, head):
 
 
 class ChainVerification:
-    """Result of a successful read-only chain verification."""
+    """Result of a successful read-only chain verification.
 
-    __slots__ = ("ok", "head", "segments")
+    ``chain`` names the verified chain when it belongs to a chain family
+    (a derived chain or the source of one); it is ``None`` for a
+    standalone chain.
+    """
 
-    def __init__(self, head, segments):
+    __slots__ = ("ok", "head", "segments", "chain")
+
+    def __init__(self, head, segments, chain=None):
         self.ok = True
         self.head = head
         self.segments = segments
+        self.chain = chain
 
     def __bool__(self):
         return True
 
     def __repr__(self):
+        suffix = f", chain={self.chain!r}" if self.chain is not None else ""
         return (
             f"ChainVerification(ok=True, head={self.head}, "
-            f"segments={self.segments})"
+            f"segments={self.segments}{suffix})"
         )
 
 
-def _verify_failure(position, what, exc):
+def _chain_suffix(chain):
+    """Failure-message suffix naming the chain a bad segment belongs to."""
+    return f" in chain {chain!r}" if chain is not None else ""
+
+
+def _verify_failure(position, what, exc, chain=None):
     return CheckpointError(
-        f"chain verification failed at {position} ({what}): {exc}"
+        f"chain verification failed at {position} ({what})"
+        f"{_chain_suffix(chain)}: {exc}"
     )
 
 
-def _verify_normal_chain(store, head):
+def _verify_normal_chain(store, head, chain=None):
     """Validate the ordinary on-disk chain ``0..head``; read-only.
 
     Any defect -- including a referenced segment file that is absent -- is
@@ -1787,29 +1826,31 @@ def _verify_normal_chain(store, head):
         basis_raw = store.read_segment(_segment_name(_BASIS_INDEX))
     except FileNotFoundError:
         raise CheckpointError(
-            "chain verification failed at segment 0 (basis): "
-            "the basis segment file is missing"
+            f"chain verification failed at segment 0 (basis)"
+            f"{_chain_suffix(chain)}: the basis segment file is missing"
         ) from None
     try:
         walker = _ChainWalker(basis_raw)
     except CheckpointError as exc:
-        raise _verify_failure("segment 0", "basis", exc) from exc
+        raise _verify_failure("segment 0", "basis", exc, chain) from exc
     for index in range(1, head + 1):
         try:
             raw = store.read_segment(_segment_name(index))
         except FileNotFoundError:
             raise CheckpointError(
-                f"chain verification failed at segment {index} (delta): "
-                "the segment file is missing"
+                f"chain verification failed at segment {index} (delta)"
+                f"{_chain_suffix(chain)}: the segment file is missing"
             ) from None
         try:
             walker.apply_delta(index, raw)
         except CheckpointError as exc:
-            raise _verify_failure(f"segment {index}", "delta", exc) from exc
+            raise _verify_failure(f"segment {index}", "delta", exc, chain) from exc
     try:
         walker.document()
     except CheckpointError as exc:
-        raise _verify_failure(f"segment {head}", "chain assembly", exc) from exc
+        raise _verify_failure(
+            f"segment {head}", "chain assembly", exc, chain
+        ) from exc
 
 
 def verify_chain_memory(store):
@@ -1842,6 +1883,11 @@ def verify_chain(directory):
     fold interrupted on disk is inspected in place rather than rolled
     forward.
 
+    When the directory belongs to a chain family (it is a derived chain
+    or the source of one), the chain itself is named in every failure
+    and in the success report, so a bad shared segment is located to the
+    chain it was found in.
+
     A missing directory raises FileNotFoundError; an operating-system
     level read failure (permissions, I/O) propagates as OSError; any
     corruption, truncation, missing field, ordering, reference or shape
@@ -1860,24 +1906,28 @@ def verify_chain(directory):
     # read-only, so a read-only directory verifies fine.
     with _DirectoryChainLock(directory):
         store = _DirectoryChainStore(directory)
+        chain = (
+            directory if _read_family_marker(directory) is not None else None
+        )
         try:
             head = _read_head_optional(store)
         except CheckpointError as exc:
-            raise _verify_failure("the head pointer", "head", exc) from exc
+            raise _verify_failure("the head pointer", "head", exc, chain) from exc
         if head is None:
             raise CheckpointError(
-                "chain verification failed at the head pointer: the chain "
-                "has no head pointer (no basis segment committed)"
+                "chain verification failed at the head pointer"
+                f"{_chain_suffix(chain)}: the chain has no head pointer "
+                "(no basis segment committed)"
             )
         if not _marker_exists(directory):
-            _verify_normal_chain(store, head)
-            return ChainVerification(head, head + 1)
+            _verify_normal_chain(store, head, chain)
+            return ChainVerification(head, head + 1, chain)
         # A fold is (or was) in flight.  Verify the one coherent logical
         # chain reachable through the marker, still without writing.
-        return _verify_through_marker_read_only(directory, store, head)
+        return _verify_through_marker_read_only(directory, store, head, chain)
 
 
-def _verify_through_marker_read_only(directory, store, head):
+def _verify_through_marker_read_only(directory, store, head, chain=None):
     """Read-only verification of a directory holding a compaction marker.
 
     No recovery is performed: the verifier assembles the one coherent
@@ -1906,15 +1956,17 @@ def _verify_through_marker_read_only(directory, store, head):
         except FileNotFoundError:
             raise CheckpointError(
                 "chain verification failed at a staged segment of the "
-                "compacted chain: a required staged file is missing"
+                f"compacted chain{_chain_suffix(chain)}: a required staged "
+                "file is missing"
             ) from None
-        return ChainVerification(new_head, new_head + 1)
+        return ChainVerification(new_head, new_head + 1, chain)
 
     fold = marker["u"]
     if head < fold:
         raise CheckpointError(
-            "chain verification failed at the compaction marker: the fold "
-            f"point {fold} is beyond the chain head {head}"
+            "chain verification failed at the compaction marker"
+            f"{_chain_suffix(chain)}: the fold point {fold} is beyond the "
+            f"chain head {head}"
         )
 
     if "h" not in marker:
@@ -1925,10 +1977,11 @@ def _verify_through_marker_read_only(directory, store, head):
         except FileNotFoundError:
             raise CheckpointError(
                 "chain verification failed at a segment of the folding "
-                "chain: a required segment file is missing"
+                f"chain{_chain_suffix(chain)}: a required segment file is "
+                "missing"
             ) from None
         new_head = head - fold
-        return ChainVerification(new_head, new_head + 1)
+        return ChainVerification(new_head, new_head + 1, chain)
 
     # Publication phase: basis promoted and the tail moved down ascending.
     # A source slot still present means that move has not happened yet;
@@ -1947,7 +2000,7 @@ def _verify_through_marker_read_only(directory, store, head):
             )
         walker.apply_delta(new_index, raw)
     walker.document()
-    return ChainVerification(new_head, new_head + 1)
+    return ChainVerification(new_head, new_head + 1, chain)
 
 
 def _read_existing(path):
@@ -2552,8 +2605,292 @@ def _unlink_quietly(path):
 
 
 # ---------------------------------------------------------------------------
+# Chain families: deriving forked chains that share their prefix segments
+#
+# Deriving forks the chain in one directory into a new chain directory at
+# any committed segment: the segments up to the fork point are hard-linked
+# into the new directory (one inode, two directory entries -- the segment
+# files are shared, never copied), the new chain's ``head`` starts at the
+# fork point, and from then on each chain maintains only its own head and
+# its own appended deltas.  Because every write in the engine is a temp
+# file plus an atomic rename, no operation on one chain can rewrite or
+# tear a segment another chain still references: a save or a streaming
+# compaction replaces or unlinks only its own directory's entries, and a
+# shared segment's storage is reclaimed by the filesystem exactly when the
+# last chain whose head can reach it lets go of it -- after a hard kill at
+# any point, shared segments are neither wrongly deleted nor leaked, and
+# every reopened chain is still one complete state.
+#
+# A small ``.seqfamily`` marker labels family members (the source chain is
+# labelled best effort -- deriving only reads it -- and the derived chain
+# always is), so read-only verification can name the chain a bad segment
+# belongs to.  The marker is auxiliary: loads, saves and compactions
+# ignore it.
+# ---------------------------------------------------------------------------
+
+
+def _encode_family(marker):
+    return json.dumps(marker, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+
+
+def _decode_family(raw):
+    try:
+        marker = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(marker, dict) or not isinstance(marker.get("id"), str):
+        return None
+    return marker
+
+
+def _family_path(directory):
+    return os.path.join(directory, _FAMILY_NAME)
+
+
+def _read_family_marker(directory):
+    """The family marker of *directory*, or None when absent/unreadable.
+
+    The marker is auxiliary metadata: a missing or undecodable one simply
+    means the chain is not known to belong to a family.
+    """
+    try:
+        with open(_family_path(directory), "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    return _decode_family(raw)
+
+
+def _ensure_family_marker(directory):
+    """Return the family id of *directory*, labelling it best effort.
+
+    Deriving only reads the source chain, so a source that cannot be
+    labelled (a read-only directory, say) still derives fine -- it simply
+    stays unlabelled until a writable derive labels it.
+    """
+    marker = _read_family_marker(directory)
+    if marker is not None:
+        return marker["id"]
+    family_id = os.urandom(16).hex()
+    try:
+        _atomic_write(
+            directory,
+            _FAMILY_NAME,
+            _encode_family({"v": 1, "id": family_id, "role": "root"}),
+        )
+    except OSError:
+        pass
+    return family_id
+
+
+def _check_fork_point(at, head):
+    if at is None:
+        return head
+    if isinstance(at, bool) or not isinstance(at, int) or at < 0:
+        raise CheckpointError(
+            "fork point must be a non-negative segment index"
+        )
+    if at > head:
+        raise CheckpointError(
+            f"fork point {at} names a segment beyond the chain head {head}"
+        )
+    return at
+
+
+def _validate_prefix(store, fork):
+    """Walk segments ``0..fork`` exactly as a load would; read-only."""
+    walker = _ChainWalker(store.read_segment(_segment_name(_BASIS_INDEX)))
+    for index in range(1, fork + 1):
+        walker.apply_delta(index, store.read_segment(_segment_name(index)))
+    walker.document()
+
+
+def derive_chain(source, target, at=None):
+    """Fork the chain in *source* into a new chain directory *target*.
+
+    The new chain shares every segment up to *at* (the source head when
+    omitted) with the source chain -- the segment files are hard-linked,
+    never copied -- and starts with its own ``head`` at the fork point.
+    From then on the two chains evolve independently: appends, loads,
+    verifications and streaming compactions on either chain never disturb
+    the other, two chains appending at the same segment position write
+    fully independent files, and a shared segment is reclaimed exactly
+    when no chain's head can reach it any more.  The reassembled state of
+    each chain is bit for bit the state an unforked chain with the same
+    saves would hold.
+
+    The fork is published with one directory rename, so a crash leaves
+    either no new chain or a complete one, and the source chain is never
+    modified by a failed derive.  A fork point that is not a committed
+    segment boundary (a non-integer or negative position), one beyond the
+    source head, or an already existing *target* raises ValueError; a
+    missing source directory or a missing referenced segment raises
+    FileNotFoundError; an unwritable destination or a full disk raises
+    OSError.
+    """
+    if not isinstance(source, (str, os.PathLike)):
+        raise TypeError("source chain directory must be a path")
+    if not isinstance(target, (str, os.PathLike)):
+        raise TypeError("derived chain directory must be a path")
+    source = os.fspath(source)
+    target = os.fspath(target)
+    if not os.path.isdir(source):
+        raise FileNotFoundError(
+            f"incremental checkpoint directory not found: {source!r}"
+        )
+    target_abs = os.path.abspath(target)
+    if os.path.lexists(target_abs):
+        raise CheckpointError(
+            f"derived chain directory already exists: {target!r}"
+        )
+    # Serialise derives into one target path in this process; the target
+    # does not exist yet, so its chain lock is free for this purpose.
+    with _chain_lock(target_abs):
+        # Wait out a fold another thread/process may be running on the
+        # source, then fork under the source chain lock, so no compaction
+        # can renumber or release a segment while it is being linked.
+        while True:
+            with _DirectoryChainLock(source):
+                store = _DirectoryChainStore(source)
+                _recover_directory_chain(source, store)
+                contended = _marker_exists(source)
+                if not contended:
+                    _derive_locked(source, store, target, target_abs, at)
+            if not contended:
+                break
+            _wait_for_live_marker(source)
+    return None
+
+
+def _derive_locked(source, store, target, target_abs, at):
+    """Build the fork; runs under the source chain lock with no live fold."""
+    head = _read_head_optional(store)
+    if head is None:
+        raise CheckpointError(
+            "chain has no head pointer (no basis segment committed)"
+        )
+    fork = _check_fork_point(at, head)
+    # The shared prefix is validated exactly as a load would walk it, so a
+    # corrupt or incomplete source never spawns a corrupt branch.
+    _validate_prefix(store, fork)
+    family_id = _ensure_family_marker(source)
+    parent = os.path.dirname(target_abs)
+    tmp = tempfile.mkdtemp(prefix=_DERIVE_TMP_PREFIX, dir=parent)
+    published = False
+    try:
+        for index in range(fork + 1):
+            os.link(
+                os.path.join(source, _segment_name(index)),
+                os.path.join(tmp, _segment_name(index)),
+            )
+        _atomic_write(tmp, _HEAD_NAME, str(fork).encode("ascii"))
+        _atomic_write(
+            tmp,
+            _FAMILY_NAME,
+            _encode_family(
+                {
+                    "v": 1,
+                    "id": family_id,
+                    "role": "branch",
+                    "of": os.path.abspath(source),
+                    "at": fork,
+                }
+            ),
+        )
+        _fsync_directory(tmp)
+        if os.path.lexists(target_abs):
+            raise CheckpointError(
+                f"derived chain directory already exists: {target!r}"
+            )
+        os.rename(tmp, target_abs)
+        published = True
+        _fsync_directory(parent)
+    finally:
+        if not published:
+            _rmtree_quietly(tmp)
+
+
+def derive_chain_memory(source, at=None):
+    """Fork an in-memory chain; return the new :class:`MemoryChain`.
+
+    The branch shares the prefix segment objects (segment bytes are
+    immutable, so sharing is exact) and then evolves independently,
+    exactly like a derived chain directory.
+    """
+    if not isinstance(source, MemoryChain):
+        raise TypeError("source must be a MemoryChain")
+    with source._lock:
+        head = _read_head_optional(source)
+        if head is None:
+            raise CheckpointError(
+                "chain has no head pointer (no basis segment committed)"
+            )
+        fork = _check_fork_point(at, head)
+        _validate_prefix(source, fork)
+        raw_marker = source._objects.get(_FAMILY_NAME)
+        marker = _decode_family(raw_marker) if raw_marker is not None else None
+        if marker is None:
+            family_id = os.urandom(16).hex()
+            source._objects[_FAMILY_NAME] = _encode_family(
+                {"v": 1, "id": family_id, "role": "root"}
+            )
+        else:
+            family_id = marker["id"]
+        target = MemoryChain()
+        for index in range(fork + 1):
+            name = _segment_name(index)
+            target._objects[name] = source._objects[name]
+        target._objects[_HEAD_NAME] = str(fork).encode("ascii")
+        target._objects[_FAMILY_NAME] = _encode_family(
+            {"v": 1, "id": family_id, "role": "branch", "at": fork}
+        )
+    return target
+
+
+def drop_chain(directory):
+    """Remove a chain directory, reclaiming only what no chain can reach.
+
+    Segments shared with other chains of the family stay alive through
+    those chains' own references; the storage of everything else is
+    reclaimed with the directory.  A missing directory raises
+    FileNotFoundError.
+    """
+    if not isinstance(directory, (str, os.PathLike)):
+        raise TypeError("chain directory must be a path")
+    directory = os.fspath(directory)
+    if not os.path.isdir(directory):
+        raise FileNotFoundError(
+            f"incremental checkpoint directory not found: {directory!r}"
+        )
+    with _DirectoryChainLock(directory):
+        shutil.rmtree(directory)
+    return None
+
+
+def drop_chain_memory(store):
+    """Drop an in-memory chain; shared segments survive in other chains."""
+    if not isinstance(store, MemoryChain):
+        raise TypeError("store must be a MemoryChain")
+    with store._lock:
+        store._objects.clear()
+    return None
+
+
+def _rmtree_quietly(path):
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Full / chain dispatch and file / memory IO
 # ---------------------------------------------------------------------------
+
+
+
 
 
 def save_bytes(document, target):

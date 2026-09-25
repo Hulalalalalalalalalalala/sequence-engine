@@ -127,9 +127,35 @@ checkpoint path) and writes no files.
   rejects the **whole** chain with `ValueError` whose message names the
   first bad segment's position and the reason; the chain directory is not
   modified by a single byte (a compaction interrupted on disk is
-  inspected in place, not rolled forward). A missing chain directory
+  inspected in place, not rolled forward). When the chain belongs to a
+  chain family (see below), the failure and the report (`.chain`) also
+  name the chain the bad segment belongs to. A missing chain directory
   raises `FileNotFoundError`; an operating-system level read failure
   raises `OSError`.
+- `Sequential.derive(source, target=None, at=None)` forks an existing
+  incremental checkpoint chain (a chain directory or a `MemoryChain`)
+  into a new chain of the same family at segment `at` (the source head
+  when omitted). The new chain shares every segment file up to the fork
+  point with the source chain -- the files are shared, never copied --
+  and starts with its own `head` at the fork point; from then on each
+  chain maintains only its own head and its own appended deltas, and
+  saves, loads, verifications and streaming compactions on either chain
+  proceed in parallel without interfering. Every state a chain of the
+  family reassembles -- parameters, gradients, optimizer state, hidden
+  state -- is bit for bit the state an unforked chain with the same
+  saves would hold. For a directory source, `target` is the new chain
+  directory and the call returns `None`; for a `MemoryChain` source the
+  new `MemoryChain` is returned. A fork point that is not a committed
+  segment boundary or names a segment beyond the source head, and an
+  already existing target directory, raise `ValueError`; a missing
+  source directory or referenced segment raises `FileNotFoundError`; an
+  unwritable destination or a full disk raises `OSError`.
+- `Sequential.drop(target)` removes a chain (a chain directory or a
+  `MemoryChain`). Segments shared with other chains of its family stay
+  alive through those chains' own references -- a shared segment is
+  reclaimed exactly when no chain's head can reach it any more -- and
+  everything else is reclaimed with the chain. A missing directory
+  raises `FileNotFoundError`.
 
 ### Threading
 
@@ -225,6 +251,37 @@ a different model.
 `MemoryChain` (exported from `sequence_engine`) is an in-memory chain with
 identical commit semantics, useful for tests and long-running processes that
 want incremental snapshots without files.
+
+## Chain families
+
+`Sequential.derive` (or `checkpoint.derive_chain`) forks an existing chain
+into a **family** of chains that share one prefix of history and then
+evolve independently:
+
+- deriving a chain directory at segment `at` creates a new chain directory
+  whose first `at + 1` segment files are **shared** with the source chain
+  (hard links, never copies) and whose own `head` starts at the fork
+  point; afterwards each chain maintains only its own head and its own
+  appended deltas;
+- both chains save, load, stream-compact and verify in parallel without
+  interfering. Every write is a temp file plus an atomic rename, so one
+  chain's save or compaction can never rewrite or tear a segment another
+  chain still references, and two chains appending at the same segment
+  position write fully independent files. Every state a chain of the
+  family reassembles is bit for bit the state an unforked chain with the
+  same saves would hold;
+- shared segments are reclaimed by reachability: unlinking a segment from
+  one chain's directory (by compaction, or by `Sequential.drop` removing
+  the chain) only drops that chain's own reference, and the storage is
+  reclaimed exactly when no chain's head can reach it any more. A process
+  killed at any point therefore neither loses nor leaks shared segments,
+  and every reopened chain is still one complete state;
+- the fork itself is published with one directory rename, so a crash
+  leaves either no new chain or a complete one, and the source chain is
+  never modified by a failed derive;
+- `Sequential.verify` on any family member checks the chain strictly
+  read-only as before and additionally names the chain a bad segment
+  belongs to (in the failure message and in the report's `chain` field).
 
 ## Tests
 

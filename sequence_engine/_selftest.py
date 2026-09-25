@@ -1994,6 +1994,249 @@ def _check_chain_verification():
             "verify rejects a non-MemoryChain")
 
 
+def _check_chain_families_memory():
+    # A derived chain shares the prefix segments and then evolves
+    # independently; both chains reassemble bit for bit the states two
+    # unforked chains would have produced.
+    seq, _ = _fresh_stack()
+    main = _checkpoint.MemoryChain()
+    seq.save(main)  # seg 0
+    out, hidden = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out))
+    seq.save(main)  # seg 1
+    seq.update(_LR)
+    seq.save(main)  # seg 2
+
+    branch = _checkpoint.derive_chain_memory(main)  # fork at the head (2)
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(branch))
+        == _checkpoint.build_bytes(_checkpoint.load_chain_memory(main)),
+        "a fresh branch reassembles the forked state bit for bit",
+    )
+    _check(
+        branch.read_head() == b"2",
+        "the branch head starts at the fork point",
+    )
+    _check(
+        all(
+            branch._objects[_checkpoint._segment_name(index)]
+            is main._objects[_checkpoint._segment_name(index)]
+            for index in range(3)
+        ),
+        "the branch shares the prefix segment objects",
+    )
+
+    # Identical continuations of both chains stay bit for bit identical,
+    # exactly as if the chain had never been forked.
+    seq2, _ = _fresh_stack()
+    hidden2 = seq2.load(branch)
+    out_a, _ = seq.forward(Tensor(_SEG2), hidden)
+    seq.backward(_total(out_a))
+    seq.adam_step(_ADAM_LR)
+    seq.save(main)  # main seg 3
+    out_b, _ = seq2.forward(Tensor(_SEG2), hidden2)
+    seq2.backward(_total(out_b))
+    seq2.adam_step(_ADAM_LR)
+    seq2.save(branch)  # branch seg 3
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(main))
+        == _checkpoint.build_bytes(_checkpoint.load_chain_memory(branch)),
+        "identical continuations of forked chains match bit for bit",
+    )
+    _check(
+        len(main) == 4 and len(branch) == 4,
+        "both chains appended exactly one delta after the fork",
+    )
+    _check(
+        main._objects[_checkpoint._segment_name(3)]
+        is not branch._objects[_checkpoint._segment_name(3)],
+        "post-fork segments are private to each chain",
+    )
+
+    # Divergent continuations: each chain still reassembles its own
+    # model's exact state.
+    seq2.adam_step(_ADAM_LR)
+    seq2.save(branch)  # branch seg 4
+    full_main = bytearray()
+    seq.save(full_main)
+    full_branch = bytearray()
+    seq2.save(full_branch)
+    _check(
+        bytes(full_main) != bytes(full_branch),
+        "divergent continuations produce different states",
+    )
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(main))
+        == bytes(full_main),
+        "the main chain reassembles its own head state bit for bit",
+    )
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(branch))
+        == bytes(full_branch),
+        "the branch reassembles its own head state bit for bit",
+    )
+
+    # Compacting one chain of the family never disturbs the other.
+    branch_state = _checkpoint.build_bytes(
+        _checkpoint.load_chain_memory(branch)
+    )
+    _checkpoint.compact_chain_memory(main)
+    _check(len(main) == 1, "the main chain folds to one basis segment")
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(branch))
+        == branch_state,
+        "compacting the main chain leaves the branch untouched",
+    )
+    _check(len(branch) == 5, "the branch keeps its own segment count")
+    _checkpoint.compact_chain_memory(branch, up_to=2)
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(branch))
+        == branch_state,
+        "compacting the branch preserves its state bit for bit",
+    )
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(main))
+        == bytes(full_main),
+        "compacting the branch leaves the main chain untouched",
+    )
+
+    # A fork at the basis shares only the basis segment.
+    base_only = _checkpoint.derive_chain_memory(branch, at=0)
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(base_only))
+        == _checkpoint.build_bytes(
+            _checkpoint.load_chain_memory(branch, up_to=0)
+        ),
+        "a fork at the basis reassembles the basis state",
+    )
+    _check(len(base_only) == 1, "a basis-only fork holds one segment")
+
+    # Dropping one chain never touches the others.
+    _checkpoint.drop_chain_memory(base_only)
+    _expect(
+        ValueError,
+        lambda: _checkpoint.load_chain_memory(base_only),
+        "a dropped chain has no reachable state",
+    )
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(branch))
+        == branch_state,
+        "dropping a sibling chain leaves the family untouched",
+    )
+
+    # Family members verify; the family marker rides along invisibly.
+    _check(
+        _checkpoint._FAMILY_NAME in main._objects
+        and _checkpoint._FAMILY_NAME in branch._objects,
+        "family members are labelled",
+    )
+    _check(
+        _checkpoint.verify_chain_memory(branch).ok,
+        "a family branch verifies read-only",
+    )
+
+    # Appends and compactions across the family interleave freely.
+    errors = []
+    stop = False
+
+    def appender(chain):
+        try:
+            for _ in range(60):
+                doc = _checkpoint.load_chain_memory(chain)
+                _checkpoint.save_chain_memory(doc, chain)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def reader(chain):
+        try:
+            while not stop:
+                _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=appender, args=(main,)),
+        threading.Thread(target=appender, args=(branch,)),
+        threading.Thread(target=reader, args=(branch,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for _ in range(20):
+        _checkpoint.compact_chain_memory(main)
+        _checkpoint.compact_chain_memory(branch)
+    stop = True
+    for thread in threads:
+        thread.join()
+    _check(errors == [], f"family interleave raised: {errors!r}")
+    _check(
+        _checkpoint.verify_chain_memory(main).ok
+        and _checkpoint.verify_chain_memory(branch).ok,
+        "both chains verify after the interleaved run",
+    )
+
+    # Fork-point validation and type errors.
+    for bad in (-1, True, 0.5, "1"):
+        _expect(
+            ValueError,
+            lambda bad=bad: _checkpoint.derive_chain_memory(main, bad),
+            f"invalid fork point {bad!r} is rejected",
+        )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.derive_chain_memory(main, 10**9),
+        "a fork point beyond the head is rejected",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.derive_chain_memory(_checkpoint.MemoryChain()),
+        "deriving an empty chain is rejected",
+    )
+    _expect(
+        TypeError,
+        lambda: _checkpoint.derive_chain_memory(object()),
+        "derive rejects a non-MemoryChain source",
+    )
+    _expect(
+        TypeError,
+        lambda: _checkpoint.drop_chain_memory(object()),
+        "drop rejects a non-MemoryChain target",
+    )
+
+    # The container-level entry points derive and drop memory chains too.
+    via_seq, _ = _fresh_stack()
+    forked = via_seq.derive(main)
+    _check(
+        isinstance(forked, _checkpoint.MemoryChain),
+        "Sequential.derive returns the new memory chain",
+    )
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(forked))
+        == _checkpoint.build_bytes(_checkpoint.load_chain_memory(main)),
+        "Sequential.derive forks the exact head state",
+    )
+    _expect(
+        TypeError,
+        lambda: via_seq.derive(main, main),
+        "a memory derive takes no target",
+    )
+    _expect(
+        TypeError,
+        lambda: via_seq.derive(object()),
+        "derive rejects a non-chain source",
+    )
+    via_seq.drop(forked)
+    _expect(
+        ValueError,
+        lambda: _checkpoint.load_chain_memory(forked),
+        "Sequential.drop removes the forked chain",
+    )
+    _expect(
+        TypeError,
+        lambda: via_seq.drop(object()),
+        "drop rejects a non-chain target",
+    )
+
+
 class _BoomBackwardAndReplayRNN(_RNNStep):
     """Layer whose first backward raises and whose cache-rebuild replay
     also raises, so the rebuild failure must be surfaced, not swallowed."""
@@ -2159,6 +2402,7 @@ _GROUPS = [
     ("in-memory chain compaction", _check_chain_compaction_memory),
     ("streaming compaction interleave", _check_streaming_compaction_interleaves),
     ("chain verification", _check_chain_verification),
+    ("in-memory chain families", _check_chain_families_memory),
     ("backward replay failure surfaced", _check_backward_replay_failure_is_surfaced),
     ("concurrent update/save/load", _check_concurrent_updates_saves_loads),
     ("concurrent adam/save/load", _check_concurrent_adam_saves_loads),

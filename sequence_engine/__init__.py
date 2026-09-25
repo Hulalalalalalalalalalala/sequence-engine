@@ -9,8 +9,11 @@ Public interface (see README.md):
   (bounded-memory activation recomputation), ``save`` / ``load``
   (versioned atomic checkpoints to a path, a chain directory, a
   ``MemoryChain`` or a bytearray), ``compact`` (streaming in-place,
-  crash-safe compaction of an incremental checkpoint chain) and ``verify``
-  (strictly read-only verification of an incremental chain).
+  crash-safe compaction of an incremental checkpoint chain), ``verify``
+  (strictly read-only verification of an incremental chain), ``derive``
+  (forking a chain into a new chain that shares the segments up to the
+  fork point and then evolves independently) and ``drop`` (removing a
+  chain, reclaiming only the segments no remaining chain can reach).
 """
 
 from .checkpoint import MemoryChain
