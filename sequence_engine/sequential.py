@@ -287,7 +287,7 @@ class Sequential:
             try:
                 for module in reversed(self._modules):
                     upstream = module.backward(upstream)
-            except BaseException:
+            except BaseException as layer_exc:
                 for param, saved in zip(self.parameters(), grad_snapshot):
                     param.grad = None if saved is None else Tensor(saved)
                 # A layer's failed backward may also have destroyed caches a
@@ -295,17 +295,35 @@ class Sequential:
                 # Replay the segment's forward from the retry anchors so every
                 # layer cache is rebuilt exactly as the recorded forward left
                 # it.  The replay only re-runs layer forwards -- parameters,
-                # gradients and the recorded boundary state stay untouched --
-                # and a replay failure never masks the original error.
+                # gradients and the recorded boundary state stay untouched.
+                # If the replay itself fails that failure must not be
+                # swallowed: it surfaces as a ValueError naming the rebuild
+                # stage, chained onto the original layer exception, which
+                # stays the exception handed to the caller (it is neither
+                # masked nor replaced).
                 try:
                     self._replay_forward()
-                except BaseException:
-                    pass
+                except BaseException as replay_exc:
+                    raise layer_exc from self._cache_rebuild_error(replay_exc)
                 raise
             self._pending_backward = False
             self._anchors = None
             self._forward_fingerprint = None
             self._retry_anchors = None
+
+    def _cache_rebuild_error(self, replay_exc):
+        """Wrap a failed cache-rebuild replay as a stage-named ValueError.
+
+        The original backward exception is what the caller receives; this
+        ValueError is chained onto it (``__cause__``) so the rebuild
+        failure is neither silent nor able to mask the original, yet
+        always names the rebuild stage and carries the replay error.
+        """
+        return ValueError(
+            "failed to rebuild layer caches: replaying the segment's "
+            "forward after the backward error raised "
+            f"{type(replay_exc).__name__}: {replay_exc}"
+        )
 
     def _replay_forward(self):
         """Re-run the in-flight segment's forward to rebuild layer caches.
@@ -689,6 +707,32 @@ class Sequential:
                 return _checkpoint.compact_chain(target, up_to)
             raise TypeError(
                 "compact target must be a chain directory or a MemoryChain"
+            )
+
+    def verify(self, source):
+        """Verify an incremental checkpoint chain without changing it.
+
+        *source* is an existing chain directory (or a ``MemoryChain``).
+        Every segment -- basis then each delta through the ``head`` -- is
+        checked read-only for completeness (framing/CRC), segment order,
+        its basis reference and tensor/layer shapes.  A sound chain
+        returns a success report; otherwise a ``ValueError`` names the
+        first bad segment's position and the reason.  The chain is only
+        read, so a chain compaction that was interrupted on disk is
+        inspected in place and the directory is left byte for byte
+        unchanged.
+
+        A missing directory raises ``FileNotFoundError``; any truncation,
+        missing field, ordering, reference or shape defect rejects the
+        whole chain with ``ValueError``.
+        """
+        with self._lock:
+            if isinstance(source, _checkpoint.MemoryChain):
+                return _checkpoint.verify_chain_memory(source)
+            if isinstance(source, (str, os.PathLike)):
+                return _checkpoint.verify_chain(source)
+            raise TypeError(
+                "verify source must be a chain directory or a MemoryChain"
             )
 
     def _validate_against_model(self, document):

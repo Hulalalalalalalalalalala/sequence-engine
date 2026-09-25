@@ -29,7 +29,11 @@ checkpoint path) and writes no files.
   `forward`, raises `RuntimeError`. If a layer raises mid-pass the partial
   gradients are rolled back, the layer caches are restored by replaying
   the segment's forward, and the same `backward` may be retried; a retry
-  is not a second backward.
+  is not a second backward. If that replay itself cannot rebuild the
+  caches the rebuild failure is surfaced (not swallowed) as a `ValueError`
+  naming the rebuild stage, chained onto the original layer exception,
+  which is still the error handed to the caller -- it is neither masked
+  nor replaced.
 - `Sequential.zero_grad() -> None` clears accumulated gradients.
 - `Sequential.update(learning_rate) -> None` performs one in-place step
   `theta <- theta - learning_rate * grad` on every parameter. Gradients are
@@ -90,8 +94,14 @@ checkpoint path) and writes no files.
   or silently filled in. A missing path raises `FileNotFoundError`.
 - `Sequential.compact(target, up_to=None) -> None` compacts an existing
   incremental checkpoint chain (a chain directory or a `MemoryChain`) in
-  place: the basis segment and the deltas through `up_to` (the current
-  head when omitted) are folded into one new basis segment and the
+  place. Compaction is a streaming online fold: segments are checked one
+  by one while the new basis is written out, the remaining deltas are
+  converted a segment at a time in the slots the original chain already
+  owned, and saves and loads proceed normally throughout -- peak on-disk
+  usage never exceeds the original chain plus one new basis segment, and
+  the `head` pointer names at every instant one complete chain (the old
+  head or the new). The basis segment and the deltas through `up_to` (the
+  current head when omitted) are folded into one new basis segment and the
   remaining deltas are renumbered after it. The reassembled state --
   parameters, gradients, optimizer moments and step count, hidden state
   -- is bit for bit identical before and after, compaction advances no
@@ -107,6 +117,19 @@ checkpoint path) and writes no files.
   `OSError`, and any corrupt, truncated or shape-inconsistent segment
   rejects the whole compaction with `ValueError` before anything is
   written.
+- `Sequential.verify(source)` verifies an existing incremental checkpoint
+  chain (a chain directory or a `MemoryChain`) strictly read-only. It
+  walks the basis and every delta through the `head`, checking each
+  segment's completeness (framing and CRC), segment order, the basis
+  reference and every tensor/layer shape, and returns a success report
+  (`ok`, `head`, `segments`) for an intact chain. A truncated segment,
+  missing field, out-of-order segment, or a shape/layer-order mismatch
+  rejects the **whole** chain with `ValueError` whose message names the
+  first bad segment's position and the reason; the chain directory is not
+  modified by a single byte (a compaction interrupted on disk is
+  inspected in place, not rolled forward). A missing chain directory
+  raises `FileNotFoundError`; an operating-system level read failure
+  raises `OSError`.
 
 ### Threading
 
@@ -172,12 +195,17 @@ incremental chain instead of one self-contained file:
   -- stays bit for bit identical to the uninterrupted run.
 
 `Sequential.compact` (or `checkpoint.compact_chain`) folds the basis and a
-prefix of the deltas into one new basis segment in place; see its entry in
-the interface list above. Compaction commits through a stage-then-roll-
-forward protocol guarded by a cross-process directory lock: concurrent
-saves, loads and compactions on one directory are serialised, a compaction
-killed at any point is completed by the next open, and `head` always
-points at one complete chain.
+prefix of the deltas into one new basis segment in place as a streaming
+online compaction; see its entry in the interface list above. The fold
+walks and checks segments as it writes the new basis, converts the tail a
+segment at a time in the slots the chain already owned, and commits
+through a stage-then-publish protocol guarded by a cross-process directory
+lock and lease: concurrent saves, loads, verifies and compactions on one
+directory are serialised at each step (a live fold is read straight
+through rather than waited on), a compaction killed at any point is
+completed by the next open, and `head` always points at one complete
+chain. Peak disk usage stays within the original chain plus the single
+new basis segment.
 
 Loading walks the basis and every delta up to the head and reassembles the
 state by layer (parameters, gradients, optimizer moments and step count,

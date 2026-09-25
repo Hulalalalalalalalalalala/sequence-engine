@@ -8,8 +8,9 @@ Public interface (see README.md):
   (one in-place Adam step with fixed coefficients), ``set_recompute``
   (bounded-memory activation recomputation), ``save`` / ``load``
   (versioned atomic checkpoints to a path, a chain directory, a
-  ``MemoryChain`` or a bytearray) and ``compact`` (in-place, crash-safe
-  compaction of an incremental checkpoint chain).
+  ``MemoryChain`` or a bytearray), ``compact`` (streaming in-place,
+  crash-safe compaction of an incremental checkpoint chain) and ``verify``
+  (strictly read-only verification of an incremental chain).
 """
 
 from .checkpoint import MemoryChain

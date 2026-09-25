@@ -1892,6 +1892,175 @@ def _check_chain_compaction_memory():
     )
 
 
+def _check_streaming_compaction_interleaves():
+    # The streaming fold keeps working through concurrent appends and
+    # reads: a compactor, an appender and readers run at once against one
+    # in-memory chain and every observed state is a complete, loadable
+    # chain.  The final chain compacts to one basis matching its head.
+    seq, _ = _fresh_stack()
+    chain = _checkpoint.MemoryChain()
+    seq.save(chain)
+    errors = []
+    stop = False
+
+    def appender():
+        try:
+            for _ in range(120):
+                doc = _checkpoint.load_chain_memory(chain)
+                _checkpoint.save_chain_memory(doc, chain)  # empty delta
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def reader():
+        try:
+            while not stop:
+                _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=appender)]
+    threads += [threading.Thread(target=reader) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for _ in range(30):
+        _checkpoint.compact_chain_memory(chain)
+    stop = True
+    for thread in threads:
+        thread.join()
+    _check(errors == [], f"streaming interleave raised: {errors!r}")
+    head_bytes = _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+    _checkpoint.compact_chain_memory(chain)
+    _check(len(chain) == 1, "the interleaved chain finally folds to one basis")
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain)) == head_bytes,
+        "the folded chain preserves the head state bit for bit",
+    )
+
+
+def _check_chain_verification():
+    # A sound chain verifies and reports the head/segment count.
+    seq, _ = _fresh_stack()
+    chain = _checkpoint.MemoryChain()
+    seq.save(chain)
+    out, _ = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out))
+    seq.save(chain)
+    seq.update(_LR)
+    seq.save(chain)
+    report = _checkpoint.verify_chain_memory(chain)
+    _check(report.ok and report.head == 2 and report.segments == 3,
+           "a sound chain verifies with a success report")
+    probe, _ = _fresh_stack()
+    _check(probe.verify(chain).ok, "Sequential.verify reads a sound chain")
+
+    # A truncated delta is rejected at that segment, naming position/reason.
+    seg1 = chain.read_segment(_checkpoint._segment_name(1))
+    chain.write_segment(_checkpoint._segment_name(1), seg1[: len(seg1) // 2])
+    try:
+        _checkpoint.verify_chain_memory(chain)
+    except ValueError as exc:
+        message = str(exc)
+        _check("segment 1" in message, f"verify names the first bad segment: {message}")
+    else:
+        raise _SelfTestFailure("a truncated segment must fail verification")
+    chain.write_segment(_checkpoint._segment_name(1), seg1)
+    _check(_checkpoint.verify_chain_memory(chain).ok,
+           "the chain verifies once the segment is whole")
+
+    # A truncated basis is located at segment 0.
+    seg0 = chain.read_segment(_checkpoint._segment_name(0))
+    chain.write_segment(_checkpoint._segment_name(0), seg0[:20])
+    try:
+        _checkpoint.verify_chain_memory(chain)
+    except ValueError as exc:
+        _check("segment 0" in str(exc), "a bad basis is located at segment 0")
+    else:
+        raise _SelfTestFailure("a truncated basis must fail verification")
+    chain.write_segment(_checkpoint._segment_name(0), seg0)
+
+    # A corrupt head pointer is rejected (not mistaken for an empty chain).
+    chain.write_head(b"not-a-number")
+    _expect(ValueError, lambda: _checkpoint.verify_chain_memory(chain),
+            "a corrupt head pointer fails verification")
+    chain.write_head(b"2")
+
+    # An empty chain (no head) is rejected wholesale.
+    _expect(
+        ValueError,
+        lambda: _checkpoint.verify_chain_memory(_checkpoint.MemoryChain()),
+        "an empty chain fails verification",
+    )
+    _expect(TypeError, lambda: _checkpoint.verify_chain_memory(object()),
+            "verify rejects a non-MemoryChain")
+
+
+class _BoomBackwardAndReplayRNN(_RNNStep):
+    """Layer whose first backward raises and whose cache-rebuild replay
+    also raises, so the rebuild failure must be surfaced, not swallowed."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._boom = True
+        self._fail_replay = False
+
+    def forward(self, x, hidden):
+        if self._fail_replay:
+            raise ValueError("replay forward failed")
+        return super().forward(x, hidden)
+
+    def backward(self, upstream):
+        if self._boom:
+            self._boom = False
+            self._cache = None
+            raise RuntimeError("layer backward failed")
+        return super().backward(upstream)
+
+
+def _check_backward_replay_failure_is_surfaced():
+    weights = _base_weights()
+    broken_layer = _BoomBackwardAndReplayRNN(
+        _N_IN, _N_H1, weights["wxh1"], weights["whh1"], weights["b1"]
+    )
+    quiet = _RNNStep(_N_H1, _N_H2, weights["wxh2"], weights["whh2"], weights["b2"])
+    seq = Sequential([broken_layer, quiet])
+    seq.forward(Tensor(_SEG1))
+    broken_layer._fail_replay = True
+    try:
+        seq.backward(1.0)
+    except RuntimeError as exc:
+        # The original layer exception is still what reaches the caller...
+        _check("layer backward failed" in str(exc),
+               "the original layer error is passed through")
+        cause = exc.__cause__
+        _check(isinstance(cause, ValueError),
+               "a failed rebuild surfaces as a ValueError")
+        message = str(cause).lower()
+        _check("rebuild" in message and "replay" in message,
+               f"the ValueError names the rebuild stage: {message}")
+        _check("replay forward failed" in str(cause),
+               "the ValueError carries the replay failure")
+    else:
+        raise _SelfTestFailure("backward must still raise the layer error")
+    # Partial accumulation was rolled back even though the replay failed.
+    _check(quiet.wxh.grad is None, "partial gradients are rolled back")
+    # The failed rebuild surfaced (rather than being swallowed) and the
+    # original error reached the caller.  With the layer healthy again a
+    # fresh forward/backward trains normally; the bitwise retry of the
+    # interrupted pass is covered separately for the rebuild-succeeds
+    # case, since a failed rebuild leaves no caches to retry against.
+    broken_layer._fail_replay = False
+    fresh_out, _ = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(fresh_out))
+    good, _ = _fresh_stack(weights)
+    good_out, _ = good.forward(Tensor(_SEG1))
+    good.backward(_total(good_out))
+    _check(
+        [p.grad.tolist() for p in seq.parameters()]
+        == [p.grad.tolist() for p in good.parameters()],
+        "the container trains normally after a surfaced rebuild failure",
+    )
+
+
 def _check_concurrent_adam_saves_loads():
     seq, _ = _fresh_stack()
     seq.forward(Tensor(_SEG1))
@@ -1988,6 +2157,9 @@ _GROUPS = [
     ("recompute bounded memory and guards", _check_recompute_bounded_memory_and_guards),
     ("backward retry restores layer caches", _check_backward_retry_restores_caches),
     ("in-memory chain compaction", _check_chain_compaction_memory),
+    ("streaming compaction interleave", _check_streaming_compaction_interleaves),
+    ("chain verification", _check_chain_verification),
+    ("backward replay failure surfaced", _check_backward_replay_failure_is_surfaced),
     ("concurrent update/save/load", _check_concurrent_updates_saves_loads),
     ("concurrent adam/save/load", _check_concurrent_adam_saves_loads),
     ("boundary save and eager hidden shapes", _check_boundary_save_and_eager_hidden_shapes),
