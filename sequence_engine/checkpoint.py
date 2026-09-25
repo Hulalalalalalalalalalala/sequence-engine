@@ -18,7 +18,12 @@ Two on-disk shapes share the same leaf encoding and trailer:
   (``seg-00000000.seqd``) followed by delta segments that only encode the
   tensors that changed.  A small ``head`` pointer names the newest
   committed segment, so a crash between the segment write and the pointer
-  update always recovers the previous complete state.
+  update always recovers the previous complete state.  Compaction rewrites a
+  merged basis plus a rebuilt delta tail under a monotonically increasing
+  *generation* suffix (``seg-00000000.g0000000001.seqd``); the head then
+  carries the matching ``{"h", "g"}`` pointer.  Reachable segment names are
+  unique across generations, so a compacted commit is again segment-then-head
+  and a crash leaves either the old head's complete chain or the new one's.
 
 Full snapshot wire format (all integers little-endian)::
 
@@ -64,6 +69,11 @@ import struct
 import tempfile
 import threading
 import zlib
+
+try:  # POSIX only; the atomic renames already give crash safety elsewhere.
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    _fcntl = None
 
 MAGIC = b"SEQECKP1"
 END_MAGIC = b"SEQECKP1END"
@@ -729,18 +739,62 @@ def _check_step_count(value, what="optimizer step count"):
 # ---------------------------------------------------------------------------
 
 
-def _segment_name(index):
-    return f"{_SEG_PREFIX}{index:0{_SEG_WIDTH}d}{_SEG_SUFFIX}"
-
-
-def _segment_index(name):
-    match = re.fullmatch(
-        re.escape(_SEG_PREFIX) + rf"(\d{{{_SEG_WIDTH}}})" + re.escape(_SEG_SUFFIX),
-        name,
+def _segment_name(index, generation=0):
+    if generation == 0:
+        return f"{_SEG_PREFIX}{index:0{_SEG_WIDTH}d}{_SEG_SUFFIX}"
+    return (
+        f"{_SEG_PREFIX}{index:0{_SEG_WIDTH}d}.g{generation:0{_SEG_WIDTH}d}"
+        f"{_SEG_SUFFIX}"
     )
+
+
+_SEGMENT_NAME_RE = re.compile(
+    re.escape(_SEG_PREFIX)
+    + rf"(\d{{{_SEG_WIDTH}}})(?:\.g(\d{{{_SEG_WIDTH}}}))?"
+    + re.escape(_SEG_SUFFIX)
+)
+
+
+def _segment_identity(name):
+    """Return ``(index, generation)`` for a segment file, else ``None``."""
+    match = _SEGMENT_NAME_RE.fullmatch(name)
     if match is None:
         return None
-    return int(match.group(1))
+    return int(match.group(1)), int(match.group(2) or 0)
+
+
+def _encode_head(index, generation):
+    if generation == 0:
+        # The original, uncompacted layout keeps its plain-digit head bytes.
+        return str(index).encode("ascii")
+    return json.dumps(
+        {"h": index, "g": generation},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _decode_head(raw):
+    text = raw.decode("ascii")
+    if re.fullmatch(r"\d+", text):
+        return int(text), 0
+    try:
+        head = json.loads(text)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise CheckpointError("chain head pointer is corrupt") from None
+    if (
+        not isinstance(head, dict)
+        or set(head) != {"h", "g"}
+        or isinstance(head["h"], bool)
+        or not isinstance(head["h"], int)
+        or head["h"] < 0
+        or isinstance(head["g"], bool)
+        or not isinstance(head["g"], int)
+        or head["g"] <= 0
+    ):
+        raise CheckpointError("chain head pointer is corrupt")
+    return head["h"], head["g"]
 
 
 def _freeze_delta(document, schema_shapes):
@@ -1067,6 +1121,66 @@ class _ChainStoreBase:
     def write_segment(self, name, raw):
         raise NotImplementedError
 
+    def list_segment_indices(self):
+        """Return the sorted segment indices physically present."""
+        raise NotImplementedError
+
+    def remove_segment(self, name):
+        raise NotImplementedError
+
+
+class _DirectoryChainLock:
+    """An advisory, process-wide exclusive lock for one chain directory.
+
+    The in-process :func:`_chain_lock` serialises threads; this ``flock``
+    serialises whole processes (two writers hammering one chain, or a
+    compaction racing an append).  The atomic segment-then-head commit
+    already gives crash safety; the flock additionally keeps two processes
+    from assigning the same next segment number or sweeping files another
+    commit depends on.  It is advisory and best effort -- when the lock file
+    cannot be created the atomic in-directory commits still provide the
+    crash guarantee.  The lock file lives *next to* the chain directory
+    (``.<chain>.seqckp.lock``) so the chain directory itself never gains an
+    extra entry and its on-disk layout stays exactly head + segments.
+    """
+
+    def __init__(self, directory, shared=False):
+        abspath = os.path.abspath(directory)
+        parent = os.path.dirname(abspath) or "."
+        self._path = os.path.join(
+            parent, f".{os.path.basename(abspath)}.seqckp.lock"
+        )
+        self._shared = shared
+        self._fh = None
+
+    def __enter__(self):
+        if _fcntl is None:
+            return self
+        try:
+            self._fh = open(self._path, "a+b")
+        except OSError:
+            # The advisory lock only coordinates cooperating processes; the
+            # documented crash safety comes from the atomic in-directory
+            # segment/head commits themselves.  When the lock file cannot be
+            # created (an unusual layout where the chain directory is
+            # writable but its parent is not) operations still proceed on
+            # those atomic guarantees.  Readers in a read-only location have
+            # nothing to exclude in any case.
+            self._fh = None
+            return self
+        mode = _fcntl.LOCK_SH if self._shared else _fcntl.LOCK_EX
+        _fcntl.flock(self._fh.fileno(), mode)
+        return self
+
+    def __exit__(self, *exc):
+        if self._fh is not None:
+            try:
+                _fcntl.flock(self._fh.fileno(), _fcntl.LOCK_UN)
+            finally:
+                self._fh.close()
+                self._fh = None
+        return False
+
 
 class MemoryChain(_ChainStoreBase):
     """An in-memory incremental checkpoint chain.
@@ -1105,11 +1219,29 @@ class MemoryChain(_ChainStoreBase):
         with self._lock:
             self._objects[name] = bytes(raw)
 
+    def list_segment_indices(self):
+        with self._lock:
+            identities = [
+                _segment_identity(name)
+                for name in self._objects
+                if _segment_identity(name) is not None
+            ]
+        return sorted(identities)
+
+    def remove_segment(self, name):
+        with self._lock:
+            self._objects.pop(name, None)
+
+    def compact(self, keep_tail=1):
+        """Compact this in-memory chain (see :func:`compact_chain_memory`)."""
+        compact_chain_memory(self, keep_tail)
+        return None
+
     def __len__(self):
         with self._lock:
             return sum(
                 1 for name in self._objects
-                if _segment_index(name) is not None
+                if _segment_identity(name) is not None
             )
 
 
@@ -1130,6 +1262,20 @@ class _DirectoryChainStore(_ChainStoreBase):
 
     def write_segment(self, name, raw):
         _atomic_write(self._directory, name, raw)
+
+    def list_segment_indices(self):
+        identities = []
+        for name in os.listdir(self._directory):
+            identity = _segment_identity(name)
+            if identity is not None:
+                identities.append(identity)
+        return sorted(identities)
+
+    def remove_segment(self, name):
+        try:
+            os.unlink(os.path.join(self._directory, name))
+        except FileNotFoundError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1155,7 +1301,7 @@ def save_chain(document, directory):
             errno.ENOENT,
             f"incremental checkpoint directory does not exist: {directory!r}",
         )
-    with _chain_lock(directory):
+    with _chain_lock(directory), _DirectoryChainLock(directory):
         _save_chain_store(document, _DirectoryChainStore(directory))
     return None
 
@@ -1172,34 +1318,33 @@ def _save_chain_store(document, store):
     if isinstance(document, dict) and document.get("optim") is None:
         # Tolerate pre-v3 in-memory documents: the optimizer never stepped.
         document = _migrate_add_optim(dict(document))
-    head_index = _read_head_optional(store)
-    if head_index is None:
+    head = _read_head_optional(store)
+    if head is None:
         store.write_segment(_segment_name(_BASIS_INDEX), build_bytes(document))
-        _commit_head(store, _BASIS_INDEX)
+        _commit_head(store, _BASIS_INDEX, 0)
         return
-    previous = _load_chain_store(store, head_index)
+    head_index, generation = head
+    previous = _load_chain_store(store, head_index, generation)
     next_index = head_index + 1
     delta_bytes = _build_delta_between(previous, document, next_index)
-    store.write_segment(_segment_name(next_index), delta_bytes)
-    _commit_head(store, next_index)
+    store.write_segment(_segment_name(next_index, generation), delta_bytes)
+    _commit_head(store, next_index, generation)
 
 
-def _commit_head(store, index):
-    store.write_head(str(index).encode("ascii"))
+def _commit_head(store, index, generation):
+    store.write_head(_encode_head(index, generation))
 
 
 def _read_head_optional(store):
+    """Return ``(head_index, generation)`` or ``None`` when no head exists."""
     try:
         raw = store.read_head()
     except FileNotFoundError:
         return None
-    text = raw.decode("ascii")
-    if not re.fullmatch(r"\d+", text):
-        raise CheckpointError("chain head pointer is corrupt")
-    index = int(text)
-    if _segment_index(_segment_name(index)) is None or index < 0:
+    index, generation = _decode_head(raw)
+    if _segment_identity(_segment_name(index, generation)) is None:
         raise CheckpointError("chain head pointer names an invalid segment")
-    return index
+    return index, generation
 
 
 def _build_delta_between(previous, current, next_index):
@@ -1303,7 +1448,11 @@ def load_chain(directory, up_to=None):
             f"incremental checkpoint directory not found: {directory!r}"
         )
     with _chain_lock(directory):
-        return _load_chain_root(_DirectoryChainStore(directory), up_to)
+        return _load_chain_locked(
+            _DirectoryChainStore(directory),
+            up_to,
+            _DirectoryChainLock(directory, shared=True),
+        )
 
 
 def load_chain_memory(store, up_to=None):
@@ -1313,25 +1462,62 @@ def load_chain_memory(store, up_to=None):
     return _load_chain_root(store, up_to)
 
 
+def _load_chain_locked(store, up_to, process_lock=None):
+    """Load under the per-directory thread lock, optionally cross-process.
+
+    A directory read first proves the head exists (so an empty directory
+    raises ValueError, matching the no-head rule), then takes the same
+    process lock the writers use so a compaction sweep can never remove a
+    segment the walk is about to open.
+    """
+    if process_lock is None:
+        return _load_chain_root(store, up_to)
+    try:
+        store.read_head()
+    except FileNotFoundError:
+        return _load_chain_root(store, up_to)
+    with process_lock:
+        return _load_chain_root(store, up_to)
+
+
 def _load_chain_root(store, up_to):
     head = _read_head_optional(store)
     if head is None:
         raise CheckpointError(
             "chain has no head pointer (no basis segment committed)"
         )
+    head_index, generation = head
     if up_to is not None:
         if isinstance(up_to, bool) or not isinstance(up_to, int) or up_to < 0:
             raise CheckpointError("up_to must be a non-negative segment index")
-        if up_to > head:
+        if up_to > head_index:
             raise CheckpointError(
-                f"up_to segment {up_to} is beyond the chain head {head}"
+                f"up_to segment {up_to} is beyond the chain head {head_index}"
             )
-        head = up_to
-    return _load_chain_store(store, head)
+        head_index = up_to
+    return _load_chain_store(store, head_index, generation)
 
 
-def _load_chain_store(store, head):
-    basis_name = _segment_name(_BASIS_INDEX)
+def _load_chain_store(store, head, generation=0):
+    final = None
+    for _index, document in _walk_chain(store, head, generation):
+        final = document
+    return final
+
+
+def _walk_chain(store, head, generation=0, prefixes=()):
+    """Validate a chain segment by segment and yield assembled prefixes.
+
+    Yields ``(index, document)`` for every index in *prefixes* that the walk
+    passes, and always for *head*.  The same single walk serves ordinary
+    loads (only the final document is assembled) and compaction (which
+    rebuilds deltas from the assembled state at a few prefixes), so
+    migration and validation stay in exactly one place: version-1/2 basis
+    and delta bytes are accepted with the same rules as :func:`load_chain`
+    and every assembled document already has the current-version shape.
+    """
+    wanted = set(prefixes)
+    basis_name = _segment_name(_BASIS_INDEX, generation)
     basis_raw = store.read_segment(basis_name)
     basis = parse_bytes(basis_raw)
     param_count = len(basis["params"])
@@ -1341,8 +1527,18 @@ def _load_chain_store(store, head):
     current_hc = basis_hc
     pending = basis["pending"]
     hidden_base = _flat_hidden_base(param_count)
+
+    def assemble():
+        return _assemble(
+            basis,
+            {"tensors": tensors, "pending": pending, "_hc": current_hc},
+        )
+
+    if _BASIS_INDEX in wanted:
+        yield _BASIS_INDEX, assemble()
+
     for index in range(1, head + 1):
-        name = _segment_name(index)
+        name = _segment_name(index, generation)
         raw = store.read_segment(name)
         _number, delta_hc, delta_pending, items = _parse_delta(raw, index)
         segment_version = struct.unpack("<I", raw[8:12])[0]
@@ -1450,9 +1646,178 @@ def _load_chain_store(store, head):
                 )
         current_hc = delta_hc
         pending = delta_pending
+        if index in wanted:
+            yield index, assemble()
 
-    applied = {"tensors": tensors, "pending": pending, "_hc": current_hc}
-    return _assemble(basis, applied)
+    if head not in wanted:
+        yield head, assemble()
+
+
+# ---------------------------------------------------------------------------
+# Compaction
+# ---------------------------------------------------------------------------
+
+
+def compact_chain(directory, keep_tail=1):
+    """Compact an existing incremental chain in place, atomically.
+
+    The basis segment and the following segments up to the head are merged:
+    the compacted chain holds one new full basis carrying the reassembled
+    state at ``head - keep_tail`` (the whole chain when ``keep_tail`` is 1,
+    i.e. just the basis), followed by *keep_tail* rebuilt delta segments, so
+    the head state -- parameters, gradients, optimizer state and hidden
+    state -- is bit for bit the one the uncompacted chain reassembled to.
+
+    * The number of segments drops deterministically by the merged range.
+    * Compacting the same chain twice (once no mergeable prefix remains)
+      changes nothing on disk and is a no-op.
+    * Segments written by older engines (versions 1 and 2) participate with
+      the same migration rules as loading; every compacted product is
+      rewritten in the current version.
+    * No training step is taken: the optimizer step count and every tensor
+      are preserved exactly; compaction advances no step.
+    * The commit is a staging directory plus one atomic rename, so a process
+      killed at any point leaves the directory holding either the old head's
+      complete chain or the new head's complete chain, never a mixture.
+
+    A missing chain directory raises FileNotFoundError; an unwritable
+    directory or a full disk raises OSError; any malformed, truncated,
+    out-of-order or shape-changing segment rejects the whole chain with
+    ValueError and leaves the directory untouched.
+    """
+    if not isinstance(directory, (str, os.PathLike)):
+        raise TypeError("chain directory must be a path")
+    directory = os.fspath(directory)
+    if not os.path.isdir(directory):
+        raise FileNotFoundError(
+            f"incremental checkpoint directory not found: {directory!r}"
+        )
+    if (
+        isinstance(keep_tail, bool)
+        or not isinstance(keep_tail, int)
+        or keep_tail < 1
+    ):
+        raise ValueError("keep_tail must be a positive integer")
+    with _chain_lock(directory), _DirectoryChainLock(directory):
+        _compact_chain_store(_DirectoryChainStore(directory), keep_tail, directory)
+    return None
+
+
+def compact_chain_memory(store, keep_tail=1):
+    """Compact an in-memory chain with identical semantics (self-checks)."""
+    if not isinstance(store, MemoryChain):
+        raise TypeError("store must be a MemoryChain")
+    if (
+        isinstance(keep_tail, bool)
+        or not isinstance(keep_tail, int)
+        or keep_tail < 1
+    ):
+        raise ValueError("keep_tail must be a positive integer")
+    _compact_chain_store(store, keep_tail, None)
+    return None
+
+
+def _compact_chain_store(store, keep_tail, directory):
+    head = _read_head_optional(store)
+    if head is None:
+        raise CheckpointError(
+            "cannot compact a chain with no head pointer (no basis committed)"
+        )
+    head_index, generation = head
+    # The new basis fixes the state at this cut; the deltas after it are the
+    # tail that stays incremental.  Nothing to merge: the cut already is the
+    # basis, so the result would be the identical chain -- a deterministic
+    # no-op (also reached by compacting an already-compacted chain again).
+    cut_index = head_index - (keep_tail - 1)
+    if cut_index <= _BASIS_INDEX:
+        return
+
+    new_generation = generation + 1
+    # The walk below validates every old segment and assembles the exact
+    # states needed to rebuild the chain: the cut state (new basis) and the
+    # state at each rebuilt delta.  All products are current-version bytes.
+    prefixes = [cut_index]
+    prefixes.extend(range(cut_index + 1, head_index + 1))
+    states = {
+        index: document
+        for index, document in _walk_chain(
+            store, head_index, generation, prefixes=prefixes
+        )
+    }
+    basis_document = states[cut_index]
+    products = [(_segment_name(_BASIS_INDEX, new_generation),
+                 build_bytes(basis_document))]
+    previous = basis_document
+    for new_number, old_index in enumerate(
+        range(cut_index + 1, head_index + 1), start=1
+    ):
+        current = states[old_index]
+        products.append(
+            (
+                _segment_name(new_number, new_generation),
+                _build_delta_between(previous, current, new_number),
+            )
+        )
+        previous = current
+
+    if directory is None:
+        _commit_compacted_memory(store, products, new_generation, generation)
+    else:
+        _commit_compacted_directory(store, directory, products, new_generation)
+
+
+def _commit_compacted_memory(store, products, new_generation, old_generation):
+    # Segment-then-head: publish every new (generation-tagged) segment while
+    # the old chain stays reachable, advance the head, then sweep the old
+    # generation.  A failure before the head moves leaves the old chain the
+    # only reachable one; after it moves only the new chain is.
+    written = []
+    try:
+        for name, raw in products:
+            store.write_segment(name, raw)
+            written.append(name)
+        new_head_index = len(products) - 1
+        _commit_head(store, new_head_index, new_generation)
+    except BaseException:
+        for name in written:
+            store.remove_segment(name)
+        raise
+    for index, gen in store.list_segment_indices():
+        if gen != new_generation:
+            store.remove_segment(_segment_name(index, gen))
+
+
+def _commit_compacted_directory(store, directory, products, new_generation):
+    # Crash-safe commit entirely inside the one chain directory:
+    #
+    # 1. Every new-generation segment is written under a unique name with a
+    #    temp file + ``os.replace`` (each file individually atomic; the old
+    #    chain's files keep their names and stay complete throughout).
+    # 2. The ``head`` pointer is atomically replaced last.  A process killed
+    #    before this leaves ``head`` on the old complete chain; killed after
+    #    leaves the new complete chain -- never a mixture.
+    # 3. Old-generation segments are swept only once the new head is durable.
+    #    A death during the sweep leaves extra unreachable files, never a
+    #    missing reachable one.
+    written = []
+    try:
+        for name, raw in products:
+            _atomic_write(directory, name, raw)
+            written.append(name)
+        new_head_index = len(products) - 1
+        _atomic_write(
+            directory, _HEAD_NAME, _encode_head(new_head_index, new_generation)
+        )
+    except BaseException:
+        # Head never moved: the old chain is still the reachable one; drop
+        # any new segments that made it to disk so the directory is unchanged.
+        for name in written:
+            store.remove_segment(name)
+        raise
+    for index, gen in store.list_segment_indices():
+        if gen != new_generation:
+            store.remove_segment(_segment_name(index, gen))
+    _fsync_directory(directory)
 
 
 # ---------------------------------------------------------------------------

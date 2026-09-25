@@ -1706,6 +1706,371 @@ def _check_concurrent_adam_saves_loads():
     _check(errors == [], f"concurrent adam run raised: {errors!r}")
 
 
+# ---------------------------------------------------------------------------
+# Backward failure recovery: per-layer caches, and chain compaction.
+# ---------------------------------------------------------------------------
+
+
+class _OneShotRNN(_RNNStep):
+    """An RNN step whose backward consumes the forward cache (one-shot).
+
+    A second backward without a fresh forward finds no cache and raises,
+    exactly like a one-shot autograd layer.
+    """
+
+    def backward(self, upstream):
+        if self._cache is None:
+            raise RuntimeError("backward cache was already consumed")
+        result = super().backward(upstream)
+        self._cache = None
+        return result
+
+
+class _BoomOnceOneShot(_OneShotRNN):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._boom = True
+
+    def backward(self, upstream):
+        if self._boom:
+            self._boom = False
+            raise RuntimeError("transient failure during backward")
+        return super().backward(upstream)
+
+
+def _check_backward_cache_restore_on_retry():
+    # A layer walked in reverse before the failing one has already consumed
+    # its forward cache.  Gradients are rolled back AND every layer's cache
+    # is rebuilt from the retained anchors, so the retry is bitwise equal to
+    # a backward that never failed -- in both normal and recompute modes.
+    weights = _base_weights()
+    reference = Sequential(
+        [
+            _OneShotRNN(_N_IN, _N_H1, weights["wxh1"], weights["whh1"], weights["b1"]),
+            _OneShotRNN(_N_H1, _N_H2, weights["wxh2"], weights["whh2"], weights["b2"]),
+        ]
+    )
+    reference.forward(Tensor(_SEG1))
+    reference.backward(1.0)
+    expected = [p.grad.tolist() for p in reference.parameters()]
+
+    for recompute in (False, True):
+        boom = _BoomOnceOneShot(
+            _N_IN, _N_H1, weights["wxh1"], weights["whh1"], weights["b1"]
+        )
+        quiet = _OneShotRNN(
+            _N_H1, _N_H2, weights["wxh2"], weights["whh2"], weights["b2"]
+        )
+        seq = Sequential([boom, quiet])
+        seq.set_recompute(recompute)
+        seq.forward(Tensor(_SEG1))
+        _expect(RuntimeError, lambda: seq.backward(1.0), "first attempt fails")
+        _check(quiet.wxh.grad is None, "failed backward rolls partial gradients back")
+        # The walked layer consumed its cache on the failed attempt; the
+        # rollback must have rebuilt it so the retry can run.
+        _check(quiet._cache is not None, "failed backward rebuilds the consumed caches")
+        seq.backward(1.0)  # retry is not a second backward
+        _check(
+            [p.grad.tolist() for p in seq.parameters()] == expected,
+            f"retried backward matches an uninterrupted pass (recompute={recompute})",
+        )
+        _expect(
+            RuntimeError, lambda: seq.backward(1.0), "the successful retry consumed the pass"
+        )
+
+
+def _v2_delta_bytes(number, hc, entries):
+    payload, header_entries = [], []
+    for index, shape, tree in entries:
+        _checkpoint._freeze_tree(tree, shape, payload)
+        header_entries.append({"i": index, "s": shape})
+    header = {
+        "v": 2,
+        "b": _checkpoint._segment_name(0),
+        "n": number,
+        "hc": hc,
+        "changed": header_entries,
+        "pending": False,
+    }
+    return _checkpoint._frame(
+        _checkpoint.DELTA_MAGIC, _checkpoint.DELTA_END_MAGIC, header, payload
+    )
+
+
+def _build_compactable_chain(chain, adam_steps=1):
+    """Drive a varied chain: basis, hidden intro, plain update, adam step."""
+    seq, _ = _fresh_stack()
+    seq.save(chain)
+    out1, hidden1 = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out1))
+    seq.save(chain)
+    seq.update(_LR)
+    seq.save(chain)
+    out2, hidden2 = seq.forward(Tensor(_SEG2), hidden1)
+    seq.backward(_total(out2))
+    seq.save(chain)
+    for _ in range(adam_steps):
+        seq.adam_step(_ADAM_LR)
+    seq.save(chain)
+    return seq
+
+
+def _check_chain_compaction_in_memory():
+    chain = _checkpoint.MemoryChain()
+    seq = _build_compactable_chain(chain)
+    full = bytearray()
+    seq.save(full)
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain)) == bytes(full),
+        "fixture chain reassembles to the full snapshot",
+    )
+
+    # Full merge (keep_tail=1): one current-version basis, identical state.
+    _checkpoint.compact_chain_memory(chain)
+    _check(len(chain) == 1, "compacting to the basis leaves one segment")
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain)) == bytes(full),
+        "compaction preserves the reassembled state bit for bit",
+    )
+    basis_name = _checkpoint._segment_name(0, 1)
+    _check(
+        struct.unpack("<I", chain.read_segment(basis_name)[8:12])[0]
+        == _checkpoint.FORMAT_VERSION,
+        "the compacted basis is rewritten in the current version",
+    )
+    doc = _checkpoint.load_chain_memory(chain)
+    _check(
+        doc["optim"]["t"] == seq._adam_t,
+        "compaction advances no optimizer step (t preserved)",
+    )
+
+    # Deterministic, idempotent: compacting an already-compacted chain
+    # changes no object at all (nothing mergeable remains).
+    snapshot = dict(chain._objects)
+    _checkpoint.compact_chain_memory(chain)
+    _checkpoint.compact_chain_memory(chain)
+    _check(
+        dict(chain._objects) == snapshot,
+        "repeated compaction of the same chain leaves it byte-for-byte unchanged",
+    )
+
+    # Appending after compaction and taking a full save still match an
+    # uninterrupted trajectory.
+    continued, _ = _fresh_stack()
+    restored_hidden = continued.load(chain)
+    out3, _ = continued.forward(
+        Tensor(_SEG3),
+        [Tensor(slot.tolist()) for slot in restored_hidden],
+    )
+    continued.backward(_total(out3))
+    continued.adam_step(_ADAM_LR)
+    full2 = bytearray()
+    continued.save(full2)
+    continued.save(chain)
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain)) == bytes(full2),
+        "delta appends after compaction reassemble to the full snapshot",
+    )
+    victim, _ = _fresh_stack()
+    victim.load(chain)
+    full3 = bytearray()
+    victim.save(full3)
+    _check(bytes(full3) == bytes(full2), "a full save after compaction matches the chain")
+
+    # A partial merge keeps a deterministic number of rebuilt tail deltas.
+    tail_chain = _checkpoint.MemoryChain()
+    seq2 = _build_compactable_chain(tail_chain)
+    _checkpoint.compact_chain_memory(tail_chain, keep_tail=3)
+    _check(len(tail_chain) == 3, "keep_tail=3 leaves a basis plus two deltas")
+    full_tail = bytearray()
+    seq2.save(full_tail)
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(tail_chain))
+        == bytes(full_tail),
+        "a partial compaction preserves the head state bit for bit",
+    )
+
+    # keep_tail beyond the chain is a deterministic no-op.
+    before = dict(tail_chain._objects)
+    _checkpoint.compact_chain_memory(tail_chain, keep_tail=1000)
+    _check(
+        dict(tail_chain._objects) == before,
+        "keep_tail larger than the chain compacts nothing",
+    )
+    _expect(
+        ValueError, lambda: _checkpoint.compact_chain_memory(tail_chain, 0), "keep_tail=0 rejected"
+    )
+    _expect(
+        ValueError, lambda: _checkpoint.compact_chain_memory(tail_chain, -2), "negative keep_tail rejected"
+    )
+    _expect(
+        ValueError, lambda: _checkpoint.compact_chain_memory(tail_chain, True), "boolean keep_tail rejected"
+    )
+
+    # An empty chain cannot be compacted.
+    _expect(
+        ValueError,
+        lambda: _checkpoint.compact_chain_memory(_checkpoint.MemoryChain()),
+        "compacting an empty chain is a deterministic ValueError",
+    )
+
+
+def _check_chain_compaction_migrates_v2():
+    # A genuine version-2 chain (v2 basis, an empty v2 delta and the delta
+    # that first introduces hidden state) participates in compaction with
+    # the same migration as loading; the product is a current-version basis.
+    seq, _ = _fresh_stack()
+    basis_raw = bytearray()
+    seq.save(basis_raw)
+    param_count = len(seq.parameters())
+    chain = _checkpoint.MemoryChain()
+    chain.write_segment(_checkpoint._segment_name(0), _downgrade_full_to_v2(bytes(basis_raw)))
+    chain.write_segment(
+        _checkpoint._segment_name(1), _v2_delta_bytes(1, None, [])
+    )
+    out, hidden = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out))
+    hidden_entries = [
+        (2 * param_count + slot, slot_tensor.shape, slot_tensor.tolist())
+        for slot, slot_tensor in enumerate(hidden)
+    ]
+    chain.write_segment(
+        _checkpoint._segment_name(2), _v2_delta_bytes(2, 2, hidden_entries)
+    )
+    chain.write_head(b"2")
+
+    before = _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+    _checkpoint.compact_chain_memory(chain)
+    _check(len(chain) == 1, "the v2 chain compacts to one basis")
+    after = _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+    _check(after == before, "compacting a v2 chain keeps its migrated state bit for bit")
+    compacted = chain.read_segment(_checkpoint._segment_name(0, 1))
+    _check(
+        struct.unpack("<I", compacted[8:12])[0] == 3,
+        "the compacted product is a native version-3 basis",
+    )
+    doc = _checkpoint.load_chain_memory(chain)
+    _check(doc["optim"]["t"] == 0, "a compacted v2 chain keeps t=0")
+    _check(
+        [entry["v"] for entry in doc["hidden"]]
+        == [slot.tolist() for slot in hidden],
+        "a compacted v2 chain keeps its hidden slots",
+    )
+
+
+class _FailAtChain(_checkpoint.MemoryChain):
+    """A MemoryChain that raises once at a chosen commit point.
+
+    The failure stays disarmed while the fixture is appended to; the test
+    arms it for the single compaction call.
+    """
+
+    def __init__(self, fail):
+        super().__init__()
+        self._fail = fail
+        self._armed = False
+        self._seg_writes = 0
+
+    def arm(self):
+        self._armed = True
+        self._seg_writes = 0
+
+    def write_segment(self, name, raw):
+        if self._armed and self._fail == "segment" and self._seg_writes == 1:
+            raise RuntimeError("simulated kill while writing a new segment")
+        super().write_segment(name, raw)
+        self._seg_writes += 1
+
+    def write_head(self, raw):
+        if self._armed and self._fail == "head":
+            raise RuntimeError("simulated kill right before the head advances")
+        super().write_head(raw)
+
+
+def _check_chain_compaction_failure_and_rejection():
+    # A crash before the head advances leaves the old chain as the only
+    # reachable one, with no new-generation leftovers; it still loads.
+    for fail in ("segment", "head"):
+        chain = _FailAtChain(fail)
+        seq = _build_compactable_chain(chain)
+        full = bytearray()
+        seq.save(full)
+        old_objects = {
+            name: bytes(raw) for name, raw in chain._objects.items()
+        }
+        chain.arm()
+        _expect(
+            RuntimeError,
+            lambda chain=chain, fail=fail: _checkpoint.compact_chain_memory(
+                chain, 2 if fail == "segment" else 1
+            ),
+            f"a {fail}-write failure surfaces",
+        )
+        _check(
+            dict(chain._objects) == old_objects,
+            f"a failed compaction leaves the directory exactly as it was ({fail})",
+        )
+        _check(
+            _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+            == bytes(full),
+            "the old chain still reassembles after an aborted compaction",
+        )
+
+    # A truncated/missing-field middle segment rejects the whole compaction
+    # with ValueError and changes nothing.
+    chain = _checkpoint.MemoryChain()
+    _build_compactable_chain(chain)
+    intact = dict(chain._objects)
+    target = _checkpoint._segment_name(3)
+    good = chain.read_segment(target)
+    chain.write_segment(target, good[: len(good) // 2])
+    _expect(
+        ValueError,
+        lambda: _checkpoint.compact_chain_memory(chain),
+        "a truncated segment rejects the whole compaction",
+    )
+    chain.write_segment(target, good)
+
+    # A shape change hidden in a delta rejects the compaction wholesale.
+    raw = good
+    hlen = struct.unpack("<Q", raw[12:20])[0]
+    dheader = json.loads(raw[20 : 20 + hlen])
+    dpayload = raw[20 + hlen : raw.rfind(_checkpoint.DELTA_END_MAGIC)]
+    for entry in dheader["changed"]:
+        if entry["s"]:
+            entry["s"][-1] += 1
+            break
+    new_header = json.dumps(dheader, separators=(",", ":")).encode("utf-8")
+    body = (
+        raw[:8]
+        + struct.pack("<I", _checkpoint.FORMAT_VERSION)
+        + struct.pack("<Q", len(new_header))
+        + new_header
+        + dpayload
+    )
+    crc = zlib.crc32(body[20:])
+    forged = body + _checkpoint.DELTA_END_MAGIC + struct.pack(
+        "<QI", len(dpayload) // 9, crc
+    )
+    chain.write_segment(target, forged)
+    _expect(
+        ValueError,
+        lambda: _checkpoint.compact_chain_memory(chain),
+        "a shape-changing segment rejects the whole compaction",
+    )
+    chain.write_segment(target, good)
+    _check(
+        {n: bytes(r) for n, r in chain._objects.items()}
+        == {n: bytes(r) for n, r in intact.items()},
+        "every rejected compaction leaves the chain files untouched",
+    )
+    _checkpoint.compact_chain_memory(chain)
+    _check(
+        _checkpoint.load_chain_memory(chain) is not None,
+        "the chain compacts cleanly once its segments are whole again",
+    )
+
+
 _GROUPS = [
     ("tensor basics", _check_tensor_basics),
     ("tensor validation", _check_tensor_validation),
@@ -1730,6 +2095,10 @@ _GROUPS = [
     ("concurrent update/save/load", _check_concurrent_updates_saves_loads),
     ("concurrent adam/save/load", _check_concurrent_adam_saves_loads),
     ("boundary save and eager hidden shapes", _check_boundary_save_and_eager_hidden_shapes),
+    ("backward cache restore on retry", _check_backward_cache_restore_on_retry),
+    ("incremental chain compaction", _check_chain_compaction_in_memory),
+    ("compaction of a version-2 chain", _check_chain_compaction_migrates_v2),
+    ("compaction failure rollback and rejection", _check_chain_compaction_failure_and_rejection),
 ]
 
 

@@ -27,8 +27,11 @@ checkpoint path) and writes no files.
   carrying the exact Tensor returned by the preceding `forward`.
   Calling `backward` without a preceding `forward`, or twice for one
   `forward`, raises `RuntimeError`. If a layer raises mid-pass the partial
-  gradients are rolled back and the same `backward` may be retried; a retry
-  is not a second backward.
+  gradients are rolled back and every layer's forward cache is rebuilt from
+  the segment anchors, so the container is exactly as it was right after the
+  `forward`; the same `backward` may be retried and a retry is not a second
+  backward. The retried pass accumulates the same gradients, bit for bit, as
+  a backward that never failed.
 - `Sequential.zero_grad() -> None` clears accumulated gradients.
 - `Sequential.update(learning_rate) -> None` performs one in-place step
   `theta <- theta - learning_rate * grad` on every parameter. Gradients are
@@ -146,7 +149,12 @@ incremental chain instead of one self-contained file:
 - a `head` pointer names the newest committed segment. Each segment file is
   written completely and atomically before the head is advanced, so a crash,
   a full disk or two saves racing into one directory always leave a single
-  complete chain reachable from `head`.
+  complete chain reachable from `head`. A freshly appended chain keeps the
+  plain `seg-NNNNNNNNNN.seqd` names and a digit-only `head`; after a
+  compaction the segments carry a generation suffix
+  (`seg-NNNNNNNNNN.gNNNNNNNNNN.seqd`) and `head` holds the equivalent small
+  JSON pointer `{"h": index, "g": generation}` -- loading, appending and
+  saving accept both transparently.
 
 Loading walks the basis and every delta up to the head and reassembles the
 state by layer (parameters, gradients, optimizer moments and step count,
@@ -166,6 +174,50 @@ a different model.
 `MemoryChain` (exported from `sequence_engine`) is an in-memory chain with
 identical commit semantics, useful for tests and long-running processes that
 want incremental snapshots without files.
+
+## Chain compaction
+
+`compact_chain(directory, keep_tail=1)` (also exported from
+`sequence_engine`) merges an existing chain directory in place: the basis
+segment and the following segments are folded into one new full **basis**
+segment that carries the reassembled state at the cut point, followed by the
+last `keep_tail` segments rebuilt as deltas. `MemoryChain.compact(keep_tail=1)`
+does the same in memory.
+
+- The reassembled state -- parameters, gradients, optimizer moments and
+  step count, and the slice-boundary hidden state -- is identical bit for
+  bit before and after compaction. The number of segments drops
+  deterministically by the merged range (`keep_tail=1` leaves a single
+  basis). Compaction takes no training step: the optimizer step count and
+  every tensor are preserved exactly, including a chain at `t = 0` or with
+  non-zero steps.
+- Compaction is idempotent: once no mergeable prefix remains (the cut
+  already is the basis), a repeat compaction leaves the chain byte for byte
+  unchanged. A chain with no mergeable segments, and a `keep_tail` at least
+  as large as the chain, are deterministic no-ops; `keep_tail` must be a
+  positive integer (`ValueError` otherwise), and an empty chain is rejected
+  with `ValueError`.
+- Segments written by the old version-1/version-2 engines participate with
+  the same item-by-item migration as loading; every compacted product is
+  rewritten in the current version, and the migrated optimizer state stays
+  at `t = 0` with zero moments when the source had none.
+- After compaction, appending delta segments and then taking a full
+  snapshot still reproduces the uninterrupted trajectory bit for bit.
+
+The compacted commit is crash-atomic: each new-generation segment is written
+completely under its own name first, and only then is the `head` pointer
+atomically advanced to name the new chain. A process killed at any point --
+mid-segment, between the last segment and the head, or while the old
+generation is swept -- leaves `head` naming exactly one complete chain:
+either the previous head's chain or the new one, and every segment read
+through `head` is complete. Compaction and saves serialise across processes
+(an advisory lock held for the brief commit) as well as threads, so
+compaction interleaved with saves, or two processes writing one chain, never
+exposes a torn head or a half-swept segment. A missing chain directory
+raises `FileNotFoundError`; an unwritable directory or a full disk raises
+`OSError` and leaves the previous chain intact; a truncated, corrupt,
+out-of-order or layer/shape-changing segment rejects the whole compaction
+with `ValueError` without touching the committed chain.
 
 ## Tests
 

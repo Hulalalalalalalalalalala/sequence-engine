@@ -214,17 +214,21 @@ class Sequential:
                 # the segment input, the incoming hidden values and a
                 # fingerprint of the parameters.
                 self._segment_recompute = True
-                self._anchors = (
-                    batch.tolist(),
-                    [None if slot is None else slot.tolist() for slot in slots],
-                )
-                self._forward_fingerprint = _parameters_fingerprint(
-                    self.parameters()
-                )
             else:
                 self._segment_recompute = False
-                self._anchors = None
-                self._forward_fingerprint = None
+            # The anchors are retained in every mode.  Besides feeding the
+            # recompute pass they let a *failed* backward rebuild the
+            # per-layer caches after rolling the partial gradients back, so
+            # retrying the same forward's backward runs exactly like the
+            # first attempt.  A boundary carries one batch and one hidden
+            # slot per layer, independent of how many layers retained more.
+            self._anchors = (
+                batch.tolist(),
+                [None if slot is None else slot.tolist() for slot in slots],
+            )
+            self._forward_fingerprint = _parameters_fingerprint(
+                self.parameters()
+            )
             self._pending_backward = True
             return x, new_hidden
 
@@ -273,13 +277,65 @@ class Sequential:
             try:
                 for module in reversed(self._modules):
                     upstream = module.backward(upstream)
-            except BaseException:
+            except BaseException as exc:
                 for param, saved in zip(self.parameters(), grad_snapshot):
                     param.grad = None if saved is None else Tensor(saved)
+                # The layers walked before the failing one consumed the
+                # activations their forward cached (or never cached them,
+                # e.g. after a bounded-memory forward).  Replay the forward
+                # from the retained anchors so every layer's cache is back in
+                # its post-forward state and the retry is the exact equal of
+                # a backward that never failed.  Parameters cannot have moved
+                # while the container lock is held; the fingerprint check
+                # makes that structural.  A replay failure never masks the
+                # original layer error.
+                try:
+                    self._restore_layer_caches()
+                except BaseException:
+                    raise exc
                 raise
             self._pending_backward = False
             self._anchors = None
             self._forward_fingerprint = None
+
+    def _restore_layer_caches(self):
+        """Rebuild every layer's forward cache after a failed backward.
+
+        Runs only on the failure path: the partial gradients have already
+        been rolled back, so the container is indistinguishable from the
+        state right after ``forward`` once the caches are rebuilt.  Uses the
+        same anchors (segment input + incoming hidden values) and the same
+        parameter fingerprint as the bounded-memory recompute path.
+        """
+        if self._anchors is None or self._forward_fingerprint is None:
+            raise RuntimeError("forward anchors are missing for the retry")
+        if _parameters_fingerprint(self.parameters()) != self._forward_fingerprint:
+            raise RuntimeError(
+                "parameters were modified while the segment was in flight; "
+                "cannot rebuild its activations for the retry"
+            )
+        batch_values, slot_values = self._anchors
+        x = Tensor(batch_values)
+        slots = [None if value is None else Tensor(value) for value in slot_values]
+        for module, slot in zip(self._modules, slots):
+            result = module.forward(x, slot)
+            try:
+                x, slot_out = result
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "each layer's forward must return an (output, hidden) pair"
+                ) from exc
+            if not isinstance(x, Tensor) or not isinstance(slot_out, Tensor):
+                raise ValueError(
+                    "each layer's forward must return (Tensor, Tensor)"
+                )
+        if _checkpoint._trees_differ(
+            x.tolist(), self._last_output.tolist(), x.shape
+        ):
+            raise RuntimeError(
+                "the rebuilt activations diverge from the recorded forward "
+                "output; the segment cannot be back-propagated again"
+            )
 
     def _recompute_activations(self):
         """Rebuild the in-flight segment's activations from its anchors.
