@@ -2020,6 +2020,100 @@ def _check_chain_fork_memory():
     _check(all(report.ok for report in reports), "the family members verify")
 
 
+def _check_chain_delete_memory():
+    # Deleting one chain of a family releases only its own references;
+    # every chain still standing keeps reassembling its complete state.
+    seq, _ = _fresh_stack()
+    chain = _checkpoint.MemoryChain()
+    seq.save(chain)  # seg 0 (basis, no hidden)
+    out, _ = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out))
+    seq.update(_LR)
+    seq.save(chain)  # seg 1 (hidden introduced)
+    seq.adam_step(_ADAM_LR)
+    seq.save(chain)  # seg 2 (optimizer state moves, t=1)
+    main_head = _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+
+    branch = _checkpoint.fork_chain_memory(chain, up_to=1)
+    _checkpoint.delete_chain_memory(branch)
+    _check(len(branch) == 0, "a deleted memory chain holds no segments")
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+        == main_head,
+        "deleting the branch leaves the source chain bit for bit intact",
+    )
+    _check(
+        _checkpoint.load_chain_memory(chain)["optim"]["t"] == 1,
+        "deletion advances no optimizer step",
+    )
+
+    # Deleting the source keeps the branch's shared prefix reachable.
+    chain2 = _checkpoint.MemoryChain()
+    seq2, _ = _fresh_stack()
+    seq2.save(chain2)
+    out2, _ = seq2.forward(Tensor(_SEG1))
+    seq2.backward(_total(out2))
+    seq2.update(_LR)
+    seq2.save(chain2)
+    branch2 = _checkpoint.fork_chain_memory(chain2)
+    branch2_state = _checkpoint.build_bytes(
+        _checkpoint.load_chain_memory(branch2)
+    )
+    _checkpoint.delete_chain_memory(chain2)
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(branch2))
+        == branch2_state,
+        "deleting the source leaves the branch bit for bit intact",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.delete_chain_memory(chain2),
+        "deleting an already-deleted chain is rejected",
+    )
+
+    # A corrupt chain is rejected wholesale and nothing is dropped.
+    corrupt = _checkpoint.MemoryChain()
+    seq3, _ = _fresh_stack()
+    seq3.save(corrupt)
+    seq3.update(_LR)
+    seq3.save(corrupt)
+    seg1 = corrupt.read_segment(_checkpoint._segment_name(1))
+    corrupt.write_segment(
+        _checkpoint._segment_name(1), seg1[: len(seg1) // 2]
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.delete_chain_memory(corrupt),
+        "a corrupt chain rejects deletion",
+    )
+    _check(len(corrupt) == 2, "a rejected deletion drops nothing")
+    _expect(
+        TypeError,
+        lambda: _checkpoint.delete_chain_memory(object()),
+        "delete rejects a non-MemoryChain",
+    )
+
+    # The container-level entry points delete memory chains too.
+    via_seq, _ = _fresh_stack()
+    chain3 = _checkpoint.MemoryChain()
+    via_seq.save(chain3)
+    via_seq.update(_LR)
+    via_seq.save(chain3)
+    via_seq.delete_branch(chain3)
+    _check(len(chain3) == 0, "Sequential.delete_branch clears a memory chain")
+    chain4 = _checkpoint.MemoryChain()
+    via_seq.save(chain4)
+    via_seq.update(_LR)
+    via_seq.save(chain4)
+    via_seq.delete(chain4)
+    _check(len(chain4) == 0, "Sequential.delete aliases delete_branch")
+    _expect(
+        TypeError,
+        lambda: via_seq.delete_branch(bytearray()),
+        "delete rejects a non-chain target",
+    )
+
+
 def _check_streaming_compaction_interleaves():
     # The streaming fold keeps working through concurrent appends and
     # reads: a compactor, an appender and readers run at once against one
@@ -2286,6 +2380,7 @@ _GROUPS = [
     ("backward retry restores layer caches", _check_backward_retry_restores_caches),
     ("in-memory chain compaction", _check_chain_compaction_memory),
     ("in-memory chain fork", _check_chain_fork_memory),
+    ("in-memory chain deletion", _check_chain_delete_memory),
     ("streaming compaction interleave", _check_streaming_compaction_interleaves),
     ("chain verification", _check_chain_verification),
     ("backward replay failure surfaced", _check_backward_replay_failure_is_surfaced),

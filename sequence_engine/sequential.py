@@ -127,6 +127,10 @@ class Sequential:
       chain then maintains only its own head and appended deltas, and
       shared segments are reclaimed exactly when no chain can reach
       them any more.
+    * ``delete_branch(target)`` -- removes one chain of a family (its
+      directory, head and exclusively reachable segments) atomically;
+      shared segments stay reachable through the chains that still
+      reference them.
 
     All public operations are serialised by one re-entrant lock, so
     several threads may interleave ``forward``, ``backward``, ``update``,
@@ -796,6 +800,43 @@ class Sequential:
             raise TypeError(
                 "verify source must be a chain directory or a MemoryChain"
             )
+
+    def delete_branch(self, target):
+        """Delete one chain of a chain family.
+
+        *target* is an existing chain directory or a ``MemoryChain``.
+        The chain directory, its ``head`` pointer and the delta segments
+        no other chain's head can still reach are removed; segments
+        shared with another chain (hard-linked at a fork) are kept
+        exactly as they are while any chain's head can reach them, and
+        their bytes are reclaimed precisely when the last referencing
+        chain lets go.  The chain name disappears in one atomic step
+        before anything is unlinked, so a process killed at any point
+        leaves every chain still standing as one complete state and only
+        private staging debris, which the next fork, compaction or
+        deletion reclaims deterministically.  Reclamation is by
+        reachability alone: repeating it changes nothing and no chain's
+        optimizer step count ever advances.
+
+        The chain must parse as one complete state: a missing ``head``
+        or an unparseable chain structure raises ``ValueError`` and not
+        a single shared segment is touched.  A missing or already
+        deleted directory raises ``FileNotFoundError`` without changing
+        any other chain of the family; an unwritable directory or a full
+        disk raises ``OSError``, and even an interrupted reclamation
+        never leaves half a segment file behind.
+        """
+        with self._lock:
+            if isinstance(target, _checkpoint.MemoryChain):
+                return _checkpoint.delete_chain_memory(target)
+            if isinstance(target, (str, os.PathLike)):
+                return _checkpoint.delete_chain(target)
+            raise TypeError(
+                "delete target must be a chain directory or a MemoryChain"
+            )
+
+    # Short alias for the same capability.
+    delete = delete_branch
 
     def _validate_against_model(self, document):
         if not isinstance(document, dict):

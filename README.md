@@ -143,6 +143,29 @@ checkpoint path) and writes no files.
   directory or a missing referenced segment raises `FileNotFoundError`;
   an unwritable destination or a full disk raises `OSError`. Forking a
   `MemoryChain` takes no `target` and returns the new `MemoryChain`.
+- `Sequential.delete_branch(target) -> None` (also spelled
+  `Sequential.delete`) removes one chain of a chain family: the chain
+  directory, its `head` pointer and the delta segments no other chain's
+  head can still reach. Segments shared with another chain (hard-linked
+  at a fork) are kept exactly as they are while any chain's head can
+  reach them; a shared segment's bytes are reclaimed exactly when the
+  last referencing chain lets go, whether through a compaction or
+  through the deletion of the last branch directory holding it. The
+  chain must parse as one complete state: a missing `head` or an
+  unparseable chain structure rejects the deletion with `ValueError`
+  and not a single shared segment is touched. The deletion is atomic
+  from the outside -- the directory is renamed aside in one step before
+  its contents are unlinked, so the chain name either exists as one
+  complete state or is gone, and a process killed at any point leaves
+  only private staging debris that the next fork, compaction or
+  deletion of the same chain name reclaims deterministically; even an
+  interrupted reclamation never leaves half a segment file behind.
+  Reclamation is by reachability alone: repeating it changes nothing
+  and no chain's optimizer step count ever advances. A missing or
+  already-deleted directory raises `FileNotFoundError` without changing
+  any other chain of the family; an unwritable directory or a full disk
+  raises `OSError`. `checkpoint.delete_chain` is the module-level entry
+  point; a `MemoryChain` is deleted with the same call.
 - `Sequential.verify(source)` verifies an existing incremental checkpoint
   chain (a chain directory or a `MemoryChain`) strictly read-only. It
   walks the basis and every delta through the `head`, checking each
@@ -160,7 +183,9 @@ checkpoint path) and writes no files.
   member is then verified in turn with the same read-only walk, a sound
   family returns a family report (`ok`, `members`, `chains`), and the
   first bad segment across the family is reported with its position, the
-  reason and the chain it belongs to.
+  reason and every chain whose head can reach it -- a shared segment's
+  corruption is attributed to all the chains that reference it, not just
+  the one the verifier walked first.
 
 ### Threading
 
@@ -244,9 +269,18 @@ point with the source chain (hard links, so the prefix is stored once)
 and then grows its own tail under its own `head`. Every chain of the
 family saves, loads, compacts and verifies independently; a shared
 segment's bytes are reclaimed exactly when no chain's head can reach it
-any more. `checkpoint.verify_chain` (or `Sequential.verify`) accepts a
+any more. `Sequential.delete_branch` (or `checkpoint.delete_chain`)
+removes one chain of the family -- its directory, head and exclusively
+reachable segments -- atomically and crash-safely, while shared segments
+stay reachable through the chains that still reference them. Staging
+debris of killed forks and deletions, and segments a crashed commit
+left unreachable (written but never committed through the `head`), are
+reclaimed deterministically on the next fork, compaction or deletion;
+the reclamation is by reachability alone, so repeating it changes
+nothing and no chain's optimizer step count ever advances.
+`checkpoint.verify_chain` (or `Sequential.verify`) accepts a
 list of chain directories to verify a whole family read-only, reporting
-the first bad segment with the chain it belongs to.
+the first bad segment with every chain that shares it.
 
 Loading walks the basis and every delta up to the head and reassembles the
 state by layer (parameters, gradients, optimizer moments and step count,
