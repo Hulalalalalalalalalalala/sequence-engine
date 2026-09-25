@@ -117,6 +117,32 @@ checkpoint path) and writes no files.
   `OSError`, and any corrupt, truncated or shape-inconsistent segment
   rejects the whole compaction with `ValueError` before anything is
   written.
+- `Sequential.fork(source, target, up_to=None) -> None` derives a branch
+  chain from an existing incremental checkpoint chain at segment `up_to`
+  (the source chain's current head when omitted). The branch chain
+  directory created at `target` shares every segment up to and including
+  the fork point with the source chain -- the prefix files are
+  hard-linked, so they are stored once -- and from then on maintains
+  only its own `head` and the delta segments it appends. The two chains
+  save, load, compact and verify independently and in parallel: a state
+  reassembled from either chain is bit for bit identical to the state an
+  unforked chain would hold, appends landing on the same segment
+  position in both chains leave each other's bytes untouched, and a
+  shared segment (immutable by construction) is never observed
+  half-written. A shared segment's bytes are reclaimed by reachability,
+  exactly when no chain's head can reach it any more -- whether the
+  reference went away through a compaction or through the deletion of a
+  whole branch directory -- and a process killed at any point neither
+  loses a reachable segment nor leaks an unreachable one; every chain
+  still standing reopens as one complete state. The fork itself is
+  atomic: the branch is staged under a private sibling directory and
+  renamed into place, so `target` either appears as one complete chain
+  or not at all. A fork point that falls between segment positions (a
+  non-integer) or names a segment the chain has not committed, and a
+  `target` that already exists, raise `ValueError`; a missing source
+  directory or a missing referenced segment raises `FileNotFoundError`;
+  an unwritable destination or a full disk raises `OSError`. Forking a
+  `MemoryChain` takes no `target` and returns the new `MemoryChain`.
 - `Sequential.verify(source)` verifies an existing incremental checkpoint
   chain (a chain directory or a `MemoryChain`) strictly read-only. It
   walks the basis and every delta through the `head`, checking each
@@ -129,7 +155,12 @@ checkpoint path) and writes no files.
   modified by a single byte (a compaction interrupted on disk is
   inspected in place, not rolled forward). A missing chain directory
   raises `FileNotFoundError`; an operating-system level read failure
-  raises `OSError`.
+  raises `OSError`. `source` may also be a list of chain directories --
+  a chain family whose members share prefix segments after a fork. Every
+  member is then verified in turn with the same read-only walk, a sound
+  family returns a family report (`ok`, `members`, `chains`), and the
+  first bad segment across the family is reported with its position, the
+  reason and the chain it belongs to.
 
 ### Threading
 
@@ -206,6 +237,16 @@ through rather than waited on), a compaction killed at any point is
 completed by the next open, and `head` always points at one complete
 chain. Peak disk usage stays within the original chain plus the single
 new basis segment.
+
+`Sequential.fork` (or `checkpoint.fork_chain`) turns one chain into a
+chain family: the branch directory shares the segments up to the fork
+point with the source chain (hard links, so the prefix is stored once)
+and then grows its own tail under its own `head`. Every chain of the
+family saves, loads, compacts and verifies independently; a shared
+segment's bytes are reclaimed exactly when no chain's head can reach it
+any more. `checkpoint.verify_chain` (or `Sequential.verify`) accepts a
+list of chain directories to verify a whole family read-only, reporting
+the first bad segment with the chain it belongs to.
 
 Loading walks the basis and every delta up to the head and reassembles the
 state by layer (parameters, gradients, optimizer moments and step count,

@@ -30,6 +30,18 @@ Two on-disk shapes share the same leaf encoding and trailer:
   the old head's or the new head's.  A chain directory can also be
   **verified** strictly read-only: each segment is walked like a load and
   the first bad one is located and reported without a single write.
+* **Chain families** -- a chain can be **forked** at any committed
+  segment: the new chain directory shares every segment up to and
+  including the fork point with the source chain (the prefix files are
+  hard-linked, so they are stored once) and from then on maintains only
+  its own head and the deltas it appends.  The chains of a family save,
+  load, stream-compact and verify independently; shared segments are
+  immutable (every write anywhere is a temp file plus a rename), and a
+  shared segment's bytes are reclaimed by reachability -- exactly when no
+  chain's head can reach it any more, whether the reference went away
+  through a compaction or through the deletion of a whole branch.  A
+  family of chains can also be verified read-only in one call, with the
+  first bad segment reported together with the chain it belongs to.
 
 Full snapshot wire format (all integers little-endian)::
 
@@ -111,6 +123,14 @@ _BASIS_INDEX = 0
 # re-running the recovery step.
 _STAGED_PREFIX = ".seqc-"
 _COMPACT_MARKER = ".seqcompact"
+
+# Fork staging: a branch chain is fully populated (segment links first,
+# the head pointer last -- the chain commit order) under a private
+# sibling directory and then renamed over the target in one step, so the
+# target either appears as one complete chain or not at all.  A killed
+# fork leaves only a staging directory, which the next fork to the same
+# target reclaims.
+_FORK_TMP_PREFIX = ".seqfork.tmp-"
 
 # Streaming-compaction leases.  A compaction no longer folds the chain in
 # one critical section: it stages a new basis and then converts one tail
@@ -1770,6 +1790,32 @@ class ChainVerification:
         )
 
 
+class ChainFamilyVerification:
+    """Result of a successful read-only verification of a chain family.
+
+    ``members`` holds the verified chain directories (as paths, in the
+    order they were given) and ``chains`` the per-chain
+    :class:`ChainVerification` reports in the same order.
+    """
+
+    __slots__ = ("ok", "members", "chains")
+
+    def __init__(self, members, chains):
+        self.ok = True
+        self.members = members
+        self.chains = chains
+
+    def __bool__(self):
+        return True
+
+    def __repr__(self):
+        heads = tuple(report.head for report in self.chains)
+        return (
+            f"ChainFamilyVerification(ok=True, members={len(self.members)}, "
+            f"heads={heads})"
+        )
+
+
 def _verify_failure(position, what, exc):
     return CheckpointError(
         f"chain verification failed at {position} ({what}): {exc}"
@@ -1842,12 +1888,21 @@ def verify_chain(directory):
     fold interrupted on disk is inspected in place rather than rolled
     forward.
 
+    *directory* may also be a list (or tuple) of chain directories -- a
+    chain family whose members share prefix segments.  Every member is
+    then verified in turn with the same read-only walk and a sound
+    family returns a :class:`ChainFamilyVerification`; the first bad
+    segment across the family is reported with its position, the reason
+    and the chain it belongs to (see :func:`verify_family`).
+
     A missing directory raises FileNotFoundError; an operating-system
     level read failure (permissions, I/O) propagates as OSError; any
     corruption, truncation, missing field, ordering, reference or shape
     defect rejects the whole chain with ValueError whose message names
     the first bad segment and the reason.
     """
+    if isinstance(directory, (list, tuple)):
+        return verify_family(directory)
     if not isinstance(directory, (str, os.PathLike)):
         raise TypeError("chain directory must be a path")
     directory = os.fspath(directory)
@@ -1875,6 +1930,54 @@ def verify_chain(directory):
         # A fold is (or was) in flight.  Verify the one coherent logical
         # chain reachable through the marker, still without writing.
         return _verify_through_marker_read_only(directory, store, head)
+
+
+def verify_family(members):
+    """Verify a chain family read-only; report the first bad segment.
+
+    *members* is a non-empty sequence of chain directories whose chains
+    may share prefix segments (the result of one or more forks).  Every
+    member is walked exactly as :func:`verify_chain` walks a single
+    chain -- completeness (framing and CRC), segment order, the basis
+    reference and tensor/layer shapes -- and nothing is written: no
+    chain directory changes by a single byte.  A shared segment that is
+    truncated, out of order or shape-inconsistent is located at the
+    first chain (in the given order) and the first segment position
+    that exhibits it, and the whole family is rejected.
+
+    A sound family returns a :class:`ChainFamilyVerification` holding
+    one :class:`ChainVerification` per member.  A failure raises
+    ValueError naming the owning chain (its position and path), the
+    first bad segment and the reason; a missing member directory raises
+    FileNotFoundError and an operating-system level read failure
+    propagates as OSError.
+    """
+    if isinstance(members, (str, bytes, os.PathLike)):
+        raise TypeError("a chain family must be a sequence of chain directories")
+    try:
+        members = list(members)
+    except TypeError:
+        raise TypeError(
+            "a chain family must be a sequence of chain directories"
+        ) from None
+    if not members:
+        raise CheckpointError("a chain family needs at least one chain")
+    paths = []
+    reports = []
+    for position, member in enumerate(members):
+        if not isinstance(member, (str, os.PathLike)):
+            raise TypeError("chain family members must be chain directory paths")
+        path = os.fspath(member)
+        try:
+            report = verify_chain(path)
+        except CheckpointError as exc:
+            raise CheckpointError(
+                f"chain family verification failed at chain {position} "
+                f"({path!r}): {exc}"
+            ) from exc
+        paths.append(path)
+        reports.append(report)
+    return ChainFamilyVerification(tuple(paths), tuple(reports))
 
 
 def _verify_through_marker_read_only(directory, store, head):
@@ -2549,6 +2652,215 @@ def _unlink_quietly(path):
         os.unlink(path)
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Chain forks: deriving branch chains that share a prefix segment family
+#
+# Forking a chain at segment *k* creates a second chain directory whose
+# segments ``0..k`` are hard links to the source chain's files -- the
+# shared prefix is stored once -- plus its own ``head`` pointer naming
+# segment *k*.  From then on each chain maintains only its own head and
+# the delta segments it appends: appends landing on the same segment
+# position in two chains live in different directories and never touch
+# each other's bytes, and a state reassembled from either chain is bit
+# for bit the state an unforked chain would hold.
+#
+# Shared segments are immutable by construction (every write anywhere in
+# the engine is a temp file plus an atomic rename), so a reader of a
+# shared segment never observes half-written content.  Reclamation is by
+# reachability and deterministic: a compaction folding the prefix away,
+# or the deletion of a whole branch directory, only drops that chain's
+# own directory entries, and the filesystem reclaims a shared segment's
+# bytes exactly when the last chain whose head can reach it lets go.  A
+# process killed at any point therefore neither loses a reachable
+# segment nor leaks an unreachable one, and every chain still standing
+# reopens as one complete state.
+# ---------------------------------------------------------------------------
+
+
+def _check_fork_point(up_to, head):
+    """The segment index a fork branches from; the head when omitted.
+
+    The fork point must name an existing segment boundary: a point
+    between positions (a non-integer), a negative index or a segment the
+    chain has not committed yet is refused with ValueError.
+    """
+    if up_to is None:
+        return head
+    if isinstance(up_to, bool) or not isinstance(up_to, int):
+        raise CheckpointError(
+            "fork point must name a segment boundary (a non-negative "
+            "integer segment index)"
+        )
+    if up_to < 0 or up_to > head:
+        raise CheckpointError(
+            f"fork point {up_to} names no segment of the chain "
+            f"(the head is segment {head})"
+        )
+    return up_to
+
+
+def fork_chain(source, target, up_to=None):
+    """Derive a new chain from *source* at segment *up_to* into *target*.
+
+    The branch chain directory shares every segment up to and including
+    the fork point with the source chain (the prefix files are
+    hard-linked, so they are stored once) and receives its own ``head``
+    pointer; afterwards each chain maintains only its own head and the
+    delta segments it appends.  Saves, loads, streaming compactions and
+    verifications on either chain proceed independently and in parallel:
+    a state reassembled from either chain is bit for bit identical to
+    the state an unforked chain would hold, appends landing on the same
+    segment position in both chains leave each other's bytes untouched,
+    and a shared segment -- immutable by construction -- is never
+    observed half-written.
+
+    Reclamation is by reachability and deterministic: unlinking a shared
+    segment from one chain (a compaction folding the prefix away, or the
+    deletion of a whole branch directory) releases only that chain's
+    reference, and the segment's bytes are reclaimed exactly when no
+    chain's head can reach it any more.  A process killed at any point
+    neither loses a reachable segment nor leaks an unreachable one, and
+    every chain still standing reopens as one complete state.  The fork
+    itself is atomic: the branch is staged under a private sibling
+    directory and renamed into place, so *target* either appears as one
+    complete chain or not at all (a killed attempt leaves only staging
+    debris, which the next fork to the same target reclaims).
+
+    *up_to* defaults to the source chain's current head.  A fork point
+    that falls between segment positions (a non-integer) or names a
+    segment the chain has not committed, and a *target* that already
+    exists, raise ``ValueError``; a missing source directory or a
+    missing referenced segment raises ``FileNotFoundError``; an
+    unwritable destination or a full disk raises ``OSError``.  The
+    shared prefix is fully validated before anything is linked, so a
+    corrupt chain is rejected before the target appears.
+    """
+    if not isinstance(source, (str, os.PathLike)):
+        raise TypeError("fork source must be a chain directory path")
+    if not isinstance(target, (str, os.PathLike)):
+        raise TypeError("fork target must be a chain directory path")
+    source = os.fspath(source)
+    target = os.fspath(target)
+    if not os.path.isdir(source):
+        raise FileNotFoundError(
+            f"incremental checkpoint directory not found: {source!r}"
+        )
+    source_abs = os.path.abspath(source)
+    target_abs = os.path.abspath(target)
+    if os.path.exists(target_abs) or target_abs == source_abs:
+        raise CheckpointError(f"fork target already exists: {target!r}")
+    if target_abs.startswith(source_abs + os.sep):
+        raise CheckpointError(
+            "fork target must not live inside the source chain directory"
+        )
+    parent = os.path.dirname(target_abs)
+    staging_prefix = _FORK_TMP_PREFIX + os.path.basename(target_abs) + "-"
+    # Reclaim debris of a killed earlier fork attempt to the same target.
+    for name in os.listdir(parent):
+        if name.startswith(staging_prefix):
+            _remove_tree_quietly(os.path.join(parent, name))
+
+    # Serialise against saves and compactions on the source: the shared
+    # prefix must not be replaced or released while it is being linked.
+    # A live streaming fold is waited out first (a dead one is rolled
+    # forward by the recovery step), so the linked prefix always comes
+    # from a quiescent chain.
+    while True:
+        with _DirectoryChainLock(source):
+            store = _DirectoryChainStore(source)
+            _recover_directory_chain(source, store)
+            if _marker_exists(source):
+                contended = True
+            else:
+                contended = False
+                head = _read_head_optional(store)
+                if head is None:
+                    raise CheckpointError(
+                        "chain has no head pointer (no basis segment committed)"
+                    )
+                fork_point = _check_fork_point(up_to, head)
+                # Validate the whole shared prefix before anything is
+                # linked; a missing referenced segment surfaces as
+                # FileNotFoundError, any corruption as ValueError.
+                _walk_to(store, fork_point, fork_point)
+                _materialize_fork(
+                    source, target_abs, parent, staging_prefix, fork_point
+                )
+        if not contended:
+            return None
+        _wait_for_live_marker(source)
+
+
+def _materialize_fork(source, target, parent, staging_prefix, fork_point):
+    """Link the shared prefix into a staging dir and rename it into place.
+
+    Runs under the source directory lock, so no save or compaction can
+    replace or release a prefix segment while it is being linked.  The
+    branch appears atomically: the staging directory is fully populated
+    -- segment links first, the head pointer last, mirroring the chain
+    commit order -- and then renamed over the (nonexistent) target.
+    """
+    staging = tempfile.mkdtemp(prefix=staging_prefix, dir=parent)
+    committed = False
+    try:
+        for index in range(fork_point + 1):
+            os.link(
+                os.path.join(source, _segment_name(index)),
+                os.path.join(staging, _segment_name(index)),
+            )
+        _atomic_write(staging, _HEAD_NAME, str(fork_point).encode("ascii"))
+        _fsync_directory(staging)
+        if os.path.exists(target):
+            raise CheckpointError(f"fork target already exists: {target!r}")
+        os.rename(staging, target)
+        committed = True
+        _fsync_directory(parent)
+    finally:
+        if not committed:
+            _remove_tree_quietly(staging)
+
+
+def _remove_tree_quietly(directory):
+    """Best-effort removal of a fork staging directory and its contents."""
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        _unlink_quietly(os.path.join(directory, name))
+    try:
+        os.rmdir(directory)
+    except OSError:
+        pass
+
+
+def fork_chain_memory(store, up_to=None):
+    """Derive an in-memory branch chain; same semantics as :func:`fork_chain`.
+
+    The branch shares the prefix segments with the source chain (segment
+    bytes are immutable, so sharing them by reference is safe) and
+    receives its own head pointer; later appends and compactions on
+    either chain are fully independent.  Returns the new
+    :class:`MemoryChain`.
+    """
+    if not isinstance(store, MemoryChain):
+        raise TypeError("store must be a MemoryChain")
+    with store._lock:
+        head = _read_head_optional(store)
+        if head is None:
+            raise CheckpointError(
+                "chain has no head pointer (no basis segment committed)"
+            )
+        fork_point = _check_fork_point(up_to, head)
+        _walk_to(store, fork_point, fork_point)
+        branch = MemoryChain()
+        for index in range(fork_point + 1):
+            name = _segment_name(index)
+            branch._objects[name] = store._objects[name]
+        branch._objects[_HEAD_NAME] = str(fork_point).encode("ascii")
+    return branch
 
 
 # ---------------------------------------------------------------------------

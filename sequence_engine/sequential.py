@@ -122,6 +122,11 @@ class Sequential:
     * ``compact(target, up_to=None)`` -- folds an incremental chain's
       basis and a prefix of its deltas into one new basis segment,
       crash-safely; the reassembled state is bit for bit unchanged.
+    * ``fork(source, target, up_to=None)`` -- derives a branch chain
+      sharing the source chain's segments up to the fork point; each
+      chain then maintains only its own head and appended deltas, and
+      shared segments are reclaimed exactly when no chain can reach
+      them any more.
 
     All public operations are serialised by one re-entrant lock, so
     several threads may interleave ``forward``, ``backward``, ``update``,
@@ -709,6 +714,54 @@ class Sequential:
                 "compact target must be a chain directory or a MemoryChain"
             )
 
+    def fork(self, source, target=None, up_to=None):
+        """Derive a branch chain from an existing incremental chain.
+
+        *source* is an existing chain directory or a ``MemoryChain``;
+        *up_to* is the segment the branch forks from (the source chain's
+        current head when omitted).  For a directory source the branch
+        is created at *target* (a path that must not exist yet): it
+        shares every segment up to and including the fork point with the
+        source chain -- the prefix files are hard-linked, so they are
+        stored once -- and from then on maintains only its own head and
+        the delta segments it appends.  For a ``MemoryChain`` source no
+        *target* is given and the new ``MemoryChain`` is returned.
+
+        The two chains save, load, compact and verify independently and
+        in parallel: a state reassembled from either chain is bit for
+        bit identical to the state an unforked chain would hold, appends
+        landing on the same segment position in both chains leave each
+        other's bytes untouched, and a shared segment is never observed
+        half-written.  A shared segment's bytes are reclaimed exactly
+        when no chain's head can reach it any more -- whether the
+        reference went away through a compaction or through the deletion
+        of a whole branch directory -- and a process killed at any point
+        leaves every chain still standing as one complete state.
+
+        A fork point that falls between segment positions (a
+        non-integer) or names a segment the chain has not committed, and
+        a *target* that already exists, raise ``ValueError``; a missing
+        source directory or a missing referenced segment raises
+        ``FileNotFoundError``; an unwritable destination or a full disk
+        raises ``OSError``.
+        """
+        with self._lock:
+            if isinstance(source, _checkpoint.MemoryChain):
+                if target is not None:
+                    raise TypeError(
+                        "a MemoryChain fork takes no target directory"
+                    )
+                return _checkpoint.fork_chain_memory(source, up_to)
+            if isinstance(source, (str, os.PathLike)):
+                if target is None:
+                    raise TypeError(
+                        "forking a chain directory requires a target path"
+                    )
+                return _checkpoint.fork_chain(source, target, up_to)
+            raise TypeError(
+                "fork source must be a chain directory or a MemoryChain"
+            )
+
     def verify(self, source):
         """Verify an incremental checkpoint chain without changing it.
 
@@ -722,6 +775,13 @@ class Sequential:
         inspected in place and the directory is left byte for byte
         unchanged.
 
+        *source* may also be a list (or tuple) of chain directories -- a
+        chain family whose members share prefix segments.  Every member
+        is verified in turn and a sound family returns a family report;
+        the first bad segment across the family is reported with its
+        position, the reason and the chain it belongs to, still without
+        a single write.
+
         A missing directory raises ``FileNotFoundError``; any truncation,
         missing field, ordering, reference or shape defect rejects the
         whole chain with ``ValueError``.
@@ -729,6 +789,8 @@ class Sequential:
         with self._lock:
             if isinstance(source, _checkpoint.MemoryChain):
                 return _checkpoint.verify_chain_memory(source)
+            if isinstance(source, (list, tuple)):
+                return _checkpoint.verify_chain(source)
             if isinstance(source, (str, os.PathLike)):
                 return _checkpoint.verify_chain(source)
             raise TypeError(

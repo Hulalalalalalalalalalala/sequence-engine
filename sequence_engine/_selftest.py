@@ -1892,6 +1892,134 @@ def _check_chain_compaction_memory():
     )
 
 
+def _check_chain_fork_memory():
+    # A forked branch shares the prefix with its source chain and then
+    # evolves independently; both chains stay bit for bit identical to
+    # two chains that never forked.
+    seq, _ = _fresh_stack()
+    chain = _checkpoint.MemoryChain()
+    seq.save(chain)  # seg 0 (basis, no hidden)
+    out, _ = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out))
+    seq.update(_LR)
+    seq.save(chain)  # seg 1 (hidden introduced)
+    seq.adam_step(_ADAM_LR)
+    seq.save(chain)  # seg 2 (optimizer state moves)
+
+    branch = _checkpoint.fork_chain_memory(chain, up_to=1)
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(branch))
+        == _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain, up_to=1)),
+        "a fork reassembles exactly the fork-point state",
+    )
+    _check(branch.read_head() == b"1", "the branch head names the fork point")
+
+    # Both chains append to the same next position without interfering.
+    main_seq, _ = _fresh_stack()
+    main_seq.load(chain)
+    main_seq.update(_LR)
+    main_seq.save(chain)  # main seg 3
+    branch_seq, _ = _fresh_stack()
+    branch_seq.load(branch)
+    branch_seq.adam_step(_ADAM_LR)
+    branch_seq.save(branch)  # branch seg 2
+    _check(len(chain) == 4 and len(branch) == 3, "each chain grows its own tail")
+
+    # Reference chains replayed without a fork must match bit for bit.
+    ref_main, _ = _fresh_stack()
+    ref_main_chain = _checkpoint.MemoryChain()
+    ref_main.save(ref_main_chain)
+    out, _ = ref_main.forward(Tensor(_SEG1))
+    ref_main.backward(_total(out))
+    ref_main.update(_LR)
+    ref_main.save(ref_main_chain)
+    ref_main.adam_step(_ADAM_LR)
+    ref_main.save(ref_main_chain)
+    ref_main.update(_LR)
+    ref_main.save(ref_main_chain)
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+        == _checkpoint.build_bytes(_checkpoint.load_chain_memory(ref_main_chain)),
+        "the source chain evolves as if it had never forked",
+    )
+    ref_branch, _ = _fresh_stack()
+    ref_branch_chain = _checkpoint.MemoryChain()
+    ref_branch.save(ref_branch_chain)
+    out, _ = ref_branch.forward(Tensor(_SEG1))
+    ref_branch.backward(_total(out))
+    ref_branch.update(_LR)
+    ref_branch.save(ref_branch_chain)
+    ref_branch.adam_step(_ADAM_LR)
+    ref_branch.save(ref_branch_chain)
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(branch))
+        == _checkpoint.build_bytes(_checkpoint.load_chain_memory(ref_branch_chain)),
+        "the branch evolves as if it had never shared a prefix",
+    )
+
+    # Compacting one chain leaves the other's state untouched.
+    _checkpoint.compact_chain_memory(chain)
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(branch))
+        == _checkpoint.build_bytes(_checkpoint.load_chain_memory(ref_branch_chain)),
+        "compacting the source chain leaves the branch bit for bit intact",
+    )
+    _checkpoint.compact_chain_memory(branch)
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+        == _checkpoint.build_bytes(_checkpoint.load_chain_memory(ref_main_chain)),
+        "compacting the branch leaves the source chain bit for bit intact",
+    )
+
+    # The container-level entry point forks memory chains too.
+    via_seq, _ = _fresh_stack()
+    chain2 = _checkpoint.MemoryChain()
+    via_seq.save(chain2)
+    via_seq.update(_LR)
+    via_seq.save(chain2)
+    branch2 = via_seq.fork(chain2)
+    _check(
+        isinstance(branch2, _checkpoint.MemoryChain)
+        and branch2.read_head() == b"1",
+        "Sequential.fork derives a memory branch at the head by default",
+    )
+    _expect(
+        TypeError,
+        lambda: via_seq.fork(chain2, "somewhere"),
+        "a memory fork takes no target directory",
+    )
+    _expect(
+        TypeError,
+        lambda: via_seq.fork(bytearray()),
+        "fork rejects a non-chain source",
+    )
+
+    # Bad fork points and an empty chain are refused with ValueError.
+    for bad in (-1, True, 0.5, "1"):
+        _expect(
+            ValueError,
+            lambda bad=bad: _checkpoint.fork_chain_memory(chain2, bad),
+            f"invalid fork point {bad!r} is rejected",
+        )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.fork_chain_memory(chain2, 99),
+        "a fork point beyond the head is rejected",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.fork_chain_memory(_checkpoint.MemoryChain()),
+        "forking a chain with no committed basis is rejected",
+    )
+
+    # A family of memory chains verifies through the single-chain entry.
+    reports = [
+        _checkpoint.verify_chain_memory(chain),
+        _checkpoint.verify_chain_memory(branch),
+    ]
+    _check(all(report.ok for report in reports), "the family members verify")
+
+
 def _check_streaming_compaction_interleaves():
     # The streaming fold keeps working through concurrent appends and
     # reads: a compactor, an appender and readers run at once against one
@@ -2157,6 +2285,7 @@ _GROUPS = [
     ("recompute bounded memory and guards", _check_recompute_bounded_memory_and_guards),
     ("backward retry restores layer caches", _check_backward_retry_restores_caches),
     ("in-memory chain compaction", _check_chain_compaction_memory),
+    ("in-memory chain fork", _check_chain_fork_memory),
     ("streaming compaction interleave", _check_streaming_compaction_interleaves),
     ("chain verification", _check_chain_verification),
     ("backward replay failure surfaced", _check_backward_replay_failure_is_surfaced),
