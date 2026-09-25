@@ -143,6 +143,28 @@ checkpoint path) and writes no files.
   directory or a missing referenced segment raises `FileNotFoundError`;
   an unwritable destination or a full disk raises `OSError`. Forking a
   `MemoryChain` takes no `target` and returns the new `MemoryChain`.
+- `Sequential.delete(target) -> None` deletes one branch chain of a
+  family: the chain directory, its `head` and the incremental segments
+  it alone owned are removed. A shared segment's bytes are reclaimed by
+  reachability only -- exactly when no chain's head can reach it any
+  more -- and are kept byte for byte intact while any chain still
+  references them. The directory is renamed aside in one atomic step
+  and then emptied, so a fork or compaction running on the same family
+  at any moment observes each surviving chain as one complete state,
+  and a process killed at any point leaves every surviving chain
+  loadable, with the residue (a detached staging directory, or segments
+  no head can reach) swept deterministically by the next fork,
+  compaction or deletion. The sweep is a pure reachability function:
+  repeating it changes nothing and it advances no chain's optimizer
+  step count. A `target` that does not exist or was already deleted
+  raises `FileNotFoundError` and leaves every other chain untouched; a
+  directory that exists but has no `head`, or holds a chain that cannot
+  be parsed, raises `ValueError` and removes not a single shared
+  segment; an unwritable directory or a full disk raises `OSError`, and
+  an interrupted teardown leaves only whole segment files behind --
+  never a half-written one. Deleting a `MemoryChain` drops its head
+  and segments in one critical section, and the emptied chain can be
+  reused.
 - `Sequential.verify(source)` verifies an existing incremental checkpoint
   chain (a chain directory or a `MemoryChain`) strictly read-only. It
   walks the basis and every delta through the `head`, checking each
@@ -160,7 +182,8 @@ checkpoint path) and writes no files.
   member is then verified in turn with the same read-only walk, a sound
   family returns a family report (`ok`, `members`, `chains`), and the
   first bad segment across the family is reported with its position, the
-  reason and the chain it belongs to.
+  reason and -- for a shared segment -- every chain whose head reaches
+  it.
 
 ### Threading
 
@@ -244,9 +267,15 @@ point with the source chain (hard links, so the prefix is stored once)
 and then grows its own tail under its own `head`. Every chain of the
 family saves, loads, compacts and verifies independently; a shared
 segment's bytes are reclaimed exactly when no chain's head can reach it
-any more. `checkpoint.verify_chain` (or `Sequential.verify`) accepts a
-list of chain directories to verify a whole family read-only, reporting
-the first bad segment with the chain it belongs to.
+any more. `Sequential.delete` (or `checkpoint.delete_chain`) removes one
+branch of the family -- its directory, its head and the segments it
+alone owned -- atomically with respect to concurrent forks and
+compactions, and deterministically sweeps crash residue (staging
+directories of killed forks/deletes, segments no head can reach) on
+every fork, compaction and deletion. `checkpoint.verify_chain` (or
+`Sequential.verify`) accepts a list of chain directories to verify a
+whole family read-only, reporting the first bad segment with every chain
+that reaches it.
 
 Loading walks the basis and every delta up to the head and reassembles the
 state by layer (parameters, gradients, optimizer moments and step count,

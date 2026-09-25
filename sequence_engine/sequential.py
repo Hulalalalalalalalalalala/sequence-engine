@@ -127,6 +127,11 @@ class Sequential:
       chain then maintains only its own head and appended deltas, and
       shared segments are reclaimed exactly when no chain can reach
       them any more.
+    * ``delete(target)`` -- deletes one branch chain of a family: its
+      directory, its head and the segments it alone owned.  Shared
+      segments stay while any chain's head can reach them, and crash
+      residue (staging directories, unreachable orphan segments) is
+      swept deterministically.
 
     All public operations are serialised by one re-entrant lock, so
     several threads may interleave ``forward``, ``backward``, ``update``,
@@ -760,6 +765,43 @@ class Sequential:
                 return _checkpoint.fork_chain(source, target, up_to)
             raise TypeError(
                 "fork source must be a chain directory or a MemoryChain"
+            )
+
+    def delete(self, target):
+        """Delete one branch chain of a family.
+
+        *target* is an existing chain directory or a ``MemoryChain``.
+        The chain's directory, its ``head`` and the incremental segments
+        it alone owned are removed; a shared segment's bytes are
+        reclaimed exactly when no chain's head can reach it any more and
+        are kept untouched while any chain still references them.  The
+        directory is renamed aside in one atomic step and then emptied,
+        so concurrent forks and compactions on the family always observe
+        either the complete branch or no branch at all, and every
+        surviving chain stays one complete state.  Staging directories
+        of killed forks/deletes and segments no head can reach are swept
+        deterministically as part of the deletion; the sweep is a pure
+        reachability function -- repeating it changes nothing and it
+        advances no chain's optimizer step count.
+
+        A *target* that does not exist (or was already deleted) raises
+        ``FileNotFoundError`` and leaves every other chain of the family
+        untouched.  A directory that exists but has no ``head``, or
+        holds a chain that cannot be parsed, raises ``ValueError`` and
+        removes not a single shared segment.  An unwritable directory or
+        a full disk raises ``OSError``; an interrupted teardown leaves
+        only whole segment files in a detached staging directory, which
+        the next fork, compaction or deletion reclaims.  Deleting a
+        ``MemoryChain`` drops its head and segments in one critical
+        section; the emptied chain can be reused.
+        """
+        with self._lock:
+            if isinstance(target, _checkpoint.MemoryChain):
+                return _checkpoint.delete_chain_memory(target)
+            if isinstance(target, (str, os.PathLike)):
+                return _checkpoint.delete_chain(target)
+            raise TypeError(
+                "delete target must be a chain directory or a MemoryChain"
             )
 
     def verify(self, source):

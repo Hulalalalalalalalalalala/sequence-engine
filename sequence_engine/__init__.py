@@ -11,8 +11,10 @@ Public interface (see README.md):
   ``MemoryChain`` or a bytearray), ``compact`` (streaming in-place,
   crash-safe compaction of an incremental checkpoint chain), ``fork``
   (deriving a branch chain that shares the source chain's prefix
-  segments and then evolves independently) and ``verify`` (strictly
-  read-only verification of an incremental chain or a chain family).
+  segments and then evolves independently), ``delete`` (removing a
+  branch chain and deterministically reclaiming the segments no
+  remaining chain can reach) and ``verify`` (strictly read-only
+  verification of an incremental chain or a chain family).
 """
 
 from .checkpoint import MemoryChain

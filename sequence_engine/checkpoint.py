@@ -39,9 +39,13 @@ Two on-disk shapes share the same leaf encoding and trailer:
   immutable (every write anywhere is a temp file plus a rename), and a
   shared segment's bytes are reclaimed by reachability -- exactly when no
   chain's head can reach it any more, whether the reference went away
-  through a compaction or through the deletion of a whole branch.  A
-  family of chains can also be verified read-only in one call, with the
-  first bad segment reported together with the chain it belongs to.
+  through a compaction or through the **deletion** of a whole branch.
+  Reclamation is a pure reachability function, so sweeping again changes
+  nothing; segments no head can reach (orphans left by a hard kill) and
+  staging directories from a killed fork, delete or compaction are swept
+  deterministically on the next fork, compaction or deletion.  A family
+  of chains can also be verified read-only in one call, with the first
+  bad segment reported together with every chain that reaches it.
 
 Full snapshot wire format (all integers little-endian)::
 
@@ -131,6 +135,14 @@ _COMPACT_MARKER = ".seqcompact"
 # fork leaves only a staging directory, which the next fork to the same
 # target reclaims.
 _FORK_TMP_PREFIX = ".seqfork.tmp-"
+
+# Branch deletion: the chain directory is first renamed aside under this
+# sibling prefix (the unlink that makes the deleted chain unreachable is
+# one directory-entry change, so the family observes either the complete
+# branch or none of it) and then emptied and removed.  A kill between the
+# rename and the teardown leaves only a directory carrying this prefix,
+# which the next fork, compaction or deletion sweeps deterministically.
+_DELETE_TMP_PREFIX = ".seqdel.tmp-"
 
 # Streaming-compaction leases.  A compaction no longer folds the chain in
 # one critical section: it stages a new basis and then converts one tail
@@ -1222,6 +1234,13 @@ class _DirectoryChainLock:
                     self._directory,
                     os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
                 )
+            except FileNotFoundError:
+                # The directory was deleted (renamed aside by a branch
+                # delete) between the caller's existence check and the
+                # lock: report the documented missing-directory error
+                # rather than degrading to a headless chain.
+                self._thread_lock.release()
+                raise
             except OSError:
                 fd = None
             if fd is not None:
@@ -1230,6 +1249,31 @@ class _DirectoryChainLock:
                 except OSError:
                     os.close(fd)
                 else:
+                    # The flock may have been waited out while another
+                    # process holding it renamed this directory aside (a
+                    # branch delete) and emptied it; the fd then names a
+                    # detached staging directory, not the chain.  Compare
+                    # identities after acquiring: the inode must still
+                    # live at the locked path.
+                    try:
+                        fd_stat = os.fstat(fd)
+                        path_stat = os.stat(self._directory)
+                    except FileNotFoundError:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                        os.close(fd)
+                        self._thread_lock.release()
+                        raise
+                    if (fd_stat.st_dev, fd_stat.st_ino) != (
+                        path_stat.st_dev,
+                        path_stat.st_ino,
+                    ):
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                        os.close(fd)
+                        self._thread_lock.release()
+                        raise FileNotFoundError(
+                            "incremental checkpoint directory not found: "
+                            f"{self._directory!r}"
+                        )
                     self._fd = fd
         return self
 
@@ -1262,6 +1306,9 @@ class _ChainStoreBase:
         raise NotImplementedError
 
     def write_head(self, raw):
+        raise NotImplementedError
+
+    def remove_head(self):
         raise NotImplementedError
 
     def read_segment(self, name):
@@ -1298,6 +1345,12 @@ class MemoryChain(_ChainStoreBase):
             # Commit order: the named segment must already be present when
             # the head can point at it.
             self._objects[_HEAD_NAME] = bytes(raw)
+
+    def remove_head(self):
+        with self._lock:
+            # A memory delete drops the pointer and everything it made
+            # unreachable in one critical section.
+            self._objects.pop(_HEAD_NAME, None)
 
     def read_segment(self, name):
         with self._lock:
@@ -1360,10 +1413,18 @@ def save_chain(document, directory):
             errno.ENOENT,
             f"incremental checkpoint directory does not exist: {directory!r}",
         )
-    with _DirectoryChainLock(directory):
-        store = _DirectoryChainStore(directory)
-        _recover_directory_chain(directory, store)
-        _save_chain_directory(document, directory, store)
+    try:
+        with _DirectoryChainLock(directory):
+            store = _DirectoryChainStore(directory)
+            _recover_directory_chain(directory, store)
+            _save_chain_directory(document, directory, store)
+    except FileNotFoundError:
+        # The directory was deleted (a branch delete) between the check
+        # and the lock: saving into a missing directory is an OSError.
+        raise OSError(
+            errno.ENOENT,
+            f"incremental checkpoint directory does not exist: {directory!r}",
+        ) from None
     return None
 
 
@@ -1893,7 +1954,7 @@ def verify_chain(directory):
     then verified in turn with the same read-only walk and a sound
     family returns a :class:`ChainFamilyVerification`; the first bad
     segment across the family is reported with its position, the reason
-    and the chain it belongs to (see :func:`verify_family`).
+    and every chain whose head reaches it (see :func:`verify_family`).
 
     A missing directory raises FileNotFoundError; an operating-system
     level read failure (permissions, I/O) propagates as OSError; any
@@ -1948,7 +2009,9 @@ def verify_family(members):
     A sound family returns a :class:`ChainFamilyVerification` holding
     one :class:`ChainVerification` per member.  A failure raises
     ValueError naming the owning chain (its position and path), the
-    first bad segment and the reason; a missing member directory raises
+    first bad segment and the reason; when the bad segment is a shared
+    one, the report covers every chain whose head reaches it, never
+    just one of them.  A missing member directory raises
     FileNotFoundError and an operating-system level read failure
     propagates as OSError.
     """
@@ -1963,21 +2026,73 @@ def verify_family(members):
     if not members:
         raise CheckpointError("a chain family needs at least one chain")
     paths = []
-    reports = []
-    for position, member in enumerate(members):
+    for member in members:
         if not isinstance(member, (str, os.PathLike)):
             raise TypeError("chain family members must be chain directory paths")
-        path = os.fspath(member)
+        paths.append(os.fspath(member))
+    reports = []
+    for position, path in enumerate(paths):
         try:
             report = verify_chain(path)
         except CheckpointError as exc:
-            raise CheckpointError(
-                f"chain family verification failed at chain {position} "
-                f"({path!r}): {exc}"
-            ) from exc
-        paths.append(path)
+            raise _attributed_family_error(paths, position, exc) from exc
         reports.append(report)
     return ChainFamilyVerification(tuple(paths), tuple(reports))
+
+
+# Matches a genuine segment defect ("segment 3 (delta)" / "segment 0
+# (basis)") in a verification failure, so the family report can attribute
+# a shared segment to every chain that reaches it.
+_FAMILY_SEGMENT_RE = re.compile(r"segment (\d+) \((?:basis|delta)\)")
+
+
+def _attributed_family_error(paths, position, exc):
+    """The family failure for member *position*, with shared-segment
+    attribution covering every chain whose head reaches the bad segment.
+    """
+    message = (
+        f"chain family verification failed at chain {position} "
+        f"({paths[position]!r}): {exc}"
+    )
+    match = _FAMILY_SEGMENT_RE.search(str(exc))
+    if match is not None:
+        refs = _chains_sharing_segment(paths, position, int(match.group(1)))
+        if len(refs) > 1:
+            reached = ", ".join(f"chain {j} ({paths[j]!r})" for j in refs)
+            message += (
+                "; the segment is shared and the defect is reachable "
+                f"from {reached}"
+            )
+    return CheckpointError(message)
+
+
+def _chains_sharing_segment(paths, failed, segment_index):
+    """Member indices whose head reaches *segment_index* through the same
+    underlying (hard-linked) segment file as the failed chain.
+
+    Read-only: stats the candidate files and reads each member's head
+    pointer.  A member whose file is missing, different, unreadable or
+    beyond its head does not reference the bad segment.
+    """
+    name = _segment_name(segment_index)
+    failed_file = os.path.join(paths[failed], name)
+    if not os.path.exists(failed_file):
+        return [failed]
+    refs = []
+    for j, path in enumerate(paths):
+        candidate = os.path.join(path, name)
+        try:
+            if not os.path.samefile(failed_file, candidate):
+                continue
+        except OSError:
+            continue
+        try:
+            head = _read_head_optional(_DirectoryChainStore(path))
+        except (CheckpointError, OSError):
+            continue
+        if head is not None and head >= segment_index:
+            refs.append(j)
+    return refs or [failed]
 
 
 def _verify_through_marker_read_only(directory, store, head):
@@ -2179,6 +2294,9 @@ def compact_chain(directory, up_to=None):
         raise FileNotFoundError(
             f"incremental checkpoint directory not found: {directory!r}"
         )
+    # Deterministic GC: staging directories killed forks/deletes left in
+    # the family directory are reclaimed on every compaction.
+    _sweep_parent_staging(os.path.dirname(os.path.abspath(directory)))
 
     # Claim the fold -- waiting out a fold another process/thread may
     # already run -- then validate and stage.  The lease is taken inside
@@ -2207,6 +2325,9 @@ def compact_chain(directory, up_to=None):
                 raise CheckpointError(
                     "chain has no head pointer (no basis segment committed)"
                 )
+            # Deterministic GC: segments beyond the head are unreachable
+            # crash residue and are swept on every compaction.
+            _sweep_chain_debris(directory, head)
             fold = _check_up_to(up_to, head)
             if fold == 0 or head == 0:
                 _release_compaction_lease(lease_fd)
@@ -2534,6 +2655,10 @@ def _recover_directory_chain(directory, store):
         # A lease without a marker can only be debris from a crash before
         # the marker was published.
         _unlink_quietly(_lease_path(directory))
+        # A staging sentinel in a committed chain is debris from a fork
+        # killed between the staging rename and the sentinel unlink.
+        if not _staging_dir_is_live(directory):
+            _unlink_quietly(os.path.join(directory, _STAGING_LOCK_NAME))
         return
 
     if _marker_live(directory):
@@ -2757,10 +2882,9 @@ def fork_chain(source, target, up_to=None):
         )
     parent = os.path.dirname(target_abs)
     staging_prefix = _FORK_TMP_PREFIX + os.path.basename(target_abs) + "-"
-    # Reclaim debris of a killed earlier fork attempt to the same target.
-    for name in os.listdir(parent):
-        if name.startswith(staging_prefix):
-            _remove_tree_quietly(os.path.join(parent, name))
+    # Deterministically reclaim debris of killed earlier forks/deletes in
+    # the family directory (staging dirs whose owner is gone).
+    _sweep_parent_staging(parent)
 
     # Serialise against saves and compactions on the source: the shared
     # prefix must not be replaced or released while it is being linked.
@@ -2785,6 +2909,9 @@ def fork_chain(source, target, up_to=None):
                 # linked; a missing referenced segment surfaces as
                 # FileNotFoundError, any corruption as ValueError.
                 _walk_to(store, fork_point, fork_point)
+                # Deterministic GC: segments beyond the head are
+                # unreachable crash residue and are swept on every fork.
+                _sweep_chain_debris(source, head)
                 _materialize_fork(
                     source, target_abs, parent, staging_prefix, fork_point
                 )
@@ -2800,11 +2927,23 @@ def _materialize_fork(source, target, parent, staging_prefix, fork_point):
     replace or release a prefix segment while it is being linked.  The
     branch appears atomically: the staging directory is fully populated
     -- segment links first, the head pointer last, mirroring the chain
-    commit order -- and then renamed over the (nonexistent) target.
+    commit order -- and then renamed over the (nonexistent) target.  A
+    flock-held sentinel marks the staging as owned by this live fork for
+    the whole window, so the deterministic staging sweep only ever
+    reclaims stagings whose creator died.
     """
-    staging = tempfile.mkdtemp(prefix=staging_prefix, dir=parent)
+    staging = None
+    lease_fd = None
     committed = False
     try:
+        # Create the staging and lock its sentinel under the parent
+        # directory's flock, which is exactly the lock a sweep holds
+        # while scanning: a sweep therefore never sees a staging that
+        # exists but is not yet recognisably alive.
+        with _DirectoryChainLock(parent):
+            staging = tempfile.mkdtemp(prefix=staging_prefix, dir=parent)
+            _fork_staging_register(staging)
+            lease_fd = _acquire_staging_lease(staging)
         for index in range(fork_point + 1):
             os.link(
                 os.path.join(source, _segment_name(index)),
@@ -2817,9 +2956,15 @@ def _materialize_fork(source, target, parent, staging_prefix, fork_point):
         os.rename(staging, target)
         committed = True
         _fsync_directory(parent)
+        # The sentinel's work is done; a kill before this unlink leaves
+        # it as debris the next open of the chain reclaims.
+        _unlink_quietly(os.path.join(target, _STAGING_LOCK_NAME))
     finally:
+        if staging is not None:
+            _release_staging_lease(lease_fd, staging)
         if not committed:
-            _remove_tree_quietly(staging)
+            if staging is not None:
+                _remove_tree_quietly(staging)
 
 
 def _remove_tree_quietly(directory):
@@ -2861,6 +3006,322 @@ def fork_chain_memory(store, up_to=None):
             branch._objects[name] = store._objects[name]
         branch._objects[_HEAD_NAME] = str(fork_point).encode("ascii")
     return branch
+
+
+# ---------------------------------------------------------------------------
+# Branch deletion and deterministic reachability cleanup
+#
+# Deleting a branch chain removes exactly that chain's references: its
+# directory, its head and the delta segments it alone owned.  The
+# directory is renamed aside in one directory-entry change and only then
+# emptied, so the family observes either the complete branch or none of
+# it -- never a half one -- and a shared segment's bytes are reclaimed by
+# the filesystem exactly when the last chain whose head can reach them
+# lets go.
+#
+# Reclamation is a pure function of reachability, so it is idempotent:
+# sweeping again changes nothing and advances no chain's state.  Two
+# kinds of crash residue are swept deterministically on the next fork,
+# compaction or deletion (never on a plain load or verify):
+#
+# * staging directories a killed fork or delete left behind in the family
+#   directory (``.seqfork.tmp-*`` / ``.seqdel.tmp-*``) -- a fork staging
+#   dir is removed only when the flock sentinel its creator holds is
+#   free, so a fork still populating its staging area is never disturbed;
+# * segment files no head can reach -- an index greater than the head,
+#   left when a process was killed between the segment write and the head
+#   advance -- plus crash debris carrying the temp-file prefix.
+# ---------------------------------------------------------------------------
+
+
+_STAGING_LOCK_NAME = ".seqstag.lock"
+
+_fork_stagings_guard = threading.Lock()
+_active_fork_stagings: set[str] = set()
+
+
+def _fork_staging_register(directory):
+    with _fork_stagings_guard:
+        _active_fork_stagings.add(os.path.abspath(directory))
+
+
+def _fork_staging_release(directory):
+    with _fork_stagings_guard:
+        _active_fork_stagings.discard(os.path.abspath(directory))
+
+
+def _acquire_staging_lease(staging):
+    """Create the staging sentinel and hold an exclusive flock on it.
+
+    The sentinel exists for the whole population window, so a sweeper can
+    tell a fork killed mid-linking (lock free) from a live one (lock
+    held).  Returns the locked fd (on platforms without ``fcntl`` only
+    the in-process registry guards the staging).
+    """
+    fd = os.open(
+        os.path.join(staging, _STAGING_LOCK_NAME),
+        os.O_RDWR | os.O_CREAT,
+        0o644,
+    )
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def _release_staging_lease(fd, staging):
+    _fork_staging_release(staging)
+    if not fd:
+        return
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(fd)
+
+
+def _staging_dir_is_live(staging):
+    """Whether a fork staging directory belongs to a still-running fork."""
+    with _fork_stagings_guard:
+        if os.path.abspath(staging) in _active_fork_stagings:
+            return True
+    sentinel = os.path.join(staging, _STAGING_LOCK_NAME)
+    if fcntl is None or not os.path.exists(sentinel):
+        return False
+    try:
+        fd = os.open(sentinel, os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                return True
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return False
+    finally:
+        os.close(fd)
+
+
+def _sweep_parent_staging(parent):
+    """Remove killed fork/delete staging directories in *parent*.
+
+    Garbage collection only: a directory still owned by a live fork is
+    skipped and operating-system failures never reach the caller.  A
+    delete staging directory is always detached (the rename is its only
+    creation step), so it needs no liveness check.  The scan runs under
+    the parent directory's advisory flock, which is the same lock a fork
+    holds while creating its staging and locking its sentinel, so a
+    staging is either not there yet or already recognisably alive --
+    there is no window in which a half-created live staging can be
+    swept.
+    """
+    with _DirectoryChainLock(parent):
+        try:
+            names = os.listdir(parent)
+        except OSError:
+            return
+        removed = False
+        for name in names:
+            if name.startswith(_FORK_TMP_PREFIX):
+                path = os.path.join(parent, name)
+                if not os.path.isdir(path):
+                    _unlink_quietly(path)
+                    removed = True
+                elif not _staging_dir_is_live(path):
+                    _remove_tree_quietly(path)
+                    removed = True
+            elif name.startswith(_DELETE_TMP_PREFIX):
+                path = os.path.join(parent, name)
+                if os.path.isdir(path):
+                    _remove_tree_quietly(path)
+                else:
+                    _unlink_quietly(path)
+                removed = True
+        if removed:
+            _fsync_directory(parent)
+
+
+def _sweep_chain_debris(directory, head):
+    """Drop temp-file residue and segments no head of *directory* reaches.
+
+    Runs under the directory lock and only when no compaction marker is in
+    force, so every ``seg-*`` slot beyond *head* is unreachable crash
+    residue (a converted compaction tail always lands at or below the
+    head).  Pure reachability: idempotent, writes nothing into the chain
+    and advances no chain's state.
+    """
+    changed = False
+    for name in list(os.listdir(directory)):
+        path = os.path.join(directory, name)
+        index = _segment_index(name)
+        unreachable = index is not None and head is not None and index > head
+        if unreachable or name.startswith(_TMP_PREFIX):
+            _unlink_quietly(path)
+            changed = True
+    if changed:
+        _fsync_directory(directory)
+
+
+def _validate_reachable_chain(store, head):
+    """Walk the whole reachable chain, like a load, for delete validation.
+
+    A missing referenced segment -- with the directory itself present --
+    is an unparseable chain structure and therefore a ``ValueError``, not
+    the ``FileNotFoundError`` a missing chain directory gets.
+    """
+    try:
+        _load_chain_store(store, head)
+    except FileNotFoundError as exc:
+        raise CheckpointError(
+            "chain is missing a segment its head reaches; the chain "
+            "structure is unparseable"
+        ) from exc
+
+
+def delete_chain(directory):
+    """Delete one branch chain directory from a chain family.
+
+    The directory, its ``head`` and the incremental segments it alone
+    owned are removed.  Shared segments are dropped by reachability only:
+    the filesystem keeps their bytes while any chain's head can still
+    reach them (hard links from a forked branch hold them), and reclaims
+    them exactly when the last reference goes.  The directory is renamed
+    aside in one directory-entry change and then emptied, so concurrent
+    forks and compactions on the family always observe either the
+    complete branch or no branch at all, and every surviving chain stays
+    one complete state.
+
+    Staging directories of killed forks/deletes and segments no head can
+    reach are swept deterministically as part of the deletion; the sweep
+    is a pure reachability function -- repeating it changes nothing and
+    advances no chain's optimizer state.
+
+    A *directory* path that does not exist (including a chain already
+    deleted) raises ``FileNotFoundError`` and leaves every other chain
+    untouched.  A directory that exists but has no ``head``, or holds a
+    chain that cannot be parsed (a corrupt, truncated, missing,
+    out-of-order or shape-inconsistent reachable segment), raises
+    ``ValueError`` and removes not a single shared segment.  An
+    unwritable directory/parent or a full disk raises ``OSError``; a
+    teardown interrupted at that point leaves only whole segment files in
+    a detached staging directory, which the next fork, compaction or
+    deletion reclaims -- never a half-written segment.
+    """
+    if not isinstance(directory, (str, os.PathLike)):
+        raise TypeError("chain directory must be a path")
+    directory = os.path.abspath(os.fspath(directory))
+    if not os.path.isdir(directory):
+        raise FileNotFoundError(
+            f"incremental checkpoint directory not found: {directory!r}"
+        )
+    parent = os.path.dirname(directory)
+    # Deterministic GC: staging directories killed forks/deletes left in
+    # the family directory are reclaimed on every deletion.
+    _sweep_parent_staging(parent)
+
+    # Wait out a live fold exactly like fork: deletion must not race the
+    # marker protocol, and a dead fold is rolled forward first.
+    while True:
+        with _DirectoryChainLock(directory):
+            store = _DirectoryChainStore(directory)
+            _recover_directory_chain(directory, store)
+            if _marker_exists(directory):
+                contended = True
+            else:
+                contended = False
+                head = _read_head_optional(store)
+                if head is None:
+                    raise CheckpointError(
+                        "chain has no head pointer (no basis segment committed)"
+                    )
+                # Validate the whole reachable chain before anything moves;
+                # only then may crash residue be swept (unreachable files
+                # only -- no reachable shared segment is ever touched).
+                _validate_reachable_chain(store, head)
+                _sweep_chain_debris(directory, head)
+
+                # Reserve the detached name before touching the chain: an
+                # unwritable parent fails here, with the chain intact.
+                staging = tempfile.mkdtemp(
+                    prefix=_DELETE_TMP_PREFIX
+                    + os.path.basename(directory)
+                    + "-",
+                    dir=parent,
+                )
+                os.rmdir(staging)
+                try:
+                    os.rename(directory, staging)
+                except FileNotFoundError:
+                    # Another deleter won between the check and the rename.
+                    raise FileNotFoundError(
+                        f"incremental checkpoint directory not found: {directory!r}"
+                    ) from None
+                _fsync_directory(parent)
+                _empty_and_remove(staging)
+                _fsync_directory(parent)
+        if not contended:
+            return None
+        _wait_for_live_marker(directory)
+
+
+def _empty_and_remove(directory):
+    """Unlink every entry of a detached chain dir and remove the dir.
+
+    Only whole files are removed (segment files are immutable), so an
+    interrupted teardown never leaves a half segment; whatever remains is
+    detached residue the next family operation sweeps.  Permission or I/O
+    failures propagate as ``OSError``.  A concurrent sweep may reclaim
+    the same detached directory; that cooperation is not an error.
+    """
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return
+    for name in names:
+        path = os.path.join(directory, name)
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                _empty_and_remove(path)
+            else:
+                os.unlink(path)
+        except FileNotFoundError:
+            pass
+    try:
+        os.rmdir(directory)
+    except FileNotFoundError:
+        pass
+
+
+def delete_chain_memory(store):
+    """Delete an in-memory chain; same semantics as :func:`delete_chain`.
+
+    Drops the head pointer and every segment the store held in one
+    critical section, so a concurrent observer never sees a partial
+    chain.  The emptied store can be reused: its next save writes a
+    fresh basis.
+    """
+    if not isinstance(store, MemoryChain):
+        raise TypeError("store must be a MemoryChain")
+    with store._lock:
+        head = _read_head_optional(store)
+        if head is None:
+            raise CheckpointError(
+                "chain has no head pointer (no basis segment committed)"
+            )
+        _validate_reachable_chain(store, head)
+        store.remove_head()
+        for name in list(store._objects):
+            if _segment_index(name) is not None:
+                del store._objects[name]
+    return None
 
 
 # ---------------------------------------------------------------------------
