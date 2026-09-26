@@ -9,7 +9,8 @@ Public interface (see README.md):
   (bounded-memory activation recomputation), ``save`` / ``load``
   (versioned atomic checkpoints to a path, a chain directory, a
   ``MemoryChain`` or a bytearray), ``compact`` (streaming in-place,
-  crash-safe compaction of an incremental checkpoint chain), ``fork``
+  crash-safe compaction of one incremental checkpoint chain, or a single
+  family-wide fold over a list of member chains), ``fork``
   (deriving a branch chain that shares the source chain's prefix
   segments and then evolves independently), ``delete`` (removing a
   branch chain and deterministically reclaiming the segments no

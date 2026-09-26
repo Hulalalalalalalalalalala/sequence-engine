@@ -2588,6 +2588,175 @@ def _check_concurrent_adam_saves_loads():
     _check(errors == [], f"concurrent adam run raised: {errors!r}")
 
 
+def _check_family_compaction_memory():
+    # One family-level fold collapses the prefix shared by every member
+    # into a single basis segment referenced by all of them, while each
+    # member's member-owned tail follows it byte for byte unchanged.
+    seq, _ = _fresh_stack()
+    main = _checkpoint.MemoryChain()
+    seq.save(main)  # seg 0 (basis, no hidden)
+    out, hidden = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out))
+    seq.update(_LR)
+    seq.save(main)  # seg 1 (hidden introduced)
+    seq.adam_step(_ADAM_LR)
+    seq.save(main)  # seg 2
+    seq.update(_LR)
+    seq.save(main)  # seg 3
+    seq.adam_step(_ADAM_LR)
+    seq.save(main)  # seg 4
+    main_state = _checkpoint.build_bytes(
+        _checkpoint.load_chain_memory(main)
+    )
+    main_t = _checkpoint.load_chain_memory(main)["optim"]["t"]
+
+    b1 = _checkpoint.fork_chain_memory(main, up_to=3)
+    b1_seq, _ = _fresh_stack()
+    b1_hidden = b1_seq.load(b1)
+    o, b1_hidden = b1_seq.forward(Tensor(_SEG2), b1_hidden)
+    b1_seq.backward(_total(o))
+    b1_seq.adam_step(_ADAM_LR)
+    b1_seq.save(b1)  # b1-owned seg 4
+    b2 = _checkpoint.fork_chain_memory(main, up_to=2)
+    b1_state = _checkpoint.build_bytes(_checkpoint.load_chain_memory(b1))
+    b2_state = _checkpoint.build_bytes(_checkpoint.load_chain_memory(b2))
+    b1_t = _checkpoint.load_chain_memory(b1)["optim"]["t"]
+    b2_t = _checkpoint.load_chain_memory(b2)["optim"]["t"]
+
+    # The common shared prefix is 0..2 (b2's fork point).
+    _checkpoint.compact_family_memory([main, b1, b2])
+
+    for chain, state in (
+        (main, main_state),
+        (b1, b1_state),
+        (b2, b2_state),
+    ):
+        _check(
+            _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+            == state,
+            "family compaction preserves every member's state bit for bit",
+        )
+    _check(main.read_head() == b"2", "main head renumbers onto the new basis")
+    _check(b1.read_head() == b"2", "branch 1 head renumbers onto the new basis")
+    _check(b2.read_head() == b"0", "branch 2 folds fully to the new basis")
+    # One shared basis object across the whole family.
+    basis_name = _checkpoint._segment_name(0)
+    _check(
+        main._objects[basis_name]
+        is b1._objects[basis_name]
+        is b2._objects[basis_name],
+        "family compaction keeps one shared basis object",
+    )
+    # Member-owned tails stay distinct.
+    _check(
+        main._objects[_checkpoint._segment_name(2)]
+        is not b1._objects[_checkpoint._segment_name(2)],
+        "member-owned tail segments stay private to their chains",
+    )
+    # No optimizer step moves for any member.
+    _check(
+        _checkpoint.load_chain_memory(main)["optim"]["t"] == main_t
+        and _checkpoint.load_chain_memory(b1)["optim"]["t"] == b1_t
+        and _checkpoint.load_chain_memory(b2)["optim"]["t"] == b2_t,
+        "family compaction advances no member's optimizer step count",
+    )
+    # Every member verifies and together they form a sound family.
+    for chain in (main, b1, b2):
+        _check(_checkpoint.verify_chain_memory(chain).ok, "member verifies")
+
+    # Repeating the same fold is a deterministic no-op.
+    for chain, state in (
+        (main, main_state),
+        (b1, b1_state),
+        (b2, b2_state),
+    ):
+        before = dict(chain._objects)
+    _checkpoint.compact_family_memory([main, b1, b2])
+    for chain, state in (
+        (main, main_state),
+        (b1, b1_state),
+        (b2, b2_state),
+    ):
+        _check(
+            _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+            == state,
+            "repeated family compaction changes nothing",
+        )
+
+    # A family whose members already diverged (no common prefix beyond
+    # the basis) is left as it was.
+    c1 = _checkpoint.MemoryChain()
+    c2 = _checkpoint.MemoryChain()
+    a_seq, _ = _fresh_stack()
+    a_seq.save(c1)
+    b_seq, _ = _fresh_stack()
+    b_seq.zero_grad()
+    b_seq.save(c2)
+    a_state = _checkpoint.build_bytes(_checkpoint.load_chain_memory(c1))
+    b_state = _checkpoint.build_bytes(_checkpoint.load_chain_memory(c2))
+    _checkpoint.compact_family_memory([c1, c2])
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(c1)) == a_state
+        and _checkpoint.build_bytes(_checkpoint.load_chain_memory(c2))
+        == b_state,
+        "a family with no foldable prefix is left unchanged",
+    )
+
+    # Error taxonomy.
+    _expect(
+        TypeError,
+        lambda: _checkpoint.compact_family_memory(main),
+        "a bare MemoryChain is not a family",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.compact_family_memory([]),
+        "an empty family is rejected",
+    )
+    _expect(
+        TypeError,
+        lambda: _checkpoint.compact_family_memory([main, object()]),
+        "a non-MemoryChain member is rejected",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.compact_family_memory([main, main]),
+        "a duplicated member is rejected",
+    )
+    # Members whose parameter shapes disagree are rejected wholesale.
+    other_weights = _base_weights()
+    other_weights["b1"] = [0.01, -0.02]
+    shaped = _checkpoint.MemoryChain()
+    other_seq, _ = _fresh_stack(other_weights)
+    other_seq.save(shaped)
+    saved_main = dict(main._objects)
+    _expect(
+        ValueError,
+        lambda: _checkpoint.compact_family_memory([main, shaped]),
+        "shape-inconsistent members refuse a family fold",
+    )
+    _check(
+        dict(main._objects) == saved_main,
+        "a rejected family fold leaves its members untouched",
+    )
+    # The container-level entry point folds memory families too.
+    via_seq, _ = _fresh_stack()
+    _check(
+        via_seq.compact([main, b1, b2]) is None,
+        "Sequential.compact folds a memory family",
+    )
+    _expect(
+        ValueError,
+        lambda: via_seq.compact([main, b1, b2], up_to=1),
+        "a family fold takes no up_to",
+    )
+    _expect(
+        TypeError,
+        lambda: via_seq.compact([main, bytearray()]),
+        "a mixed family is rejected",
+    )
+
+
 _GROUPS = [
     ("tensor basics", _check_tensor_basics),
     ("tensor validation", _check_tensor_validation),
@@ -2614,6 +2783,7 @@ _GROUPS = [
     ("in-memory chain fork", _check_chain_fork_memory),
     ("in-memory chain delete", _check_chain_delete_memory),
     ("in-memory chain merge", _check_chain_merge_memory),
+    ("in-memory family compaction", _check_family_compaction_memory),
     ("streaming compaction interleave", _check_streaming_compaction_interleaves),
     ("chain verification", _check_chain_verification),
     ("backward replay failure surfaced", _check_backward_replay_failure_is_surfaced),

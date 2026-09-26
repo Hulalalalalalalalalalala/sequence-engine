@@ -116,7 +116,22 @@ checkpoint path) and writes no files.
   `FileNotFoundError`, an unwritable directory or a full disk raises
   `OSError`, and any corrupt, truncated or shape-inconsistent segment
   rejects the whole compaction with `ValueError` before anything is
-  written.
+  written. Passing a list of chain directories (or `MemoryChain`s)
+  instead of one chain performs the family-level fold (`up_to` is not
+  accepted): the prefix segments all members reach through the same
+  shared files are merged into one new basis segment stored once and
+  shared by every member, each member's head moves to the new history
+  and its member-owned tail follows it, and every member's reassembled
+  state is bit for bit unchanged with no optimizer step advanced. The
+  family fold is idempotent, leaves a family with no foldable prefix as
+  it was, and a killed fold leaves every member loadable with the
+  residue reclaimed by the next family operation. A missing member
+  directory or referenced segment raises `FileNotFoundError` without
+  touching the other members; truncated, missing-field or out-of-order
+  segments or members whose shapes/layer order disagree reject the whole
+  family fold with `ValueError` (naming the disagreeing shapes and
+  layer order); an unwritable directory or a full disk raises
+  `OSError`.
 - `Sequential.fork(source, target, up_to=None) -> None` derives a branch
   chain from an existing incremental checkpoint chain at segment `up_to`
   (the source chain's current head when omitted). The branch chain
@@ -287,6 +302,29 @@ through rather than waited on), a compaction killed at any point is
 completed by the next open, and `head` always points at one complete
 chain. Peak disk usage stays within the original chain plus the single
 new basis segment.
+
+A whole chain family is compacted in one call too: `Sequential.compact`
+(or `checkpoint.compact_family`) takes the sequence of member chain
+directories and folds the prefix segments every member reaches through
+the same shared files (the hard-linked fork prefix) into one new basis
+segment stored once and shared by every member. Each member's head is
+advanced to that new history while the tail segments it alone owned
+follow the new basis in their original order, so the state every member
+reassembles -- parameters, gradients, optimizer state and hidden state
+-- is bit for bit unchanged and no member's optimizer step moves. The
+segment count drops deterministically by exactly the folded range,
+repeating the same family fold is a no-op, and a family with no
+foldable prefix is left as it was. Each member runs the same streaming,
+crash-safe fold a single-chain compaction uses (saves, loads and
+incremental appends keep flowing and no member is ever observed as half
+a chain); the family fold is serialised against single-chain
+compactions, forks, merges and deletions by the directory locks and
+leases. Hard-killed mid-fold, each member still loads one complete
+state -- its own interrupted fold rolls forward on the next open -- and
+the next family operation finishes the fold and reclaims the residue,
+neither deleting a reachable shared segment nor leaking an unreachable
+one. `checkpoint.compact_family_memory` provides the same family fold for
+`MemoryChain` stores.
 
 `Sequential.fork` (or `checkpoint.fork_chain`) turns one chain into a
 chain family: the branch directory shares the segments up to the fork

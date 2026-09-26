@@ -119,9 +119,13 @@ class Sequential:
       parameters, accumulated gradients, optimizer state and
       slice-boundary hidden state, to a filesystem path, an
       incremental-chain directory or to an in-memory ``bytearray``.
-    * ``compact(target, up_to=None)`` -- folds an incremental chain's
+    * ``compact(target, up_to=None)`` -- folds one incremental chain's
       basis and a prefix of its deltas into one new basis segment,
-      crash-safely; the reassembled state is bit for bit unchanged.
+      crash-safely; the reassembled state is bit for bit unchanged.  With
+      a list of chain directories (or ``MemoryChain`` stores) it
+      performs one family-level fold: the prefix shared by every member
+      becomes a single new basis segment shared by them all and each
+      member's own tail follows it.
     * ``fork(source, target, up_to=None)`` -- derives a branch chain
       sharing the source chain's segments up to the fork point; each
       chain then maintains only its own head and appended deltas, and
@@ -692,36 +696,61 @@ class Sequential:
             return [Tensor(slot.tolist()) for slot in new_hidden]
 
     def compact(self, target, up_to=None):
-        """Compact an incremental checkpoint chain in place.
+        """Compact an incremental checkpoint chain (or a whole family) in place.
 
-        *target* is an existing chain directory or a ``MemoryChain``.  The
-        basis segment and the deltas through *up_to* (the current head
-        when omitted) are folded into one new basis segment and the
-        remaining deltas are renumbered after it.  The state the chain
-        reassembles to -- parameters, gradients, optimizer moments and
-        step count, hidden state -- is bit for bit identical before and
-        after, and compaction advances no optimizer step; only the
-        segment count changes, decreasing deterministically by the merged
-        range.  Repeating the same compaction is a no-op, as is a chain
-        with nothing to merge.  Old-version segments participate exactly
-        as on load and the compacted chain is rewritten in the current
-        format version.
+        *target* is an existing chain directory, a ``MemoryChain``, or a
+        sequence of chain directories (a chain family) / ``MemoryChain``
+        stores.  For one chain the basis segment and the deltas through
+        *up_to* (the current head when omitted) are folded into one new
+        basis segment and the remaining deltas are renumbered after it.
+        For a family, *up_to* is not accepted: the prefix segments every
+        member reaches through the same shared files are folded in one
+        call into a single new basis segment shared by every member; each
+        member's member-owned tail follows it unchanged.  In both cases
+        the state a chain reassembles to -- parameters, gradients,
+        optimizer moments and step count, hidden state -- is bit for bit
+        identical before and after, and the fold advances no optimizer
+        step; only the segment count changes, dropping deterministically
+        by exactly the folded range.  Repeating the same fold is a
+        no-op, as is a chain with nothing to merge.  Old-version
+        segments participate exactly as on load and the compacted chain
+        is rewritten in the current format version.
 
-        A process killed mid-compaction leaves either the old or the new
-        head reachable; the next open of the chain finishes the
-        roll-forward, so the directory always holds one complete chain.
-        A missing directory raises ``FileNotFoundError``, an unwritable
-        directory or a full disk raises ``OSError``, and any corrupt or
-        inconsistent segment rejects the whole compaction with
-        ``ValueError`` before anything is written.
+        A process killed mid-fold leaves either the old or the new head
+        reachable for every member; the next open of a member finishes
+        its own roll-forward and the next family operation reclaims the
+        residue, so every directory always holds one complete chain.  A
+        missing directory raises ``FileNotFoundError``, an unwritable
+        directory or a full disk raises ``OSError``, and any corrupt,
+        truncated, out-of-order or shape/layer-order-inconsistent
+        segment (or, for a family, members whose shapes or layer order
+        disagree) rejects the whole fold with ``ValueError`` before
+        anything is written.
         """
         with self._lock:
+            if isinstance(target, (list, tuple)):
+                if up_to is not None:
+                    raise ValueError(
+                        "a family compaction takes no up_to: it folds the "
+                        "prefix shared by every member"
+                    )
+                if all(isinstance(member, _checkpoint.MemoryChain) for member in target):
+                    return _checkpoint.compact_family_memory(list(target))
+                if all(isinstance(member, (str, os.PathLike)) for member in target):
+                    return _checkpoint.compact_family(
+                        [os.fspath(member) for member in target]
+                    )
+                raise TypeError(
+                    "a family compaction needs a sequence of chain "
+                    "directories or a sequence of MemoryChains"
+                )
             if isinstance(target, _checkpoint.MemoryChain):
                 return _checkpoint.compact_chain_memory(target, up_to)
             if isinstance(target, (str, os.PathLike)):
                 return _checkpoint.compact_chain(target, up_to)
             raise TypeError(
-                "compact target must be a chain directory or a MemoryChain"
+                "compact target must be a chain directory, a MemoryChain, "
+                "or a sequence of either"
             )
 
     def fork(self, source, target=None, up_to=None):
