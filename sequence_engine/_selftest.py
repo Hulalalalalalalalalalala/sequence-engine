@@ -2346,6 +2346,226 @@ def _check_chain_merge_memory():
     )
 
 
+def _check_chain_family_compaction_memory():
+    # Folding a whole family folds exactly the prefix every member's head
+    # reaches into one new basis; every member keeps its own tail and
+    # reassembles bit for bit unchanged.
+    seq, _ = _fresh_stack()
+    main = _checkpoint.MemoryChain()
+    seq.save(main)  # seg 0
+    out, _ = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out))
+    seq.update(_LR)
+    seq.save(main)  # seg 1
+    seq.adam_step(_ADAM_LR)
+    seq.save(main)  # seg 2
+    seq.update(_LR)
+    seq.save(main)  # seg 3
+    seq.adam_step(_ADAM_LR)
+    seq.save(main)  # seg 4
+
+    branch_a = _checkpoint.fork_chain_memory(main, up_to=3)
+    branch_b = _checkpoint.fork_chain_memory(main, up_to=1)
+
+    # The branches diverge on their own from different fork points.
+    a_seq, _ = _fresh_stack()
+    a_hidden = a_seq.load(branch_a)
+    out, a_hidden = a_seq.forward(Tensor(_SEG2), a_hidden)
+    a_seq.backward(_total(out))
+    a_seq.adam_step(_ADAM_LR)
+    a_seq.save(branch_a)  # branch_a seg 4
+    b_seq, _ = _fresh_stack()
+    b_hidden = b_seq.load(branch_b)
+    out, b_hidden = b_seq.forward(Tensor(_SEG1), b_hidden)
+    b_seq.backward(_total(out))
+    b_seq.update(_LR)
+    b_seq.save(branch_b)  # branch_b seg 2
+    out, b_hidden = b_seq.forward(Tensor(_SEG2), b_hidden)
+    b_seq.backward(_total(out))
+    b_seq.adam_step(_ADAM_LR)
+    b_seq.save(branch_b)  # branch_b seg 3
+
+    family = [main, branch_a, branch_b]
+    states_before = [
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(member))
+        for member in family
+    ]
+    heads_before = [int(member.read_head()) for member in family]
+    steps_before = [
+        _checkpoint.load_chain_memory(member)["optim"]["t"] for member in family
+    ]
+    # The longest common delta prefix is segment 1 (branch_b forks at 1;
+    # its segment 2 differs from main's).
+    _checkpoint.compact_family_memory(family)
+
+    heads_after = [int(member.read_head()) for member in family]
+    _check(
+        heads_after == [head - 1 for head in heads_before],
+        "family compaction shrinks every member's segment count by the fold",
+    )
+    states_after = [
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(member))
+        for member in family
+    ]
+    _check(
+        states_after == states_before,
+        "every member reassembles bit for bit unchanged after family compaction",
+    )
+    steps_after = [
+        _checkpoint.load_chain_memory(member)["optim"]["t"] for member in family
+    ]
+    _check(
+        steps_after == steps_before,
+        "family compaction advances no member's optimizer step",
+    )
+    # The new basis is the single shared object every member starts from.
+    basis = family[0].read_segment(_checkpoint._segment_name(0))
+    _check(
+        all(member.read_segment(_checkpoint._segment_name(0)) is basis for member in family[1:]),
+        "the folded basis is shared once across every member",
+    )
+    # Member-exclusive tails are untouched in content (renumbered only).
+    _check(
+        all(
+            _checkpoint.verify_chain_memory(member).ok for member in family
+        ),
+        "every folded member verifies",
+    )
+
+    # Repeating the same family fold is a deterministic no-op: the common
+    # range is now just the basis, so nothing folds and nothing changes.
+    _checkpoint.compact_family_memory(family)
+    _check(
+        [int(member.read_head()) for member in family] == heads_after,
+        "repeating a family compaction changes nothing",
+    )
+    _check(
+        [
+            _checkpoint.build_bytes(_checkpoint.load_chain_memory(member))
+            for member in family
+        ]
+        == states_after,
+        "a repeated family compaction keeps every state exactly the same",
+    )
+
+    # Each member keeps appending independently onto its folded chain.
+    a_seq.update(_LR)
+    a_seq.save(branch_a)
+    b_seq.update(_LR)
+    b_seq.save(branch_b)
+    seq.update(_LR)
+    seq.save(main)
+    _check(
+        all(
+            _checkpoint.verify_chain_memory(member).ok for member in family
+        ),
+        "members append independently after a family compaction",
+    )
+
+    # A family whose members never share a delta (fork at the basis) folds
+    # nothing and is left exactly as it was.
+    root = _checkpoint.MemoryChain()
+    r_seq, _ = _fresh_stack()
+    r_seq.save(root)
+    out, _ = r_seq.forward(Tensor(_SEG1))
+    r_seq.backward(_total(out))
+    r_seq.update(_LR)
+    r_seq.save(root)
+    twin = _checkpoint.fork_chain_memory(root, up_to=0)
+    t_seq, _ = _fresh_stack()
+    t_hidden = t_seq.load(twin)
+    out, t_hidden = t_seq.forward(Tensor(_SEG2), t_hidden)
+    t_seq.backward(_total(out))
+    t_seq.adam_step(_ADAM_LR)
+    t_seq.save(twin)
+    root_snapshot = sorted(root._objects.items())
+    twin_snapshot = sorted(twin._objects.items())
+    _checkpoint.compact_family_memory([root, twin])
+    _check(
+        sorted(root._objects.items()) == root_snapshot
+        and sorted(twin._objects.items()) == twin_snapshot,
+        "a family without a shared delta is left byte for byte untouched",
+    )
+
+    # An unstepped family keeps t = 0 through the fold.
+    unstepped = _checkpoint.MemoryChain()
+    u_seq, _ = _fresh_stack()
+    u_seq.save(unstepped)
+    out, _ = u_seq.forward(Tensor(_SEG1))
+    u_seq.backward(_total(out))
+    u_seq.update(_LR)
+    u_seq.save(unstepped)
+    u_branch = _checkpoint.fork_chain_memory(unstepped, up_to=1)
+    _checkpoint.compact_family_memory([unstepped, u_branch])
+    _check(
+        _checkpoint.load_chain_memory(unstepped)["optim"]["t"] == 0
+        and _checkpoint.load_chain_memory(u_branch)["optim"]["t"] == 0,
+        "an unstepped family stays at t = 0 through a family compaction",
+    )
+
+    # Error taxonomy.
+    _expect(
+        ValueError,
+        lambda: _checkpoint.compact_family_memory([]),
+        "an empty family is rejected",
+    )
+    _expect(
+        TypeError,
+        lambda: _checkpoint.compact_family_memory(unstepped),
+        "a bare chain is not a family",
+    )
+    _expect(
+        TypeError,
+        lambda: _checkpoint.compact_family_memory([unstepped, object()]),
+        "a family needs MemoryChain members",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.compact_family_memory([main, main]),
+        "listing the same member twice is rejected",
+    )
+    # Members with incompatible parameter shapes reject the whole fold.
+    other_weights = _base_weights()
+    other_weights["b1"] = [0.01, -0.02]  # shape [2] instead of [3]
+    shaped_seq, _ = _fresh_stack(other_weights)
+    shaped = _checkpoint.MemoryChain()
+    shaped_seq.save(shaped)
+    saved_objects = dict(main._objects)
+    saved_head = main.read_head()
+    try:
+        _checkpoint.compact_family_memory([main, shaped])
+    except ValueError as exc:
+        _check(
+            "parameter shapes" in str(exc) and "do not match" in str(exc),
+            f"a shape disagreement names the shapes: {exc}",
+        )
+    else:
+        raise _SelfTestFailure("incompatible family members must be rejected")
+    _check(
+        main.read_head() == saved_head and dict(main._objects) == saved_objects,
+        "a rejected family compaction moves no member byte",
+    )
+
+    # The container-level entry point folds a list of memory chains.
+    via_seq, _ = _fresh_stack()
+    c0 = _checkpoint.MemoryChain()
+    via_seq.save(c0)
+    via_seq.update(_LR)
+    via_seq.save(c0)
+    c1 = _checkpoint.fork_chain_memory(c0, up_to=1)
+    via_seq.compact_family([c0, c1])
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(c0))
+        == _checkpoint.build_bytes(_checkpoint.load_chain_memory(c1)),
+        "Sequential.compact_family folds a list of memory chains",
+    )
+    _expect(
+        TypeError,
+        lambda: via_seq.compact_family(c0),
+        "compact_family rejects a non-sequence argument",
+    )
+
+
 def _check_streaming_compaction_interleaves():
     # The streaming fold keeps working through concurrent appends and
     # reads: a compactor, an appender and readers run at once against one
@@ -2614,6 +2834,7 @@ _GROUPS = [
     ("in-memory chain fork", _check_chain_fork_memory),
     ("in-memory chain delete", _check_chain_delete_memory),
     ("in-memory chain merge", _check_chain_merge_memory),
+    ("in-memory chain family compaction", _check_chain_family_compaction_memory),
     ("streaming compaction interleave", _check_streaming_compaction_interleaves),
     ("chain verification", _check_chain_verification),
     ("backward replay failure surfaced", _check_backward_replay_failure_is_surfaced),

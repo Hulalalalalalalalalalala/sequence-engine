@@ -122,6 +122,10 @@ class Sequential:
     * ``compact(target, up_to=None)`` -- folds an incremental chain's
       basis and a prefix of its deltas into one new basis segment,
       crash-safely; the reassembled state is bit for bit unchanged.
+    * ``compact_family(members)`` -- folds the common history prefix of a
+      whole chain family into one new, still-shared basis segment in a
+      single call; every member keeps its own tail and reassembles bit
+      for bit unchanged, and the fold advances no optimizer step.
     * ``fork(source, target, up_to=None)`` -- derives a branch chain
       sharing the source chain's segments up to the fork point; each
       chain then maintains only its own head and appended deltas, and
@@ -722,6 +726,63 @@ class Sequential:
                 return _checkpoint.compact_chain(target, up_to)
             raise TypeError(
                 "compact target must be a chain directory or a MemoryChain"
+            )
+
+    def compact_family(self, members):
+        """Fold the common history prefix of a whole chain family into one
+        new basis segment.
+
+        *members* is a non-empty sequence naming every member of one chain
+        family -- chain directories in one list, or ``MemoryChain`` stores
+        in one list (the two backends are not mixed).  The basis and the
+        delta prefix every member's head reaches (the segments physically
+        shared after the forks) are folded into one new basis segment, and
+        every member's ``head`` then names the folded chain: the common
+        basis followed by that member's own, untouched tail deltas.  The
+        folded basis is stored once (hard-linked across member
+        directories, exactly like the prefix it replaces) and each member
+        releases only its own old prefix entries, so shared segments are
+        reclaimed by reachability exactly when no member can reach them.
+
+        Each member's reassembled parameters, gradients, optimizer moments
+        and step count and hidden state are bit for bit identical before
+        and after; the fold advances no member's optimizer step and keeps
+        both the ``t = 0`` and the stepped-chain semantics.  Every member's
+        segment count drops deterministically by exactly the folded range;
+        repeating the fold on the same range changes nothing (it then finds
+        nothing to fold), and a family without a foldable prefix is left
+        exactly as it was.  Saves, loads and appends proceed throughout
+        without any member ever appearing as half a chain; a process
+        killed midway leaves every member loadable and the next family
+        operation reclaims the residue deterministically, serialised
+        against forks, merges, deletions and single-chain compactions.
+
+        A missing member directory or a referenced segment that is absent
+        raises ``FileNotFoundError`` and leaves the other members
+        untouched.  A truncated segment, a missing field, an out-of-order
+        segment, or members whose parameter shapes or layer order disagree
+        rejects the whole fold with ``ValueError`` (the message names the
+        mismatching shapes and layer order) before one member byte moves.
+        An unwritable directory or a full disk raises ``OSError``.
+        """
+        with self._lock:
+            if isinstance(members, (str, bytes, os.PathLike)):
+                raise TypeError(
+                    "compact_family members must be a list of chain "
+                    "directories or a list of MemoryChains"
+                )
+            members = list(members)
+            if not members:
+                return _checkpoint.compact_family(members)
+            if all(isinstance(member, _checkpoint.MemoryChain) for member in members):
+                return _checkpoint.compact_family_memory(members)
+            if all(
+                isinstance(member, (str, os.PathLike)) for member in members
+            ):
+                return _checkpoint.compact_family(members)
+            raise TypeError(
+                "compact_family members must all be chain directories or "
+                "all MemoryChains"
             )
 
     def fork(self, source, target=None, up_to=None):

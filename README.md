@@ -117,6 +117,37 @@ checkpoint path) and writes no files.
   `OSError`, and any corrupt, truncated or shape-inconsistent segment
   rejects the whole compaction with `ValueError` before anything is
   written.
+- `Sequential.compact_family(members) -> None` folds a whole chain
+  family -- all of its member directories handed in at once -- into one
+  new basis segment. The basis and the delta prefix every member's head
+  can reach (the segments physically shared after the forks) are folded
+  together; every member's `head` then names the new history, with that
+  member's own, untouched tail deltas following the new basis. Each
+  member's reassembled parameters, gradients, optimizer moments and step
+  count and hidden state are bit for bit identical afterwards, the fold
+  advances no optimizer step (both `t = 0` and stepped chains keep their
+  semantics), and every member's segment count drops deterministically by
+  exactly the folded range. The folded basis is stored once (hard-linked
+  across the member directories, like the prefix it replaces) and each
+  member releases only its own old prefix entries, so a shared segment is
+  reclaimed by reachability exactly when no member can reach it and is
+  never stored twice. Repeating the fold on the same range changes
+  nothing, and a family with no foldable common delta is left exactly as
+  it was. Members keep saving, loading and appending throughout without
+  any member ever appearing as half a chain; a process killed midway
+  leaves every member loadable as one complete state and the next family
+  operation (or the next open of any member) rolls the fold forward and
+  reclaims the residue deterministically, serialised against forks,
+  merges, deletions and single-chain compactions by the directory locks
+  and leases. A missing member directory or a missing referenced segment
+  raises `FileNotFoundError` and leaves the other members untouched; a
+  truncated segment, a missing field, an out-of-order segment, or members
+  whose parameter shapes or layer order disagree reject the whole fold
+  with `ValueError` whose message names the mismatching shapes and layer
+  order, before one member byte moves; an unwritable directory or a full
+  disk raises `OSError`. `members` may instead be a list of `MemoryChain`
+  stores, folded with identical semantics (`checkpoint.compact_family` /
+  `checkpoint.compact_family_memory`).
 - `Sequential.fork(source, target, up_to=None) -> None` derives a branch
   chain from an existing incremental checkpoint chain at segment `up_to`
   (the source chain's current head when omitted). The branch chain
@@ -287,6 +318,14 @@ through rather than waited on), a compaction killed at any point is
 completed by the next open, and `head` always points at one complete
 chain. Peak disk usage stays within the original chain plus the single
 new basis segment.
+
+`Sequential.compact_family` (or `checkpoint.compact_family`) folds a
+whole family in one call: the prefix every member shares becomes one new
+basis segment stored once across the member directories (hard links),
+each member's exclusive tail follows it unchanged, and every member runs
+the same stage-then-publish protocol, so the family-wide fold is
+crash-safe and serialised against the other family operations exactly
+like a single-chain fold.
 
 `Sequential.fork` (or `checkpoint.fork_chain`) turns one chain into a
 chain family: the branch directory shares the segments up to the fork

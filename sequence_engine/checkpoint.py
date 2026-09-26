@@ -44,6 +44,10 @@ Two on-disk shapes share the same leaf encoding and trailer:
   nothing; segments no head can reach (orphans left by a hard kill) and
   staging directories from a killed fork, delete or compaction are swept
   deterministically on the next fork, compaction, deletion or merge.  A
+  whole family can be family-compacted in one call: the common prefix is
+  folded into one new basis segment stored once across the member
+  directories (hard links), with each member's exclusive tail following
+  it unchanged, through the same per-member stage-then-publish fold.  A
   family of chains can also be verified read-only in one call, with the
   first bad segment reported together with every chain that reaches it.
 * **Branch merges** -- one chain's current state can be merged onto
@@ -137,6 +141,7 @@ _BASIS_INDEX = 0
 # re-running the recovery step.
 _STAGED_PREFIX = ".seqc-"
 _COMPACT_MARKER = ".seqcompact"
+
 
 # Fork staging: a branch chain is fully populated (segment links first,
 # the head pointer last -- the chain commit order) under a private
@@ -2402,7 +2407,7 @@ def _release_compaction_lease(fd):
     os.close(fd)
 
 
-def _stream_tail(directory, fold, folded_doc):
+def _stream_tail(directory, fold, folded_doc, family=False):
     """Convert tail deltas one per lock acquisition until published.
 
     The live head may grow while the stream runs (a concurrent append);
@@ -2410,6 +2415,10 @@ def _stream_tail(directory, fold, folded_doc):
     publication.  The owner keeps the folded walker in memory, so each
     step folds exactly one new segment (a process resuming a dead owner
     rebuilds that state from disk via :func:`_fold_walker`).
+
+    *family* marks a family compaction: the folded basis is one physical
+    file hard-linked across every member directory, so publication moves
+    (renames) the staged link onto the basis name instead of copying it.
     """
     walker = _walker_from_document(folded_doc)
     previous = folded_doc
@@ -2433,11 +2442,11 @@ def _stream_tail(directory, fold, folded_doc):
                 continue
             # Caught the live head while holding the lock, so no append
             # can land between the checks: publish now.
-            _publish_compaction(directory, store, fold, head - fold)
+            _publish_compaction(directory, store, fold, head - fold, family=family)
             return
 
 
-def _publish_compaction(directory, store, fold, new_head):
+def _publish_compaction(directory, store, fold, new_head, family=False):
     """Switch point: promote the folded chain, advance head, clear marker.
 
     Runs entirely under the directory lock, so no append can interleave;
@@ -2446,14 +2455,27 @@ def _publish_compaction(directory, store, fold, new_head):
     first, making the destructive phase recognisable and resumable after a
     kill: folded prefix release, basis promotion, then the tail rotation
     (each target move is complete exactly when its source is gone).
+
+    For a family fold (*family* true) the staged basis is the one physical
+    file shared by every member directory; it is moved onto the basis name
+    with a rename rather than copied, so the published basis stays stored
+    exactly once across the family.
     """
-    _atomic_write(
-        directory, _COMPACT_MARKER, _encode_marker({"u": fold, "h": new_head})
-    )
+    publish_marker = {"u": fold, "h": new_head}
+    if family:
+        publish_marker["f"] = 1
+    _atomic_write(directory, _COMPACT_MARKER, _encode_marker(publish_marker))
     for index in range(1, fold + 1):
         _unlink_quietly(os.path.join(directory, _segment_name(index)))
     staged_path = os.path.join(directory, _staged_name(0))
-    if os.path.exists(staged_path):
+    if family:
+        # Move the shared link atomically onto the basis name.  The old
+        # basis loses only this member's link; other members still hold
+        # theirs until they publish, and the staged inode survives in
+        # every member that has not promoted it yet.
+        if os.path.exists(staged_path):
+            os.replace(staged_path, os.path.join(directory, _segment_name(0)))
+    elif os.path.exists(staged_path):
         with open(staged_path, "rb") as fh:
             staged_basis = fh.read()
         _atomic_write(directory, _segment_name(_BASIS_INDEX), staged_basis)
@@ -2556,6 +2578,10 @@ def _decode_marker(raw):
 
     * streaming: ``{"u": fold}`` -- fold in progress, marker immutable;
     * publish: ``{"u": fold, "h": new_head}`` -- promotion in force;
+    * family: either form may additionally carry ``"f": 1``, marking a
+      family compaction -- the basis promotion hard-links the single
+      shared staged basis instead of copying it per member, so the folded
+      basis stays physically stored once across every member;
     * legacy: a bare decimal string from the pre-streaming build meaning
       every new segment was already staged and only publication remained.
     """
@@ -2572,7 +2598,7 @@ def _decode_marker(raw):
     keys = set(marker) if isinstance(marker, dict) else set()
     u = marker.get("u") if isinstance(marker, dict) else None
     if (
-        keys not in ({"u"}, {"u", "h"})
+        keys not in ({"u"}, {"u", "h"}, {"u", "f"}, {"u", "h", "f"})
         or isinstance(u, bool)
         or not isinstance(u, int)
         or u <= 0
@@ -2583,6 +2609,8 @@ def _decode_marker(raw):
         or not isinstance(marker["h"], int)
         or marker["h"] < 0
     ):
+        raise CheckpointError("compaction marker is corrupt")
+    if "f" in marker and marker["f"] != 1:
         raise CheckpointError("compaction marker is corrupt")
     return marker
 
@@ -2686,6 +2714,7 @@ def _recover_directory_chain(directory, store):
     if head < fold:
         raise CheckpointError("compaction marker is inconsistent with its head")
     final_head = marker.get("h")
+    family = marker.get("f") == 1
     if final_head is None:
         # Streaming phase interrupted: finish converting the tail.
         final_head = head - fold
@@ -2713,7 +2742,7 @@ def _recover_directory_chain(directory, store):
                 delta = _build_delta_between(previous, current, new_index)
                 _atomic_write(directory, slot_name, delta)
                 previous = current
-        _publish_compaction(directory, store, fold, final_head)
+        _publish_compaction(directory, store, fold, final_head, family=family)
         return
 
     # Publication phase interrupted: finish the resumable promotion.
@@ -2724,13 +2753,21 @@ def _recover_directory_chain(directory, store):
         _promote_tail_slots(directory, fold, final_head)
         _gc_published_chain(directory, final_head)
         return
-    _finish_publication(directory, store, fold, final_head)
+    _finish_publication(directory, store, fold, final_head, family=family)
 
 
-def _finish_publication(directory, store, fold, final_head):
-    """Complete a promotion whose publish marker is on disk."""
+def _finish_publication(directory, store, fold, final_head, family=False):
+    """Complete a promotion whose publish marker is on disk.
+
+    A family promotion (*family* true) moves the shared staged basis onto
+    the basis name rather than copying it, so the folded basis keeps one
+    physical copy across every member directory.
+    """
     staged_path = os.path.join(directory, _staged_name(0))
-    if os.path.exists(staged_path):
+    if family:
+        if os.path.exists(staged_path):
+            os.replace(staged_path, os.path.join(directory, _segment_name(0)))
+    elif os.path.exists(staged_path):
         with open(staged_path, "rb") as fh:
             staged_basis = fh.read()
         _atomic_write(directory, _segment_name(_BASIS_INDEX), staged_basis)
@@ -3532,6 +3569,524 @@ def merge_chains_memory(source, target):
         )
         target.write_segment(_segment_name(next_index), delta_bytes)
         _commit_head(target, next_index)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Family compaction: folding a whole chain family's shared history once
+#
+# A family produced by forks keeps the same history in every member's
+# prefix slots (the prefix files are hard links -- one physical copy).
+# Family compaction folds the prefix *every* member's head reaches into
+# one new basis segment.  It deliberately adds no new on-disk machinery:
+# every member runs the ordinary single-chain streaming protocol -- its
+# own staged basis, the per-directory compaction marker and lease, the
+# segment-at-a-time tail conversion and the crash-resumable publication.
+# The only family-specific parts are:
+#
+#   1. the fold range is the longest prefix with byte-identical segment
+#      files across every member (basis included -- the physically shared
+#      fork prefix);
+#   2. the folded basis is written once into the anchor member's staged
+#      slot and hard-linked into every other member's staged slot, so the
+#      new basis is stored once exactly as the old prefix was;
+#   3. every member's lease, staged basis and marker appear in one lock
+#      acquisition (a fold found already in force is waited out and the
+#      family scan restarted), so the family fold and single-chain folds
+#      serialise and a save never observes a lease without a marker;
+#   4. each member then streams its own tail and publishes independently:
+#      releasing a member's prefix drops only that member's hard links, so
+#      a shared segment's bytes are reclaimed exactly when the last member
+#      lets go and a member's exclusive tail is never touched elsewhere.
+#
+# Saves and loads (which take no fold lease) keep flowing while a fold is
+# armed: appends land in the old numbering and are converted before
+# publication, exactly as during a single-chain streaming fold.  A kill
+# at any point leaves every member's head naming one complete chain -- the
+# old one or the new one -- because each member carries its own marker and
+# staged basis; the member's next open rolls it forward, and the next
+# family operation opens every member in turn and so reclaims all residue
+# deterministically.  Folding is a pure function of the reachable segment
+# bytes: the segment count drops deterministically by exactly the common
+# folded range, repeating the same fold changes nothing (it then finds
+# nothing to fold), and no member's optimizer step is advanced.
+# ---------------------------------------------------------------------------
+
+
+class _FamilyFoldContended(Exception):
+    """A member gained a fold between the family scan and its arming."""
+
+
+def _check_family_members(members):
+    if isinstance(members, (str, bytes, os.PathLike)):
+        raise TypeError("a chain family must be a sequence of chain directories")
+    try:
+        members = list(members)
+    except TypeError:
+        raise TypeError(
+            "a chain family must be a sequence of chain directories"
+        ) from None
+    if not members:
+        raise CheckpointError("a chain family needs at least one chain")
+    paths = []
+    for member in members:
+        if not isinstance(member, (str, os.PathLike)):
+            raise TypeError("chain family members must be chain directory paths")
+        paths.append(os.fspath(member))
+    return paths
+
+
+def _layer_order_signature(document):
+    return [
+        (layer["kind"], [list(shape) for shape in layer["shapes"]])
+        for layer in document["layers"]
+    ]
+
+
+def _capture_member_snapshot(directory):
+    """Snapshot one member's committed chain into memory under one lock.
+
+    All reads happen in a single directory-lock acquisition (after any
+    dead fold is rolled forward and a live one waited out), so the
+    captured bytes always form one consistent, committed chain -- a
+    concurrent single-chain fold cannot rotate a slot between two reads.
+    Returns ``(snapshot_store, head)``.
+    """
+    while True:
+        with _DirectoryChainLock(directory):
+            store = _DirectoryChainStore(directory)
+            _recover_directory_chain(directory, store)
+            if _marker_exists(directory):
+                contended = True
+            else:
+                contended = False
+                head = _read_head_optional(store)
+                if head is None:
+                    raise CheckpointError(
+                        "chain has no head pointer (no basis segment committed)"
+                    )
+                snapshot = MemoryChain()
+                for index in range(head + 1):
+                    snapshot.write_segment(
+                        _segment_name(index),
+                        store.read_segment(_segment_name(index)),
+                    )
+                snapshot.write_head(str(head).encode("ascii"))
+        if not contended:
+            return snapshot, head
+        _wait_for_live_marker(directory)
+
+
+def _scan_family_fold(abs_paths):
+    """Validate every member and plan the common fold; strictly read-only.
+
+    Every member is validated through its own head exactly as a load
+    validates, and the head models must agree on parameter shapes and
+    layer order even when the foldable prefix is empty (a family with
+    matching models but no shared delta simply folds nothing; a family
+    whose members disagree on the model is rejected outright).
+
+    Returns ``(fold, folded_bytes, probes)`` where *fold* is the longest
+    common byte-identical delta prefix, *folded_bytes* is the new basis
+    (``None`` when nothing folds) and *probes* maps each member to
+    ``(scanned_head, fold-boundary bytes)``, used to re-detect a
+    concurrent change when arming.  A missing referenced segment raises
+    ``FileNotFoundError``; any defect or a shape/layer-order disagreement
+    between members raises :class:`CheckpointError` naming the
+    mismatching shapes and layers.
+    """
+    snapshots = []
+    heads = []
+    for path in abs_paths:
+        snapshot, head = _capture_member_snapshot(path)
+        snapshots.append(snapshot)
+        heads.append(head)
+
+    # Validate every member through its own head from its consistent
+    # snapshot, so a truncated, missing or out-of-order segment in any
+    # member rejects the whole fold before a byte is written.
+    head_documents = [
+        _load_chain_store(snapshot, head)
+        for snapshot, head in zip(snapshots, heads)
+    ]
+    _check_family_head_compatibility(abs_paths, head_documents)
+
+    fold_limit = min(heads)
+    fold = 0
+    # The basis must be identical as well: the folded document is the
+    # fold of 0..fold, so a different basis would reconstruct a different
+    # state even when every delta happened to carry the same bytes.
+    basis_name = _segment_name(_BASIS_INDEX)
+    basis_raw = snapshots[0].read_segment(basis_name)
+    if fold_limit >= 1 and all(
+        snapshot.read_segment(basis_name) == basis_raw
+        for snapshot in snapshots[1:]
+    ):
+        for segment_index in range(1, fold_limit + 1):
+            name = _segment_name(segment_index)
+            raw = snapshots[0].read_segment(name)
+            if any(
+                snapshot.read_segment(name) != raw for snapshot in snapshots[1:]
+            ):
+                break
+            fold = segment_index
+    probes = {}
+    if fold == 0:
+        return 0, None, probes
+
+    # Fold the anchor's common-prefix snapshot to build the one new basis;
+    # record each member's fold-boundary segment so arming can detect a
+    # concurrent prefix rewrite.
+    folded_doc = _walk_to(snapshots[0], heads[0], fold)
+    for member_index, (snapshot, head) in enumerate(zip(snapshots, heads)):
+        probes[abs_paths[member_index]] = (
+            head,
+            snapshot.read_segment(_segment_name(fold)),
+        )
+    return fold, build_bytes(folded_doc), probes
+
+
+def _check_family_head_compatibility(paths, head_documents):
+    """Demand identical parameter shapes and layer order across heads.
+
+    The rejection message names both chains and the shapes/layer order
+    that disagree, rather than reporting a generic mismatch.
+    """
+    reference = head_documents[0]
+    ref_param_shapes = [list(entry["s"]) for entry in reference["params"]]
+    ref_layers = _layer_order_signature(reference)
+    for member_index, document in enumerate(head_documents[1:], start=1):
+        param_shapes = [list(entry["s"]) for entry in document["params"]]
+        if param_shapes != ref_param_shapes:
+            raise CheckpointError(
+                "family compaction rejected: chain "
+                f"{member_index} ({paths[member_index]!r}) parameter shapes "
+                f"{param_shapes!r} do not match chain 0 ({paths[0]!r}) "
+                f"parameter shapes {ref_param_shapes!r}"
+            )
+        layers = _layer_order_signature(document)
+        if layers != ref_layers:
+            raise CheckpointError(
+                "family compaction rejected: chain "
+                f"{member_index} ({paths[member_index]!r}) layer order "
+                f"{layers!r} does not match chain 0 ({paths[0]!r}) layer "
+                f"order {ref_layers!r}"
+            )
+
+
+def compact_family(members):
+    """Fold the common history prefix of a whole chain family into one
+    new basis segment.
+
+    *members* is a non-empty sequence of chain directories belonging to
+    one family (the result of one or more forks).  The basis and the
+    delta prefix every member's head reaches -- the segments physically
+    shared after the forks -- are folded into one new basis segment
+    written in the current format version.  Every member's ``head`` then
+    names the folded chain: the common basis followed by the member's
+    own, untouched tail deltas.  The new basis is stored once (hard
+    linked across the member directories, exactly like the prefix it
+    replaces) and each member releases only its own old prefix entries,
+    so a shared segment keeps being stored once and is reclaimed by
+    reachability exactly when no member can reach it.
+
+    Each member's reassembled state -- parameters, gradients, optimizer
+    moments and step count, hidden state -- is bit for bit identical
+    before and after; the fold advances no member's optimizer step, and
+    the semantics of both an unstepped chain (``t = 0``) and a stepped
+    chain are preserved.  The segment count of every member drops by
+    exactly the folded range; folding the same family again is a no-op
+    (once folded, the common range is just the basis and nothing folds),
+    as is a family with no foldable prefix.  Saves, loads and incremental
+    appends proceed normally throughout and no member is ever observed as
+    half a chain; a process killed midway leaves every member loadable as
+    one complete state, and the next family operation rolls every member
+    forward and reclaims the residue deterministically, serialised against
+    forks, merges, deletions and single-chain compactions by the
+    directory locks and leases -- shared segments are neither deleted
+    while reachable nor leaked.
+
+    A missing member directory or a referenced segment that is absent
+    raises ``FileNotFoundError`` without touching the other members.  A
+    truncated segment, a missing field, an out-of-order segment, or
+    members whose parameter shapes or layer order disagree rejects the
+    whole fold with ``ValueError`` -- the message names the mismatching
+    shapes and layer order -- before any member is changed by a byte.
+    An unwritable directory or a full disk raises ``OSError``.
+    """
+    paths = _check_family_members(members)
+    abs_paths = [os.path.abspath(path) for path in paths]
+    if len(set(abs_paths)) != len(abs_paths):
+        raise CheckpointError("a chain family cannot list the same member twice")
+    for path in abs_paths:
+        if not os.path.isdir(path):
+            raise FileNotFoundError(
+                f"incremental checkpoint directory not found: {path!r}"
+            )
+    # Deterministic GC of killed fork/delete staging in the family
+    # directories' parents before the fold starts.
+    for parent in sorted({os.path.dirname(path) for path in abs_paths}):
+        _sweep_parent_staging(parent)
+
+    # Scan the family read-only, then arm every member; a fold a peer
+    # commits between the two makes the scan stale, so the arm is retried
+    # with a fresh scan (waiting for the peer fold to finish first).
+    while True:
+        fold, folded_bytes, probes = _scan_family_fold(abs_paths)
+        if fold == 0:
+            return None  # no common delta prefix (or basis only): no-op
+        armed = []
+        contended_members = set()
+        anchor = abs_paths[0]
+        arm_failed = None
+        try:
+            for member_index, path in enumerate(abs_paths):
+                member_lease = None
+                try:
+                    with _DirectoryChainLock(path):
+                        store = _DirectoryChainStore(path)
+                        _recover_directory_chain(path, store)
+                        if _marker_exists(path):
+                            contended_members.add(path)
+                            raise _FamilyFoldContended
+                        head = _read_head_optional(store)
+                        scanned_head, boundary_bytes = probes[path]
+                        if head is None or head < scanned_head:
+                            # A peer fold renumbered (shrank) this member
+                            # while the family scan ran; the plan is stale.
+                            raise _FamilyFoldContended
+                        # A tail append is harmless (the prefix slots are
+                        # immutable); a rewritten fold boundary is not.
+                        try:
+                            boundary = store.read_segment(_segment_name(fold))
+                        except FileNotFoundError:
+                            # The prefix slot vanished to a peer fold that
+                            # committed its rotation and the smaller head in
+                            # the same critical section; the plan is stale.
+                            raise _FamilyFoldContended from None
+                        if boundary != boundary_bytes:
+                            raise _FamilyFoldContended
+                        member_lease = _try_compaction_lease(path)
+                        if member_lease is None and fcntl is not None:
+                            contended_members.add(path)
+                            raise _FamilyFoldContended
+                        # Lease, staged basis and marker all appear in this
+                        # one critical section, so an opener never sees a
+                        # lease without its marker.  The basis physically
+                        # lives once.
+                        staged_path = os.path.join(path, _staged_name(0))
+                        if member_index == 0:
+                            _atomic_write(path, _staged_name(0), folded_bytes)
+                        elif not os.path.exists(staged_path):
+                            os.link(
+                                os.path.join(anchor, _staged_name(0)),
+                                staged_path,
+                            )
+                        _atomic_write(
+                            path,
+                            _COMPACT_MARKER,
+                            _encode_marker({"u": fold, "f": 1}),
+                        )
+                        # The member is armed the moment its marker is on
+                        # disk; any later failure must disarm it through
+                        # the common cleanup, not strand the marker.
+                        armed.append((path, member_lease))
+                        member_lease = None
+                        _lease_register(path)
+                        _fsync_directory(path)
+                finally:
+                    # A failure before this member was fully armed (a full
+                    # disk writing the staged basis, say) must not strand
+                    # the lease it just claimed.  No marker exists yet (a
+                    # marker is written only as the last arming step), so a
+                    # leftover staged basis is unreachable debris: drop it.
+                    if member_lease is not None:
+                        _unlink_quietly(
+                            os.path.join(path, _staged_name(0))
+                        )
+                        _release_compaction_lease(member_lease)
+                        _unlink_quietly(_lease_path(path))
+        except _FamilyFoldContended:
+            # Disarm every member already armed: the original chain slots
+            # were never touched at this point, so removing the added
+            # staged basis, marker and lease restores the member exactly.
+            for path, lease_fd in armed:
+                _disarm_family_member(path, lease_fd)
+            armed = []
+            for path in contended_members:
+                _wait_for_live_marker(path)
+            if not contended_members:
+                # A pure staleness retry must not spin.
+                time.sleep(0.0)
+            continue
+        except BaseException as exc:
+            # A live error during arming (an unwritable directory or a
+            # full disk): nothing has been published yet, so disarm every
+            # armed member and surface the error with every chain intact.
+            arm_failed = exc
+            for path, lease_fd in armed:
+                _disarm_family_member(path, lease_fd)
+        if arm_failed is not None:
+            raise arm_failed
+
+        # All members carry their marker and the shared staged basis.
+        folded_doc = parse_bytes(folded_bytes)
+        lease_fds = armed
+        try:
+            # Each member converts its own tail a segment at a time and
+            # publishes, exactly like an independent streaming fold;
+            # appends landing meanwhile are converted before publication.
+            for path, _lease_fd in lease_fds:
+                _stream_tail(path, fold, folded_doc, family=True)
+        except BaseException:
+            # A live caller giving up (a full disk, say) releases the
+            # leases; every member carrying a marker is rolled forward by
+            # its next open exactly like an interrupted single-chain fold.
+            for path, lease_fd in lease_fds:
+                _release_compaction_lease(lease_fd)
+                _lease_release(path)
+            raise
+        for path, lease_fd in lease_fds:
+            _release_compaction_lease(lease_fd)
+            _lease_release(path)
+        return None
+
+
+def _disarm_family_member(directory, lease_fd):
+    """Remove a family member's staged basis and marker without publishing.
+
+    Used only while arming is being rolled back: the member's live chain
+    slots are untouched, so the directory returns to exactly its state
+    before the family fold.
+    """
+    with _DirectoryChainLock(directory):
+        _unlink_quietly(os.path.join(directory, _staged_name(0)))
+        _unlink_quietly(_marker_path(directory))
+        _fsync_directory(directory)
+    _release_compaction_lease(lease_fd)
+    _unlink_quietly(_lease_path(directory))
+    _lease_release(directory)
+
+
+def compact_family_memory(members):
+    """Fold a family of in-memory chains; same semantics as
+    :func:`compact_family`.
+
+    The common prefix is shared by object identity (forked memory chains
+    reference the same segment bytes); one folded basis object is placed
+    in every member and each member's own renumbered tail follows it.
+    The member stores are locked in a fixed order, so the fold is one
+    serialised critical section with identical results.
+    """
+    if isinstance(members, MemoryChain):
+        raise TypeError("a chain family must be a sequence of MemoryChains")
+    try:
+        members = list(members)
+    except TypeError:
+        raise TypeError(
+            "a chain family must be a sequence of MemoryChains"
+        ) from None
+    if not members:
+        raise CheckpointError("a chain family needs at least one chain")
+    for member in members:
+        if not isinstance(member, MemoryChain):
+            raise TypeError("chain family members must be MemoryChains")
+    if len({id(member) for member in members}) != len(members):
+        raise CheckpointError("a chain family cannot list the same member twice")
+    # Acquire every store lock in a canonical (id) order rather than the
+    # caller's order, so two family folds handed the members in opposite
+    # orders cannot deadlock; the fold itself is order-independent.
+    locks = sorted({id(member): member._lock for member in members}.values(),
+                   key=lambda lock: id(lock))
+    for lock in locks:
+        lock.acquire()
+    try:
+        heads = []
+        for member in members:
+            head = _read_head_optional(member)
+            if head is None:
+                raise CheckpointError(
+                    "chain has no head pointer (no basis segment committed)"
+                )
+            heads.append(head)
+
+        # Validate every member through its own head and demand matching
+        # parameter shapes and layer order before a byte is replaced --
+        # even when the family has no shared delta to fold.
+        head_documents = [
+            _load_chain_store(member, head) for member, head in zip(members, heads)
+        ]
+        ref_shapes = [list(entry["s"]) for entry in head_documents[0]["params"]]
+        ref_layers = _layer_order_signature(head_documents[0])
+        for member_index, document in enumerate(head_documents[1:], start=1):
+            shapes = [list(entry["s"]) for entry in document["params"]]
+            if shapes != ref_shapes:
+                raise CheckpointError(
+                    "family compaction rejected: member "
+                    f"{member_index} parameter shapes {shapes!r} do not match "
+                    f"member 0 parameter shapes {ref_shapes!r}"
+                )
+            layers = _layer_order_signature(document)
+            if layers != ref_layers:
+                raise CheckpointError(
+                    "family compaction rejected: member "
+                    f"{member_index} layer order {layers!r} does not match "
+                    f"member 0 layer order {ref_layers!r}"
+                )
+
+        fold_limit = min(heads)
+        fold = 0
+        # The basis must be identical as well as the delta prefix.
+        basis_raw = members[0].read_segment(_segment_name(_BASIS_INDEX))
+        if fold_limit >= 1 and all(
+            member.read_segment(_segment_name(_BASIS_INDEX)) == basis_raw
+            for member in members[1:]
+        ):
+            for segment_index in range(1, fold_limit + 1):
+                name = _segment_name(segment_index)
+                raw = members[0].read_segment(name)
+                # Forked memory chains share the same bytes object; a
+                # value comparison also accepts an equal copied prefix,
+                # exactly like the directory fold's byte check.
+                if any(
+                    member.read_segment(name) != raw for member in members[1:]
+                ):
+                    break
+                fold = segment_index
+        if fold == 0:
+            return None
+        folded_doc = _load_chain_store(members[0], fold)
+
+        # Convert each member's tail against the folded basis; the one
+        # folded basis object is then shared by every member, followed by
+        # the member's own renumbered tail slots.
+        folded_bytes = build_bytes(folded_doc)
+        converted_tails = []
+        for member, head in zip(members, heads):
+            tail_walker = _walker_from_document(folded_doc)
+            previous = folded_doc
+            tail = {}
+            for new_index in range(1, head - fold + 1):
+                old_index = fold + new_index
+                raw = member.read_segment(_segment_name(old_index))
+                tail_walker.apply_delta(new_index, raw, wire_number=old_index)
+                current = tail_walker.document()
+                tail[new_index] = _build_delta_between(previous, current, new_index)
+                previous = current
+            converted_tails.append(tail)
+        post_heads = [head - fold for head in heads]
+        for member, new_head, tail in zip(members, post_heads, converted_tails):
+            member.write_segment(_segment_name(_BASIS_INDEX), folded_bytes)
+            for new_index, raw in tail.items():
+                member.write_segment(_segment_name(new_index), raw)
+            for name in list(member._objects):
+                index = _segment_index(name)
+                if index is not None and index > new_head:
+                    del member._objects[name]
+            _commit_head(member, new_head)
+    finally:
+        for lock in reversed(locks):
+            lock.release()
     return None
 
 
