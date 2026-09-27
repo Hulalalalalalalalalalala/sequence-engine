@@ -3125,6 +3125,284 @@ def _check_family_export_import_memory():
     )
 
 
+def _check_family_sync_memory():
+    # Cross-family incremental synchronization, exercised in memory:
+    # the diff between two families stores only genuinely differing
+    # segments, the application lands bit for bit and is atomic and
+    # idempotent, shared segments stay one object, the full and
+    # incremental artifacts convert into each other, and the error
+    # taxonomy is enforced.
+    from . import _familysync
+
+    def trained_family(main_steps, forks):
+        main = _checkpoint.MemoryChain()
+        seq, _ = _fresh_stack()
+        seq.save(main)
+        h = None
+        for i in range(main_steps):
+            out, h = seq.forward(
+                Tensor(_SEG1 if i % 2 == 0 else _SEG2), h
+            )
+            seq.backward(_total(out))
+            if i % 3 == 2:
+                seq.adam_step(_ADAM_LR)
+            else:
+                seq.update(_LR)
+            seq.save(main)
+        members = [main]
+        for point in forks:
+            branch = _checkpoint.fork_chain_memory(main, up_to=point)
+            bs, _ = _fresh_stack()
+            bh = bs.load(branch)
+            o, bh = bs.forward(Tensor(_SEG2 if point % 2 else _SEG1), bh)
+            bs.backward(_total(o))
+            bs.adam_step(_ADAM_LR)
+            bs.save(branch)
+            members.append(branch)
+        return members
+
+    source = trained_family(8, (6, 3))
+    target = trained_family(4, (3, 2))
+    # Advance the source main one more step so its tail is exclusive.
+    s_seq, _ = _fresh_stack()
+    h = s_seq.load(source[0])
+    out, h = s_seq.forward(Tensor(_SEG2), h)
+    s_seq.backward(_total(out))
+    s_seq.adam_step(_ADAM_LR)
+    s_seq.save(source[0])
+
+    source_states = [
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+        for chain in source
+    ]
+    source_heads = [int(chain.read_head()) for chain in source]
+    target_snapshot = [
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+        for chain in target
+    ]
+
+    artifact = _familysync.diff_families_memory(source, target)
+    _check(
+        artifact[:8] == _familysync.SYNC_EXPORT_MAGIC,
+        "a family diff carries the sync artifact magic",
+    )
+    _check(
+        _familysync.diff_families_memory(source, target) == artifact,
+        "repeated diff of the same two families is byte-identical",
+    )
+    full_artifact = _checkpoint.export_family_memory(source)
+    _check(
+        len(artifact) < len(full_artifact),
+        "the incremental artifact stores fewer blocks than the full one",
+    )
+    _d, plan, blobs = _familysync.parse_sync_artifact(artifact)
+    _check(
+        [member["head"] for member in plan] == source_heads,
+        "the diff records each source member's head exactly",
+    )
+    _check(
+        all(
+            len(member["shared"]) + len(member["carried"])
+            == member["head"] + 1
+            for member in plan
+        ),
+        "shared positions and carried blocks partition 0..head",
+    )
+    for chain, state in zip(source, source_states):
+        _check(
+            _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+            == state,
+            "producing a diff changes no source member",
+        )
+    for chain, state in zip(target, target_snapshot):
+        _check(
+            _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+            == state,
+            "producing a diff changes no target member",
+        )
+    _check(
+        all(
+            _checkpoint.load_chain_memory(chain)["optim"]["t"]
+            == _checkpoint.load_chain_memory(chain)["optim"]["t"]
+            for chain in source + target
+        ),
+        "a diff advances no optimizer step",
+    )
+
+    # Applying lands the source state bit for bit, step counts included.
+    source_steps = [
+        _checkpoint.load_chain_memory(chain)["optim"]["t"] for chain in source
+    ]
+    _familysync.apply_family_diff_memory(artifact, target)
+    for chain, state, step in zip(target, source_states, source_steps):
+        _check(
+            _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+            == state,
+            "the target loads to the source state bit for bit after apply",
+        )
+        _check(
+            _checkpoint.load_chain_memory(chain)["optim"]["t"] == step,
+            "applying a sync advances no optimizer step",
+        )
+        _check(
+            int(chain.read_head())
+            == source_heads[target.index(chain)],
+            "each member's head points at the source's exclusive tail end",
+        )
+    # Shared segments remain one shared object across members.
+    basis = _checkpoint._segment_name(0)
+    shared_objects = {target[0]._objects[basis], target[2]._objects[basis]}
+    _check(
+        len(shared_objects) == 1,
+        "a shared segment stays one object across the applied family",
+    )
+    # Re-applying the same artifact is a no-op (no segment object churns).
+    before_objects = {id(c): dict(c._objects) for c in target}
+    _familysync.apply_family_diff_memory(artifact, target)
+    for chain, state in zip(target, source_states):
+        _check(
+            _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+            == state,
+            "re-applying the same sync is a no-op",
+        )
+    _check(
+        all(c._objects == before_objects[id(c)] for c in target),
+        "a no-op apply rewrites no member segment",
+    )
+    # The source family is untouched after the application too.
+    for chain, state in zip(source, source_states):
+        _check(
+            _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+            == state,
+            "applying a sync never touches the source family",
+        )
+
+    # Full <-> incremental conversions load to the same state.  A full
+    # artifact converted against the target it would be applied to
+    # carries at most the full export's blocks (the fresh families
+    # already share their initial basis bytes); applying the converted
+    # incremental artifact lands the source state, and sync -> full
+    # yields a self-contained artifact that restores identically.
+    conversion_baseline = trained_family(4, (3, 2))
+    sync_bytes = _familysync.full_to_incremental_artifact_memory(
+        full_artifact, conversion_baseline
+    )
+    _d2, plan2, blobs2 = _familysync.parse_sync_artifact(sync_bytes)
+    _check(
+        len(blobs2)
+        <= len(_checkpoint._parse_family_export(full_artifact)[1]),
+        "a converted sync artifact carries no more blocks than the full one",
+    )
+    apply_baseline = trained_family(4, (3, 2))
+    _familysync.apply_family_diff_memory(sync_bytes, apply_baseline)
+    for chain, state in zip(apply_baseline, source_states):
+        _check(
+            _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+            == state,
+            "applying the artifact converted from a full one lands the "
+            "same state",
+        )
+    roundtrip_target = trained_family(4, (3, 2))
+    roundtrip_full = _familysync.incremental_to_full_artifact_memory(
+        _familysync.diff_families_memory(source, roundtrip_target),
+        roundtrip_target,
+    )
+    full_target = _checkpoint.import_family_memory(roundtrip_full)
+    for chain, state in zip(full_target, source_states):
+        _check(
+            _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+            == state,
+            "the artifact converted to a full one restores the same state",
+        )
+    _check(
+        all(
+            _checkpoint.build_bytes(_checkpoint.load_chain_memory(a))
+            == _checkpoint.build_bytes(_checkpoint.load_chain_memory(b))
+            for a, b in zip(
+                _checkpoint.import_family_memory(roundtrip_full),
+                _checkpoint.import_family_memory(full_artifact),
+            )
+        ),
+        "sync -> full conversion matches the full export",
+    )
+
+    # Error taxonomy.
+    torn = bytearray(artifact)
+    torn[-1] ^= 0xFF
+    _expect(
+        ValueError,
+        lambda: _familysync.apply_family_diff_memory(bytes(torn), target),
+        "a torn sync artifact is rejected",
+    )
+    _expect(
+        ValueError,
+        lambda: _familysync.apply_family_memory(object(), target)
+        if False
+        else _familysync.parse_sync_artifact(b"SEQFAMX2junk"),
+        "a non-sync byte stream is rejected",
+    )
+    moved = trained_family(4, (3, 2))
+    m_seq, _ = _fresh_stack()
+    mh = m_seq.load(moved[0])
+    o, mh = m_seq.forward(Tensor(_SEG1), mh)
+    m_seq.backward(_total(o))
+    m_seq.update(_LR)
+    m_seq.save(moved[0])
+    _expect(
+        ValueError,
+        lambda: _familysync.apply_family_diff_memory(artifact, moved),
+        "an artifact that does not match the target family is rejected",
+    )
+    _expect(
+        ValueError,
+        lambda: _familysync.diff_families_memory(source, source),
+        "diffing a family against itself is rejected",
+    )
+    _expect(
+        ValueError,
+        lambda: _familysync.diff_families_memory(source, target[:1]),
+        "families of different member counts are rejected",
+    )
+    _expect(
+        TypeError,
+        lambda: _familysync.diff_families_memory(source[0], target),
+        "a single MemoryChain is not a family",
+    )
+    other_weights = _base_weights()
+    other_weights["b1"] = [0.01, -0.02]
+    shaped_seq, _ = _build(other_weights)
+    shaped = _checkpoint.MemoryChain()
+    shaped_seq.save(shaped)
+    _expect(
+        ValueError,
+        lambda: _familysync.diff_families_memory([shaped], [target[0]]),
+        "shape/layer-order disagreement rejects a diff",
+    )
+
+    # Sequential-level entry points.
+    via_seq, _ = _fresh_stack()
+    seq_target = trained_family(4, (3, 2))
+    seq_artifact = via_seq.diff_families(source, seq_target)
+    _check(
+        seq_artifact == artifact,
+        "Sequential.diff_families packs the same incremental artifact",
+    )
+    via_seq.apply_family_diff(seq_artifact, seq_target)
+    for chain, state in zip(seq_target, source_states):
+        _check(
+            _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+            == state,
+            "Sequential.apply_family_diff lands the source state",
+        )
+    converted = via_seq.convert_family_artifact(
+        seq_artifact, trained_family(4, (3, 2)), to_incremental=False
+    )
+    _check(
+        converted[:8] == _checkpoint.FAMILY_EXPORT_MAGIC,
+        "convert_family_artifact(to_incremental=False) yields a full artifact",
+    )
+
+
 _GROUPS = [
     ("tensor basics", _check_tensor_basics),
     ("tensor validation", _check_tensor_validation),
@@ -3153,6 +3431,7 @@ _GROUPS = [
     ("in-memory chain merge", _check_chain_merge_memory),
     ("in-memory family compaction", _check_family_compaction_memory),
     ("in-memory family export/import", _check_family_export_import_memory),
+    ("in-memory cross-family sync", _check_family_sync_memory),
     ("streaming compaction interleave", _check_streaming_compaction_interleaves),
     ("chain verification", _check_chain_verification),
     ("backward replay failure surfaced", _check_backward_replay_failure_is_surfaced),

@@ -148,6 +148,16 @@ class Sequential:
       directories with the same member count, segment positions, shared
       layout and bit-for-bit state; both directions are crash-safe and
       advance no member's optimizer step.
+    * ``diff_families(source, target[, artifact])`` /
+      ``apply_family_diff(artifact, target)`` /
+      ``convert_family_artifact(...)`` -- cross-family incremental
+      synchronization: pack only the segments that genuinely differ
+      between two aligned families (the rest named as shared, not
+      stored), apply the incremental artifact to the target family
+      atomically and bit for bit (no optimizer step advanced, shared
+      segments stay one copy, re-applying is a no-op, a kill resumes on
+      re-run), and convert between the full and the incremental
+      artifact with identical restored state.
 
     All public operations are serialised by one re-entrant lock, so
     several threads may interleave ``forward``, ``backward``, ``update``,
@@ -1032,6 +1042,170 @@ class Sequential:
                 return _checkpoint.import_family(source, target)
             raise TypeError(
                 "import source must be a family artifact path or bytes"
+            )
+
+    def diff_families(self, source, target, artifact=None):
+        """Pack the incremental difference between two chain families.
+
+        *source* and *target* are two equal-length sequences of chain
+        directories (or two sequences of ``MemoryChain`` stores),
+        aligned member by member.  For directories *artifact* is the
+        destination path of the sync artifact and the call returns
+        ``None``; for ``MemoryChain`` stores no *artifact* is given and
+        the artifact bytes are returned.  Only the segments that
+        genuinely differ between corresponding members are stored:
+        positions the two families already hold byte for byte
+        identically carry no block and an unchanged member carries no
+        blocks at all; each member's head, its member-owned tail and
+        its segment positions are recorded exactly as the source holds
+        them.  Producing the diff changes neither family, advances no
+        member's optimizer step and is deterministic.
+
+        A missing member directory or referenced segment raises
+        ``FileNotFoundError`` without touching the other family;
+        disagreeing member counts/names, shapes or layer order, or a
+        truncated/missing-field/out-of-order segment rejects the diff
+        with ``ValueError`` before the artifact is written; an
+        unwritable destination or a full disk raises ``OSError``.
+        """
+        from . import _familysync
+
+        with self._lock:
+            if isinstance(source, (str, bytes, os.PathLike)) or isinstance(
+                target, (str, bytes, os.PathLike)
+            ):
+                raise TypeError(
+                    "a family sync diffs two sequences of chain "
+                    "directories or two sequences of MemoryChains"
+                )
+            try:
+                source_list = list(source)
+                target_list = list(target)
+            except TypeError:
+                raise TypeError(
+                    "a family sync diffs two sequences of chain "
+                    "directories or two sequences of MemoryChains"
+                ) from None
+            if not source_list or not target_list:
+                raise ValueError("a chain family needs at least one chain")
+            if all(
+                isinstance(member, _checkpoint.MemoryChain)
+                for member in source_list + target_list
+            ):
+                if artifact is not None:
+                    raise TypeError(
+                        "a MemoryChain family diff takes no artifact path"
+                    )
+                return _familysync.diff_families_memory(source_list, target_list)
+            if all(
+                isinstance(member, (str, os.PathLike))
+                for member in source_list + target_list
+            ):
+                if artifact is None:
+                    raise TypeError(
+                        "diffing directory families requires an artifact "
+                        "path"
+                    )
+                return _familysync.diff_families(source_list, target_list, artifact)
+            raise TypeError(
+                "a family sync needs two sequences of chain directories "
+                "or two sequences of MemoryChains"
+            )
+
+    def apply_family_diff(self, artifact, target=None):
+        """Apply a cross-family sync artifact to a target family.
+
+        *artifact* is a sync artifact file path, or sync artifact bytes
+        (as returned by :meth:`diff_families` for ``MemoryChain``
+        stores).  For an artifact file, *target* is the existing parent
+        directory holding the target family's member directories and
+        the call returns ``None``; for artifact bytes, *target* is the
+        sequence of ``MemoryChain`` stores to update in place.  The
+        artifact is validated in full and matched against the target
+        family before anything changes, the application lands
+        atomically (every member, or none), every target member's
+        parameters, gradients, optimizer state and step count and hidden
+        state afterwards match the source family bit for bit, no
+        optimizer step advances, and the shared history stays one
+        physical copy.  Applying the same artifact to the family it
+        already produced is a no-op; a kill mid-application is rolled
+        forward deterministically on a re-run or the next family
+        operation.
+
+        A missing artifact, target directory or member directory
+        raises ``FileNotFoundError``; a torn, truncated,
+        missing-field or reordered artifact, a shape/layer-order
+        mismatch, or an artifact that does not match the target family
+        rejects the whole application with ``ValueError`` before one
+        target byte is rewritten; an unwritable directory or a full
+        disk raises ``OSError``.
+        """
+        from . import _familysync
+
+        with self._lock:
+            if isinstance(artifact, (bytes, bytearray, memoryview)):
+                if not isinstance(target, (list, tuple)):
+                    raise TypeError(
+                        "an in-memory family sync applies to a sequence of "
+                        "MemoryChains"
+                    )
+                return _familysync.apply_family_diff_memory(
+                    artifact, list(target)
+                )
+            if isinstance(artifact, (str, os.PathLike)):
+                if target is None:
+                    raise TypeError(
+                        "applying a sync artifact requires the target "
+                        "family parent directory"
+                    )
+                return _familysync.apply_family_diff(artifact, target)
+            raise TypeError(
+                "sync artifact must be a path or artifact bytes"
+            )
+
+    def convert_family_artifact(self, artifact, target, *, to_incremental=True):
+        """Convert between a full family artifact and a sync artifact.
+
+        *artifact* is a full family artifact (``SEQFAMX1``) when
+        *to_incremental* is true, or a sync artifact (``SEQFAMX2``)
+        when it is false, given as bytes or a file path.  *target* is
+        the target family the artifact is relative to: a sequence of
+        chain directories (for a path/path conversion) or a sequence
+        of ``MemoryChain`` stores (for a bytes conversion).  The target
+        family is only read.  With *to_incremental* true the slots the
+        target already holds byte for byte become shared and the
+        returned artifact stores only the rest; with it false every
+        shared slot is materialized from the target into a
+        self-contained full artifact.  A family restored from either
+        form loads to exactly the same state.  A sync artifact that
+        does not match the target family raises ``ValueError``.
+        """
+        from . import _familysync
+
+        with self._lock:
+            memory_mode = not isinstance(artifact, (str, os.PathLike)) and all(
+                isinstance(member, _checkpoint.MemoryChain)
+                for member in list(target)
+            )
+            if memory_mode:
+                if to_incremental:
+                    return _familysync.full_to_incremental_artifact_memory(
+                        artifact, list(target)
+                    )
+                return _familysync.incremental_to_full_artifact_memory(
+                    artifact, list(target)
+                )
+            if isinstance(artifact, (str, os.PathLike)):
+                if to_incremental:
+                    return _familysync.full_to_incremental_artifact(
+                        artifact, list(target)
+                    )
+                return _familysync.incremental_to_full_artifact(
+                    artifact, list(target)
+                )
+            raise TypeError(
+                "convert_family_artifact takes an artifact path with a "
+                "directory family or artifact bytes with MemoryChains"
             )
 
     def _validate_against_model(self, document):

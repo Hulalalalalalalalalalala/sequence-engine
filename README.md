@@ -416,6 +416,75 @@ read-only in one call. `checkpoint.export_family_memory` /
 `MemoryChain` families, with reference-shared segments becoming one
 shared object again.
 
+### Cross-family incremental synchronization
+
+`Sequential.diff_families(source, target[, artifact])`,
+`Sequential.apply_family_diff(artifact, target)` and
+`Sequential.convert_family_artifact(...)` (with
+`checkpoint.diff_families` / `checkpoint.apply_family_diff` and the
+`*_memory` variants underneath) synchronize two families of the same
+model without repacking the history they already hold identically.
+
+`diff_families` compares the *source* family with the *target* family
+member by member (the sequences must be aligned: member *i* is compared
+with member *i*) and writes one incremental artifact (magic
+`SEQFAMX2`) holding only the segments that genuinely differ. Segment
+positions the corresponding members already reach through identical
+bytes are named as shared and carry no block; an unchanged member
+carries no blocks at all. Each member's head pointer, its
+member-owned (exclusive) tail segments and the segment positions are
+expressed in the artifact exactly as the source holds them. The diff is
+a pure function -- diffing the same two families twice produces
+identical bytes -- and producing it changes neither family by a byte
+(no optimizer step is advanced); members of both families keep saving,
+loading and appending while the diff runs.
+
+`apply_family_diff` reads and validates the whole artifact, and matches
+it against the target family (the digest recorded when the diff was
+produced), entirely before the first target write -- framing, field
+set, CRCs, segment order, shapes and layer order are all checked. Every
+member's new chain is then staged in a private sibling directory
+(shared slots hard-linked from the target, each carried block written
+once and hard-linked across members, the head pointer committed last),
+and the family rotates with every member directory lock held at once,
+so the application lands atomically: afterwards the target members'
+parameters, gradients, optimizer moments, optimizer step counts and
+hidden states are bit for bit the source family's. Members keep
+saving/loading and appending throughout (each member is one complete
+chain the whole time, never half a chain); the shared layout never
+degrades into duplicated bytes; and no member's optimizer step is
+advanced. Applying the same incremental artifact twice is a no-op. A
+target family that changed after the diff (a member appended a segment
+or compacted) is refused before any write so the in-flight member save
+is never lost -- re-diff against the current target and re-apply.
+
+The incremental artifact and the full family artifact are mutually
+convertible (`convert_family_artifact`, or
+`full_to_incremental_artifact` / `incremental_to_full_artifact`): a full
+artifact drops to the incremental form against the target family
+(shared positions become references rather than stored blocks) and an
+incremental artifact materializes to a self-contained full artifact;
+restoring either form loads to bit-for-bit identical member states.
+Memory families (`MemoryChain`) diff, apply and convert in memory with
+the same semantics and shared-object identity.
+
+The application is crash-safe and resumable: a kill mid-application
+leaves a resume marker plus whole-file staging, and re-running the same
+apply, or the next family operation (fork, merge, delete,
+single-chain/family compaction, or import over the target directory),
+completes it and reclaims all residue; repeating the reclamation
+changes nothing. Family verification stays strictly read-only and, in
+one call over the synchronized members, walks every member end to end,
+naming the first bad segment file and the reason and listing every
+chain that reaches a shared bad segment. A missing member directory or
+a referenced segment raises `FileNotFoundError` without touching the
+other family; a torn, truncated, malformed or reordered artifact, a
+shape/layer-order mismatch, or an artifact that does not match the
+target family is rejected with `ValueError` in the whole-artifact
+pre-write validation (the target stays byte for byte unchanged); an
+unwritable directory or a full disk raises `OSError` and leaves only
+whole segment files behind.
+
 Loading walks the basis and every delta up to the head and reassembles the
 state by layer (parameters, gradients, optimizer moments and step count,
 then hidden slots). The reassembled state is bit for bit identical to

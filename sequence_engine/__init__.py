@@ -20,7 +20,13 @@ Public interface (see README.md):
   or a chain family) and ``export_family`` / ``import_family``
   (packing a whole chain family into one self-contained artifact --
   shared segments stored once -- and restoring it with the same
-  members, segment positions, shared layout and bit-for-bit state).
+  members, segment positions, shared layout and bit-for-bit state),
+  plus ``diff_families`` / ``apply_family_diff`` for cross-family
+  incremental synchronization (only the genuinely differing segments
+  are packed, the target family lands atomically and bit for bit in
+  the source family's state without advancing an optimizer step and
+  with shared segments kept as one physical copy; the full and
+  incremental artifacts convert into each other).
 """
 
 from .checkpoint import MemoryChain

@@ -72,6 +72,22 @@ Two on-disk shapes share the same leaf encoding and trailer:
   re-running it and its debris is reclaimed by the next family
   operation.  Neither direction advances any member's optimizer step,
   and exporting the same family twice produces identical artifacts.
+* **Cross-family incremental sync** -- two families of the same model
+  can be synchronized with an incremental artifact (magic
+  ``SEQFAMX2``): :func:`diff_families` compares them member by member
+  and stores only the segments that genuinely differ (positions the
+  corresponding members already hold byte for byte are named as shared
+  and carry no block), recording each member's head, its exclusive
+  tail and its segment positions exactly; :func:`apply_family_diff`
+  validates the whole artifact against the target family and then
+  rotates every member atomically, so the application lands completely
+  or not at all, the two sides end with parameters, gradients,
+  optimizer state/steps and hidden state bit for bit equal, no
+  optimizer step advances, and the shared layout never degrades into
+  duplicate storage.  Reapplying the same artifact is a no-op, a kill
+  mid-application converges on re-run or the next family operation,
+  and the artifact converts in both directions with the full family
+  artifact.  See :mod:`sequence_engine._familysync`.
 
 Full snapshot wire format (all integers little-endian)::
 
@@ -245,6 +261,83 @@ _IMPORT_MARKER_KEYS = frozenset(("v", "d"))
 _FAMILY_MANIFEST_KEYS = frozenset(("v", "members", "segments"))
 _FAMILY_MEMBER_KEYS = frozenset(("name", "head", "segments"))
 _FAMILY_SEGMENT_KEYS = frozenset(("name", "size", "crc"))
+
+# Extension hooks used by the cross-family sync, which keeps its own
+# marker/staging names but reuses this module's locking and sweep
+# discipline:
+#
+# * residue sweeps run *inside* :func:`_sweep_parent_staging` while the
+#   parent directory flock is held (no locks may be taken, never raise,
+#   return whether anything was removed);
+# * family maintenance hooks run right after that sweep releases the
+#   parent flock and while the caller holds no member locks, so they may
+#   take member locks to finish a killed family-wide operation whose
+#   resume marker they recognize (no-op without one);
+# * chain recovery hooks run at the top of
+#   :func:`_recover_directory_chain` under the member directory lock and
+#   return True when they recognized and rolled the chain forward;
+# * read-only verify hooks run in :func:`verify_chain` and return a
+#   :class:`ChainVerification` for a directory holding the hook's own
+#   marker, or ``None``; they never write.
+_extra_parent_residue_sweeps = []
+_extra_family_guarded_maintenance_hooks = []
+_extra_chain_recovery_hooks = []
+_extra_readonly_verify_hooks = []
+
+
+def register_parent_residue_sweep(callback):
+    _extra_parent_residue_sweeps.append(callback)
+
+
+def register_chain_recovery_hook(callback):
+    _extra_chain_recovery_hooks.append(callback)
+
+
+def register_readonly_verify_hook(callback):
+    _extra_readonly_verify_hooks.append(callback)
+
+
+def register_family_guarded_maintenance_hook(callback):
+    """Register maintenance run while the family guard is already held.
+
+    The callback receives the parent and runs inside
+    :func:`family_open` (and inside import, which already holds the
+    guard); it must not take the family guard itself and is a no-op
+    without one of its own markers.
+    """
+    _extra_family_guarded_maintenance_hooks.append(callback)
+
+
+def _run_extra_verify_hooks(directory, store, head):
+    """The first read-only hook that recognizes *directory*'s marker."""
+    for callback in _extra_readonly_verify_hooks:
+        report = callback(directory, store, head)
+        if report is not None:
+            return report
+    return None
+
+
+def family_open(parent):
+    """Open a family parent for a shaping operation.
+
+    First reclaims staging/debris (as :func:`_sweep_parent_staging`
+    does); then, if a family-wide operation (a family fold or a
+    cross-family sync) currently holds the family lease, waits it out;
+    finally, under the family guard so such operations serialise, gives
+    registered operations (the cross-family sync) the chance to finish
+    an application a killed process left in this parent.  Read-only
+    family operations (export, the sync diff) keep using the plain
+    sweep, since they never move a family marker themselves.  A killed
+    *import*'s marker is left for an import re-run (only that call has
+    the artifact to complete it), while its staging directories are
+    already reclaimed by the staging sweep.
+    """
+    _sweep_parent_staging(parent)
+    if _family_lease_live(parent):
+        _wait_for_family_lease(parent)
+    with _FamilyParentGuard(parent):
+        for callback in list(_extra_family_guarded_maintenance_hooks):
+            callback(parent)
 
 
 def _lease_register(directory):
@@ -2305,8 +2398,21 @@ def verify_chain(directory):
                 "has no head pointer (no basis segment committed)"
             )
         if not _marker_exists(directory):
-            _verify_normal_chain(store, head)
-            return ChainVerification(head, head + 1)
+            # Another family operation (a cross-family sync) may hold
+            # its own per-member marker even without a compaction
+            # marker; its read-only hook verifies that chain in place.
+            try:
+                extra_report = _run_extra_verify_hooks(directory, store, head)
+            except CheckpointError as exc:
+                raise _verify_failure(
+                    "a sync member chain",
+                    "cross-family sync",
+                    exc,
+                ) from exc
+            if extra_report is None:
+                _verify_normal_chain(store, head)
+                return ChainVerification(head, head + 1)
+            return extra_report
         # A fold is (or was) in flight.  Verify the one coherent logical
         # chain reachable through the marker, still without writing.
         return _verify_through_marker_read_only(directory, store, head)
@@ -2613,9 +2719,9 @@ def compact_chain(directory, up_to=None):
         raise FileNotFoundError(
             f"incremental checkpoint directory not found: {directory!r}"
         )
-    # Deterministic GC: staging directories killed forks/deletes left in
-    # the family directory are reclaimed on every compaction.
-    _sweep_parent_staging(os.path.dirname(os.path.abspath(directory)))
+    # Deterministic GC and a killed family-wide operation (a cross-
+    # family sync) rolled forward before this compaction starts.
+    family_open(os.path.dirname(os.path.abspath(directory)))
 
     with _FamilyParentGuard(os.path.dirname(os.path.abspath(directory))):
         return _compact_chain_locked(directory, up_to)
@@ -3061,7 +3167,7 @@ def compact_family(members):
             "in the same parent directory"
         )
     parent = parents.pop()
-    _sweep_parent_staging(parent)
+    family_open(parent)
 
     lease_fd = None
     try:
@@ -3924,6 +4030,12 @@ def _recover_directory_chain(directory, store):
     owner is dead is rolled deterministically forward and the directory
     left holding one complete chain.
     """
+    # Other family operations with their own per-member commit protocol
+    # (the cross-family sync) finish a killed application here, before
+    # the ordinary chain is opened.
+    for hook in _extra_chain_recovery_hooks:
+        if hook(directory, store):
+            return
     marker_path = _marker_path(directory)
     if not os.path.exists(marker_path):
         # A live family-fold barrier means this member already stands on
@@ -4178,8 +4290,9 @@ def fork_chain(source, target, up_to=None):
     parent = os.path.dirname(target_abs)
     staging_prefix = _FORK_TMP_PREFIX + os.path.basename(target_abs) + "-"
     # Deterministically reclaim debris of killed earlier forks/deletes in
-    # the family directory (staging dirs whose owner is gone).
-    _sweep_parent_staging(parent)
+    # the family directory (staging dirs whose owner is gone) and finish
+    # a family-wide operation a killed process left here.
+    family_open(parent)
 
     # Serialise against saves and compactions on the source: the shared
     # prefix must not be replaced or released while it is being linked.
@@ -4448,6 +4561,15 @@ def _sweep_parent_staging(parent):
                 if not _family_lease_live(parent):
                     _unlink_quietly(os.path.join(parent, name))
                     removed = True
+        # Extra family operations (cross-family sync) keep their own
+        # marker names here; they sweep while this parent lock is
+        # already held and never raise into a family operation.
+        for callback in _extra_parent_residue_sweeps:
+            try:
+                if callback(parent):
+                    removed = True
+            except OSError:
+                pass
         if removed:
             _fsync_directory(parent)
 
@@ -4526,9 +4648,9 @@ def delete_chain(directory):
             f"incremental checkpoint directory not found: {directory!r}"
         )
     parent = os.path.dirname(directory)
-    # Deterministic GC: staging directories killed forks/deletes left in
-    # the family directory are reclaimed on every deletion.
-    _sweep_parent_staging(parent)
+    # Deterministic GC on every deletion: killed forks/deletes staging
+    # and a killed family-wide operation are reclaimed/finished here.
+    family_open(parent)
 
     # Wait out a live fold exactly like fork: deletion must not race the
     # marker protocol, and a dead fold is rolled forward first.
@@ -4713,9 +4835,10 @@ def merge_chains(source, target):
     target_abs = os.path.abspath(target)
     if source_abs == target_abs:
         raise CheckpointError("a chain cannot be merged into itself")
-    # Deterministic GC of killed fork/delete staging in the family
-    # directory the merge writes into, exactly as the other writers do.
-    _sweep_parent_staging(os.path.dirname(target_abs))
+    # Deterministic GC of killed fork/delete staging (and finishing a
+    # killed family-wide operation) in the family directory the merge
+    # writes into, exactly as the other writers do.
+    family_open(os.path.dirname(target_abs))
 
     # Step 1: capture the source's current state under its own lock.
     source_doc = _capture_chain_state(source_abs)
@@ -5381,65 +5504,74 @@ def import_family(artifact, target):
     with _FamilyParentGuard(parent):
         _family_register(parent)
         try:
-            # Reclaim staging a killed import (or fork/delete) left here.
-            # The family guard excludes a live import/export/fold, so any
-            # staging present belongs to a dead owner.
-            _sweep_parent_staging(parent)
-            marker = _read_import_marker(parent)
-            if marker is not None and marker["d"] == digest:
-                # Resume an interrupted import of this same artifact:
-                # members already in place are verified against the plan,
-                # the missing ones are committed now.
-                missing = []
-                for member in plan:
-                    final = os.path.join(parent, member["name"])
-                    if os.path.lexists(final):
-                        _verify_imported_member(final, member, blobs)
-                    else:
-                        missing.append(member)
-            else:
-                if marker is not None:
-                    _unlink_quietly(os.path.join(parent, _IMPORT_MARKER_NAME))
-                # A chain family is already in residence when the target
-                # holds any chain directory (one with a head pointer);
-                # dot-prefixed entries are markers, leases or swept debris.
-                occupant = _existing_family_member(parent)
-                if occupant is not None:
-                    raise CheckpointError(
-                        "family import target already holds a chain family "
-                        f"member: {occupant!r}"
-                    )
-                # Any non-marker entry at a planned member name is an
-                # occupied slot: reject before the marker is committed so
-                # not one member is staged.
-                for member in plan:
-                    final = os.path.join(parent, member["name"])
-                    if os.path.lexists(final):
-                        raise CheckpointError(
-                            "family import target already holds a chain "
-                            f"family member: {final!r}"
-                        )
-                _atomic_write(
-                    parent, _IMPORT_MARKER_NAME, _encode_import_marker(digest)
-                )
-                missing = plan
-            # The first member (in plan order) reaching a block holds its
-            # canonical file; later members hard-link from it, so a shared
-            # segment is stored exactly once.
-            canonical = {}
-            for member in plan:
-                for slot, block_id in enumerate(member["segments"]):
-                    if block_id not in canonical:
-                        canonical[block_id] = os.path.join(
-                            parent, member["name"], _segment_name(slot)
-                        )
-            for member in missing:
-                _commit_import_member(parent, member, blobs, canonical)
-            _unlink_quietly(os.path.join(parent, _IMPORT_MARKER_NAME))
-            _fsync_directory(parent)
+            _resume_or_import_family(parent, digest, plan, blobs)
         finally:
             _family_release(parent)
     return None
+
+
+def _resume_or_import_family(parent, digest, plan, blobs):
+    """The guarded body of :func:`import_family`; also used by resume."""
+    # Reclaim staging a killed import (or fork/delete) left here.  The
+    # family guard excludes a live import/export/fold, so any staging
+    # present belongs to a dead owner; then finish a killed family-wide
+    # operation (e.g. a cross-family sync) -- the guard is already held,
+    # so its hook runs directly.
+    _sweep_parent_staging(parent)
+    for callback in list(_extra_family_guarded_maintenance_hooks):
+        callback(parent)
+    marker = _read_import_marker(parent)
+    if marker is not None and marker["d"] == digest:
+        # Resume an interrupted import of this same artifact:
+        # members already in place are verified against the plan,
+        # the missing ones are committed now.
+        missing = []
+        for member in plan:
+            final = os.path.join(parent, member["name"])
+            if os.path.lexists(final):
+                _verify_imported_member(final, member, blobs)
+            else:
+                missing.append(member)
+    else:
+        if marker is not None:
+            _unlink_quietly(os.path.join(parent, _IMPORT_MARKER_NAME))
+        # A chain family is already in residence when the target
+        # holds any chain directory (one with a head pointer);
+        # dot-prefixed entries are markers, leases or swept debris.
+        occupant = _existing_family_member(parent)
+        if occupant is not None:
+            raise CheckpointError(
+                "family import target already holds a chain family "
+                f"member: {occupant!r}"
+            )
+        # Any non-marker entry at a planned member name is an
+        # occupied slot: reject before the marker is committed so
+        # not one member is staged.
+        for member in plan:
+            final = os.path.join(parent, member["name"])
+            if os.path.lexists(final):
+                raise CheckpointError(
+                    "family import target already holds a chain "
+                    f"family member: {final!r}"
+                )
+        _atomic_write(
+            parent, _IMPORT_MARKER_NAME, _encode_import_marker(digest)
+        )
+        missing = plan
+    # The first member (in plan order) reaching a block holds its
+    # canonical file; later members hard-link from it, so a shared
+    # segment is stored exactly once.
+    canonical = {}
+    for member in plan:
+        for slot, block_id in enumerate(member["segments"]):
+            if block_id not in canonical:
+                canonical[block_id] = os.path.join(
+                    parent, member["name"], _segment_name(slot)
+                )
+    for member in missing:
+        _commit_import_member(parent, member, blobs, canonical)
+    _unlink_quietly(os.path.join(parent, _IMPORT_MARKER_NAME))
+    _fsync_directory(parent)
 
 
 def _existing_family_member(parent):
@@ -5730,3 +5862,21 @@ def load_bytes(source):
     if isinstance(source, (bytes, bytearray, memoryview)):
         return parse_bytes(source)
     raise TypeError("load source must be a path or bytes")
+
+
+# Cross-family incremental synchronization lives in its own module but is
+# re-exported here so the family-level API (fork/merge/delete/compact,
+# export/import) stays in one namespace.  Imported at the bottom because
+# that module imports the primitives above from this one.
+from ._familysync import (  # noqa: E402
+    SYNC_EXPORT_MAGIC,
+    apply_family_diff,
+    apply_family_diff_memory,
+    diff_families,
+    diff_families_memory,
+    full_to_incremental_artifact,
+    full_to_incremental_artifact_memory,
+    incremental_to_full_artifact,
+    incremental_to_full_artifact_memory,
+    parse_sync_artifact,
+)
