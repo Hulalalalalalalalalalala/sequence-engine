@@ -141,6 +141,13 @@ class Sequential:
       target; the target reassembles afterwards to the source's state
       bit for bit while the source is untouched and shared segments are
       never stored twice.
+    * ``export_family(members, target)`` / ``import_family(source,
+      target)`` -- pack a whole chain family into one self-contained
+      artifact (shared segments stored once, every member's head and
+      tail positions preserved) and restore it back into chain
+      directories with the same member count, segment positions, shared
+      layout and bit-for-bit state; both directions are crash-safe and
+      advance no member's optimizer step.
 
     All public operations are serialised by one re-entrant lock, so
     several threads may interleave ``forward``, ``backward``, ``update``,
@@ -920,6 +927,111 @@ class Sequential:
                 return _checkpoint.verify_chain(source)
             raise TypeError(
                 "verify source must be a chain directory or a MemoryChain"
+            )
+
+    def export_family(self, members, target=None):
+        """Pack a whole chain family into one self-contained artifact.
+
+        *members* is the sequence of the family's chain directories (or
+        ``MemoryChain`` stores); its order is preserved in the artifact.
+        For directory members, *target* is the artifact file's
+        destination path and the call returns ``None``; for
+        ``MemoryChain`` members no *target* is given and the artifact
+        bytes are returned.  Segments the members share are stored once;
+        each member's head and member-owned tail segments are preserved
+        exactly, positions included.  The export advances no member's
+        optimizer step and changes no member by a byte; exporting the
+        same family twice produces identical artifacts.  Members keep
+        saving, loading and appending while the export runs -- the
+        artifact fixes one consistent, quiescent snapshot.
+
+        A missing member directory or referenced segment raises
+        ``FileNotFoundError``; a truncated, corrupt or out-of-order
+        segment, or members whose parameter shapes or layer order
+        disagree, rejects the whole export with ``ValueError`` before
+        the artifact is written; an unwritable destination directory or
+        a full disk raises ``OSError``.  The artifact file is written
+        through a temp file and atomically renamed, so a process killed
+        mid-export leaves only the rejected temp file behind.
+        """
+        with self._lock:
+            if isinstance(members, (str, bytes, os.PathLike)):
+                raise TypeError(
+                    "a chain family must be a sequence of chain directories "
+                    "or MemoryChains"
+                )
+            try:
+                members = list(members)
+            except TypeError:
+                raise TypeError(
+                    "a chain family must be a sequence of chain directories "
+                    "or MemoryChains"
+                ) from None
+            if not members:
+                raise ValueError("a chain family needs at least one chain")
+            if all(isinstance(member, _checkpoint.MemoryChain) for member in members):
+                if target is not None:
+                    raise TypeError(
+                        "a MemoryChain family export takes no target path"
+                    )
+                return _checkpoint.export_family_memory(members)
+            if all(isinstance(member, (str, os.PathLike)) for member in members):
+                if target is None:
+                    raise TypeError(
+                        "exporting a chain family of directories requires a "
+                        "target path"
+                    )
+                return _checkpoint.export_family(members, target)
+            raise TypeError(
+                "a family export needs a sequence of chain directories or "
+                "a sequence of MemoryChains"
+            )
+
+    def import_family(self, source, target=None):
+        """Restore a family artifact into a chain family.
+
+        *source* is a family artifact file path, or artifact bytes (as
+        returned by :meth:`export_family` for ``MemoryChain`` members).
+        For an artifact file, *target* is the existing directory that
+        receives one chain directory per family member and the call
+        returns ``None``; for artifact bytes no *target* is given and a
+        list of ``MemoryChain`` stores is returned.  The restored member
+        count, segment positions and shared layout match the exported
+        family, and every member's parameters, gradients, optimizer
+        state and step count and hidden state restore bit for bit; no
+        optimizer step advances.
+
+        The artifact is validated in full before anything is written;
+        each member appears as one complete chain or not at all, and a
+        process killed mid-import leaves a resumable marker plus
+        whole-file staging debris -- re-running the same import finishes
+        the remaining members with a result bit for bit identical to one
+        uninterrupted run, and the debris is reclaimed by the next
+        family operation over the target directory.  If the target
+        already holds a chain family member the import raises
+        ``ValueError`` without changing one byte there.  A missing
+        artifact file or target directory raises ``FileNotFoundError``;
+        a torn, truncated, missing-field, reordered or
+        shape/layer-order-inconsistent artifact rejects the whole import
+        with ``ValueError``; an unwritable directory or a full disk
+        raises ``OSError``.
+        """
+        with self._lock:
+            if isinstance(source, (bytes, bytearray, memoryview)):
+                if target is not None:
+                    raise TypeError(
+                        "an in-memory family import takes no target directory"
+                    )
+                return _checkpoint.import_family_memory(source)
+            if isinstance(source, (str, os.PathLike)):
+                if target is None:
+                    raise TypeError(
+                        "importing a family artifact requires a target "
+                        "directory"
+                    )
+                return _checkpoint.import_family(source, target)
+            raise TypeError(
+                "import source must be a family artifact path or bytes"
             )
 
     def _validate_against_model(self, document):

@@ -2757,6 +2757,374 @@ def _check_family_compaction_memory():
     )
 
 
+def _repack_export(raw, mutate):
+    """Rewrite family artifact bytes with a mutated manifest header."""
+    hlen = struct.unpack("<Q", raw[12:20])[0]
+    header = json.loads(raw[20 : 20 + hlen])
+    end = raw.rfind(_checkpoint.FAMILY_EXPORT_END_MAGIC)
+    blocks = raw[20 + hlen + 8 : end]
+    mutate(header)
+    new_header = json.dumps(
+        header, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    body = (
+        raw[:8]
+        + struct.pack("<I", 1)
+        + struct.pack("<Q", len(new_header))
+        + new_header
+        + struct.pack("<Q", len(header["segments"]))
+        + blocks
+    )
+    crc = zlib.crc32(body[20:])
+    return body + _checkpoint.FAMILY_EXPORT_END_MAGIC + struct.pack("<I", crc)
+
+
+def _splice_exports(raw_a, raw_b):
+    """Combine two family artifacts into one family with two sections.
+
+    The second artifact's members are renamed and their block references
+    shifted past the first artifact's inventory, so the result is a
+    well-framed artifact whose members come from unrelated chains.
+    """
+    def split(raw):
+        hlen = struct.unpack("<Q", raw[12:20])[0]
+        header = json.loads(raw[20 : 20 + hlen])
+        end = raw.rfind(_checkpoint.FAMILY_EXPORT_END_MAGIC)
+        # The block area is one uint64 block count followed by the blocks.
+        payload = raw[20 + hlen + 8 : end]
+        return header, payload
+
+    ha, pa = split(raw_a)
+    hb, pb = split(raw_b)
+    offset = len(ha["segments"])
+    members = list(ha["members"])
+    for position, member in enumerate(hb["members"]):
+        member = dict(member)
+        member["name"] = f"spliced-{position}"
+        member["segments"] = [entry + offset for entry in member["segments"]]
+        members.append(member)
+    header = {"v": 1, "members": members, "segments": ha["segments"] + hb["segments"]}
+    header_bytes = json.dumps(
+        header, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    blocks = pa + pb
+    body = (
+        _checkpoint.FAMILY_EXPORT_MAGIC
+        + struct.pack("<I", 1)
+        + struct.pack("<Q", len(header_bytes))
+        + header_bytes
+        + struct.pack("<Q", len(header["segments"]))
+        + blocks
+    )
+    crc = zlib.crc32(body[20:])
+    return body + _checkpoint.FAMILY_EXPORT_END_MAGIC + struct.pack("<I", crc)
+
+
+def _check_family_export_import_memory():
+    # A family of three memory chains: main plus two branches sharing
+    # different prefixes.  The export packs the shared history once and
+    # the import restores members, positions and the shared layout.
+    seq, _ = _fresh_stack()
+    main = _checkpoint.MemoryChain()
+    seq.save(main)  # seg 0 (basis, no hidden)
+    out, hidden = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out))
+    seq.update(_LR)
+    seq.save(main)  # seg 1 (hidden introduced)
+    seq.adam_step(_ADAM_LR)
+    seq.save(main)  # seg 2
+    seq.update(_LR)
+    seq.save(main)  # seg 3
+    b1 = _checkpoint.fork_chain_memory(main, up_to=2)
+    b1_seq, _ = _fresh_stack()
+    b1_hidden = b1_seq.load(b1)
+    o, b1_hidden = b1_seq.forward(Tensor(_SEG2), b1_hidden)
+    b1_seq.backward(_total(o))
+    b1_seq.adam_step(_ADAM_LR)
+    b1_seq.save(b1)  # b1-owned seg 3
+    b2 = _checkpoint.fork_chain_memory(main, up_to=1)
+    members = [main, b1, b2]
+    states = {
+        id(chain): _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+        for chain in members
+    }
+    steps = {
+        id(chain): _checkpoint.load_chain_memory(chain)["optim"]["t"]
+        for chain in members
+    }
+
+    artifact = _checkpoint.export_family_memory(members)
+    _check(
+        artifact[:8] == _checkpoint.FAMILY_EXPORT_MAGIC,
+        "a family export carries the family artifact magic",
+    )
+    _check(
+        _checkpoint.export_family_memory(members) == artifact,
+        "repeated export of the same family is byte-identical",
+    )
+    for chain in members:
+        _check(
+            _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+            == states[id(chain)],
+            "export changes no member's state",
+        )
+        _check(
+            _checkpoint.load_chain_memory(chain)["optim"]["t"] == steps[id(chain)],
+            "export advances no member's optimizer step",
+        )
+
+    restored = _checkpoint.import_family_memory(artifact)
+    _check(len(restored) == 3, "import restores every family member")
+    for original, copy in zip(members, restored):
+        _check(
+            _checkpoint.build_bytes(_checkpoint.load_chain_memory(copy))
+            == states[id(original)],
+            "an imported member reassembles bit for bit",
+        )
+        _check(
+            _checkpoint.load_chain_memory(copy)["optim"]["t"] == steps[id(original)],
+            "import advances no member's optimizer step",
+        )
+        _check(
+            copy.read_head() == original.read_head(),
+            "an imported member's head matches the exported head",
+        )
+    # The shared layout is preserved: the common prefix is one object per
+    # slot, member-owned tails stay private.
+    seg0 = _checkpoint._segment_name(0)
+    seg1 = _checkpoint._segment_name(1)
+    seg2 = _checkpoint._segment_name(2)
+    seg3 = _checkpoint._segment_name(3)
+    _check(
+        restored[0]._objects[seg0]
+        is restored[1]._objects[seg0]
+        is restored[2]._objects[seg0],
+        "the imported family shares the basis segment object",
+    )
+    _check(
+        restored[0]._objects[seg1] is restored[2]._objects[seg1],
+        "a prefix segment shared by two members stays shared",
+    )
+    _check(
+        restored[0]._objects[seg2] is restored[1]._objects[seg2],
+        "a prefix segment shared by main and b1 stays shared",
+    )
+    _check(
+        restored[0]._objects[seg3] is not restored[1]._objects[seg3],
+        "member-owned tail segments stay private",
+    )
+    for chain in restored:
+        _check(
+            _checkpoint.verify_chain_memory(chain).ok,
+            "an imported member verifies",
+        )
+    # Re-exporting the restored family reproduces the artifact exactly.
+    _check(
+        _checkpoint.export_family_memory(restored) == artifact,
+        "export -> import -> export reproduces the artifact byte for byte",
+    )
+
+    # Rejection taxonomy: the whole artifact is refused, nothing is
+    # partially restored.
+    _expect(
+        ValueError,
+        lambda: _checkpoint.import_family_memory(b""),
+        "an empty artifact is rejected",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.import_family_memory(b"not a family export"),
+        "foreign bytes are rejected",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.import_family_memory(artifact[: len(artifact) // 2]),
+        "a truncated artifact is rejected",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.import_family_memory(artifact[:-1]),
+        "a torn trailer is rejected",
+    )
+    flipped = bytearray(artifact)
+    flipped[len(flipped) // 2] ^= 0xFF
+    _expect(
+        ValueError,
+        lambda: _checkpoint.import_family_memory(bytes(flipped)),
+        "a flipped byte fails the artifact CRC",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.import_family_memory(
+            artifact[:8] + struct.pack("<I", 99) + artifact[12:]
+        ),
+        "an unknown artifact version is rejected",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.import_family_memory(
+            _repack_export(artifact, lambda h: h.pop("members"))
+        ),
+        "an artifact missing a field is rejected",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.import_family_memory(
+            _repack_export(artifact, lambda h: h.update(surprise=1))
+        ),
+        "an artifact with an extra field is rejected",
+    )
+
+    def swap_first_two_entries(header):
+        entries = header["members"][0]["segments"]
+        entries[0], entries[1] = entries[1], entries[0]
+
+    _expect(
+        ValueError,
+        lambda: _checkpoint.import_family_memory(
+            _repack_export(artifact, swap_first_two_entries)
+        ),
+        "out-of-order segment references are rejected",
+    )
+
+    def duplicate_member(header):
+        header["members"].append(dict(header["members"][0]))
+
+    _expect(
+        ValueError,
+        lambda: _checkpoint.import_family_memory(
+            _repack_export(artifact, duplicate_member)
+        ),
+        "a duplicated member is rejected",
+    )
+
+    def orphan_block(raw):
+        # Append a copy of the basis block to the block area and list it
+        # in the inventory, but let no member reach it.
+        hlen = struct.unpack("<Q", raw[12:20])[0]
+        header = json.loads(raw[20 : 20 + hlen])
+        end = raw.rfind(_checkpoint.FAMILY_EXPORT_END_MAGIC)
+        area = raw[20 + hlen : end]
+        (count,) = struct.unpack("<Q", area[:8])
+        pos = 8
+        length = struct.unpack("<Q", area[pos : pos + 8])[0]
+        basis_bytes = area[pos + 8 : pos + 8 + length]
+        header["segments"].append(
+            {
+                "name": "seg-0000000000.seqd",
+                "size": length,
+                "crc": zlib.crc32(basis_bytes) & 0xFFFFFFFF,
+            }
+        )
+        new_header = json.dumps(
+            header, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        blocks = area[8:] + struct.pack("<Q", length) + basis_bytes
+        body = (
+            _checkpoint.FAMILY_EXPORT_MAGIC
+            + struct.pack("<I", 1)
+            + struct.pack("<Q", len(new_header))
+            + new_header
+            + struct.pack("<Q", count + 1)
+            + blocks
+        )
+        crc = zlib.crc32(body[20:])
+        return body + _checkpoint.FAMILY_EXPORT_END_MAGIC + struct.pack("<I", crc)
+
+    _expect(
+        ValueError,
+        lambda: _checkpoint.import_family_memory(orphan_block(artifact)),
+        "a segment block no member reaches is rejected",
+    )
+
+    # Members whose shapes or layer order disagree reject the import.
+    other_weights = _base_weights()
+    other_weights["b1"] = [0.01, -0.02]
+    shaped_seq, _ = _fresh_stack(other_weights)
+    shaped = _checkpoint.MemoryChain()
+    shaped_seq.save(shaped)
+    shaped_artifact = _checkpoint.export_family_memory([shaped])
+    _expect(
+        ValueError,
+        lambda: _checkpoint.import_family_memory(
+            _splice_exports(artifact, shaped_artifact)
+        ),
+        "members with disagreeing shapes reject the import",
+    )
+    # The same disagreement already rejects the export.
+    _expect(
+        ValueError,
+        lambda: _checkpoint.export_family_memory([main, shaped]),
+        "shape-inconsistent members refuse a family export",
+    )
+
+    # Error taxonomy of the export/import entry points.
+    _expect(
+        ValueError,
+        lambda: _checkpoint.export_family_memory([]),
+        "an empty family is rejected",
+    )
+    _expect(
+        TypeError,
+        lambda: _checkpoint.export_family_memory(main),
+        "a bare MemoryChain is not a family",
+    )
+    _expect(
+        TypeError,
+        lambda: _checkpoint.export_family_memory([main, object()]),
+        "a non-MemoryChain member is rejected",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.export_family_memory([main, main]),
+        "a duplicated member is rejected on export",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.export_family_memory([_checkpoint.MemoryChain()]),
+        "a chain with no committed basis cannot be exported",
+    )
+
+    # The container-level entry points round-trip memory families too.
+    via_seq, _ = _fresh_stack()
+    via_artifact = via_seq.export_family(members)
+    _check(
+        via_artifact == artifact,
+        "Sequential.export_family packs a memory family identically",
+    )
+    via_restored = via_seq.import_family(via_artifact)
+    _check(
+        len(via_restored) == 3
+        and all(isinstance(chain, _checkpoint.MemoryChain) for chain in via_restored),
+        "Sequential.import_family restores memory chains",
+    )
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(via_restored[0]))
+        == states[id(main)],
+        "Sequential.import_family restores the state bit for bit",
+    )
+    _expect(
+        TypeError,
+        lambda: via_seq.export_family(members, "somewhere"),
+        "a memory family export takes no target path",
+    )
+    _expect(
+        TypeError,
+        lambda: via_seq.export_family([main, bytearray()]),
+        "a mixed family is rejected on export",
+    )
+    _expect(
+        TypeError,
+        lambda: via_seq.import_family(via_artifact, "somewhere"),
+        "an in-memory import takes no target directory",
+    )
+    _expect(
+        TypeError,
+        lambda: via_seq.import_family(123),
+        "import rejects a non-artifact source",
+    )
+
+
 _GROUPS = [
     ("tensor basics", _check_tensor_basics),
     ("tensor validation", _check_tensor_validation),
@@ -2784,6 +3152,7 @@ _GROUPS = [
     ("in-memory chain delete", _check_chain_delete_memory),
     ("in-memory chain merge", _check_chain_merge_memory),
     ("in-memory family compaction", _check_family_compaction_memory),
+    ("in-memory family export/import", _check_family_export_import_memory),
     ("streaming compaction interleave", _check_streaming_compaction_interleaves),
     ("chain verification", _check_chain_verification),
     ("backward replay failure surfaced", _check_backward_replay_failure_is_surfaced),

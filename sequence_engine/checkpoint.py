@@ -60,6 +60,18 @@ Two on-disk shapes share the same leaf encoding and trailer:
   segment-then-head append commit a save does -- a kill leaves only the
   old or the new head, both one complete chain -- and its orphan residue
   is reclaimed by the next fork, compaction, deletion or merge.
+* **Family export / import** -- a whole chain family packs into one
+  self-contained artifact file (magic ``SEQFAMX1``): every shared
+  segment is stored once as a deduplicated block and a manifest records
+  the member order, each member's head and the block filling each of
+  its segment positions.  Import restores the artifact into chain
+  directories with the same member count, segment positions, hard-link
+  sharing layout and bit-for-bit state, staging each member like a fork
+  (segment links first, the head pointer last) so a member appears as
+  one complete chain or not at all; a killed import is resumed by
+  re-running it and its debris is reclaimed by the next family
+  operation.  Neither direction advances any member's optimizer step,
+  and exporting the same family twice produces identical artifacts.
 
 Full snapshot wire format (all integers little-endian)::
 
@@ -98,6 +110,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import hashlib
 import json
 import math
 import os
@@ -211,6 +224,27 @@ _family_locks_guard = threading.Lock()
 _family_locks: dict[str, threading.Lock] = {}
 _active_families_guard = threading.Lock()
 _active_families: set[str] = set()
+
+# Family export/import.  A whole chain family is packed into one
+# self-contained artifact file: a JSON manifest (member order, heads, the
+# deduplicated segment inventory with its per-member reach) followed by
+# one block per distinct segment byte string -- the same bytes the chain
+# directories hold, shared segments stored once -- and a CRC trailer.
+# Import restores the artifact into member chain directories in one
+# staging parent (the same fork-populates-a-staging-dir-then-renames
+# protocol a fork uses), so the members appear as complete chains or not
+# at all; a killed import leaves only a staging directory, which the next
+# family operation over the target parent reclaims deterministically.
+FAMILY_EXPORT_MAGIC = b"SEQFAMX1"
+FAMILY_EXPORT_END_MAGIC = b"SEQFAMX1END"
+_FAMILY_EXPORT_VERSION = 1
+
+_IMPORT_TMP_PREFIX = ".seqimp.tmp-"
+_IMPORT_MARKER_NAME = ".seqimport"
+_IMPORT_MARKER_KEYS = frozenset(("v", "d"))
+_FAMILY_MANIFEST_KEYS = frozenset(("v", "members", "segments"))
+_FAMILY_MEMBER_KEYS = frozenset(("name", "head", "segments"))
+_FAMILY_SEGMENT_KEYS = frozenset(("name", "size", "crc"))
 
 
 def _lease_register(directory):
@@ -432,22 +466,28 @@ def _wait_for_family_lease(parent):
         os.close(fd)
 
 
-class _FamilyFoldGuard:
-    """Serialise a single-chain fold with family folds in the same parent.
+class _FamilyParentGuard:
+    """Serialise family-shaping operations over one family parent dir.
 
-    Saves, loads, verifies, forks, merges and deletions do not take this
-    guard -- only a fold (single-chain or family) does -- so ordinary
-    chain traffic keeps flowing while maintenance folds serialise: a
-    family fold blocks here until any single-chain fold of a sibling
-    member finishes, and a single-chain fold blocks while a family fold
-    is active.  On platforms without ``fcntl`` the in-process family lock
-    provides the same guarantee within the process.
+    Folds (a single-chain compaction of a member or a family fold) and
+    family import/export take this guard; saves, loads, verifies, forks,
+    merges and deletions do not, so ordinary chain traffic keeps flowing
+    while maintenance work serialises: a family fold blocks here until
+    any single-chain fold of a sibling member finishes, a single-chain
+    fold blocks while a family fold is active, and an import or export
+    waits out the same lock.  On platforms without ``fcntl`` the
+    in-process family lock provides the same guarantee within the
+    process.
     """
 
-    def __init__(self, chain_directory):
-        self._parent = os.path.dirname(os.path.abspath(chain_directory))
+    def __init__(self, parent):
+        self._parent = os.path.abspath(parent)
         self._fd = None
         self._thread_lock = None
+
+    @classmethod
+    def for_chain(cls, chain_directory):
+        return cls(os.path.dirname(os.path.abspath(chain_directory)))
 
     def __enter__(self):
         if fcntl is None:
@@ -456,9 +496,9 @@ class _FamilyFoldGuard:
             return self
         fd = os.open(_family_lease_path(self._parent), os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            # Blocking: wait out any family fold (or another single-chain
-            # fold of a sibling) instead of spinning.  flock serialises
-            # separate opens even within one process.
+            # Blocking: wait out any family fold, import/export or
+            # another single-chain fold of a sibling instead of spinning.
+            # flock serialises separate opens even within one process.
             fcntl.flock(fd, fcntl.LOCK_EX)
         except BaseException:
             os.close(fd)
@@ -501,6 +541,10 @@ class _FamilyFoldGuard:
             self._thread_lock.release()
             self._thread_lock = None
         return False
+
+
+# Backwards-compatible name: a fold enters the same parent guard.
+_FamilyFoldGuard = _FamilyParentGuard.for_chain
 
 
 _BASE_HEADER_KEYS = frozenset(("v", "params", "grads", "hidden", "layers", "pending"))
@@ -2138,40 +2182,60 @@ def _verify_failure(position, what, exc):
     )
 
 
+def _verify_segment_position(index, kind):
+    """The human-readable location of segment *index* in an error.
+
+    Names both the segment position and the literal segment file, so the
+    first bad segment can be located on disk by file name.
+    """
+    return f"segment {index}", f"{kind}, segment file {_segment_name(index)!r}"
+
+
 def _verify_normal_chain(store, head):
     """Validate the ordinary on-disk chain ``0..head``; read-only.
 
     Any defect -- including a referenced segment file that is absent -- is
-    a verification failure naming the first bad segment.  The final
-    assembly (completeness of the tensor space) is checked too.
+    a verification failure naming the first bad segment, its segment file
+    and the reason.  The final assembly (completeness of the tensor space)
+    is checked too.
     """
     try:
         basis_raw = store.read_segment(_segment_name(_BASIS_INDEX))
     except FileNotFoundError:
         raise CheckpointError(
-            "chain verification failed at segment 0 (basis): "
+            "chain verification failed at segment 0 "
+            f"(basis, segment file {_segment_name(_BASIS_INDEX)!r}): "
             "the basis segment file is missing"
         ) from None
     try:
         walker = _ChainWalker(basis_raw)
     except CheckpointError as exc:
-        raise _verify_failure("segment 0", "basis", exc) from exc
+        raise _verify_failure(
+            *_verify_segment_position(_BASIS_INDEX, "basis"), exc
+        ) from exc
     for index in range(1, head + 1):
         try:
             raw = store.read_segment(_segment_name(index))
         except FileNotFoundError:
             raise CheckpointError(
-                f"chain verification failed at segment {index} (delta): "
+                f"chain verification failed at segment {index} "
+                f"(delta, segment file {_segment_name(index)!r}): "
                 "the segment file is missing"
             ) from None
         try:
             walker.apply_delta(index, raw)
         except CheckpointError as exc:
-            raise _verify_failure(f"segment {index}", "delta", exc) from exc
+            raise _verify_failure(
+                *_verify_segment_position(index, "delta"), exc
+            ) from exc
     try:
         walker.document()
     except CheckpointError as exc:
-        raise _verify_failure(f"segment {head}", "chain assembly", exc) from exc
+        raise _verify_failure(
+            f"segment {head}",
+            f"chain assembly, segment file {_segment_name(head)!r}",
+            exc,
+        ) from exc
 
 
 def verify_chain_memory(store):
@@ -2295,10 +2359,10 @@ def verify_family(members):
     return ChainFamilyVerification(tuple(paths), tuple(reports))
 
 
-# Matches a genuine segment defect ("segment 3 (delta)" / "segment 0
-# (basis)") in a verification failure, so the family report can attribute
-# a shared segment to every chain that reaches it.
-_FAMILY_SEGMENT_RE = re.compile(r"segment (\d+) \((?:basis|delta)\)")
+# Matches a genuine segment defect ("segment 3 (delta, ...)" / "segment 0
+# (basis, ...)") in a verification failure, so the family report can
+# attribute a shared segment to every chain that reaches it.
+_FAMILY_SEGMENT_RE = re.compile(r"segment (\d+) \((?:basis|delta)\b")
 
 
 def _attributed_family_error(paths, position, exc):
@@ -2553,7 +2617,7 @@ def compact_chain(directory, up_to=None):
     # the family directory are reclaimed on every compaction.
     _sweep_parent_staging(os.path.dirname(os.path.abspath(directory)))
 
-    with _FamilyFoldGuard(directory):
+    with _FamilyParentGuard(os.path.dirname(os.path.abspath(directory))):
         return _compact_chain_locked(directory, up_to)
 
 
@@ -2886,11 +2950,11 @@ def _family_shape_signature(document):
     )
 
 
-def _format_family_shape_mismatch(signatures, members):
+def _format_family_shape_mismatch(signatures, members, operation="family compaction"):
     """A rejection message naming the shapes and layer order that disagree."""
     reference_shapes, reference_layers = signatures[0]
     lines = [
-        "family compaction rejected: the members' parameter shapes or "
+        f"{operation} rejected: the members' parameter shapes or "
         "layer order do not agree"
     ]
     lines.append(
@@ -4342,17 +4406,17 @@ def _staging_dir_is_live(staging):
 
 
 def _sweep_parent_staging(parent):
-    """Remove killed fork/delete staging directories in *parent*.
+    """Remove killed fork/delete/import staging directories in *parent*.
 
-    Garbage collection only: a directory still owned by a live fork is
-    skipped and operating-system failures never reach the caller.  A
-    delete staging directory is always detached (the rename is its only
-    creation step), so it needs no liveness check.  The scan runs under
-    the parent directory's advisory flock, which is the same lock a fork
-    holds while creating its staging and locking its sentinel, so a
-    staging is either not there yet or already recognisably alive --
-    there is no window in which a half-created live staging can be
-    swept.
+    Garbage collection only: a directory still owned by a live fork or
+    import is skipped and operating-system failures never reach the
+    caller.  A delete staging directory is always detached (the rename
+    is its only creation step), so it needs no liveness check.  The scan
+    runs under the parent directory's advisory flock, which is the same
+    lock a fork or import holds while creating its staging and locking
+    its sentinel, so a staging is either not there yet or already
+    recognisably alive -- there is no window in which a half-created
+    live staging can be swept.
     """
     with _DirectoryChainLock(parent):
         try:
@@ -4361,7 +4425,7 @@ def _sweep_parent_staging(parent):
             return
         removed = False
         for name in names:
-            if name.startswith(_FORK_TMP_PREFIX):
+            if name.startswith((_FORK_TMP_PREFIX, _IMPORT_TMP_PREFIX)):
                 path = os.path.join(parent, name)
                 if not os.path.isdir(path):
                     _unlink_quietly(path)
@@ -4762,6 +4826,856 @@ def merge_chains_memory(source, target):
         target.write_segment(_segment_name(next_index), delta_bytes)
         _commit_head(target, next_index)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Family export / import
+#
+# Export packs a whole chain family -- every member directory handed in --
+# into one self-contained artifact.  Every shared segment file (the
+# hard-linked fork prefix) becomes one deduplicated block, so the shared
+# history is stored once; the manifest records the member order, each
+# member's head and, for every member, which block fills each of its
+# segment positions.  Import reconstructs exactly that layout -- the same
+# member count, the same segment positions and the same hard-link
+# sharing -- with every member's reassembled state bit for bit identical.
+#
+# Artifact wire format (all integers little-endian)::
+#
+#     magic        8 bytes  b"SEQFAMX1"
+#     version      uint32   family artifact format version (1)
+#     manifest_len uint64   length of the JSON manifest in bytes
+#     manifest     UTF-8 JSON: {"v", "members", "segments"}
+#     block_count  uint64   number of segment blocks (== len(segments))
+#     blocks       per block: uint64 length followed by the raw segment
+#                  bytes (the exact bytes the chain directory holds)
+#     end_magic    10 bytes b"SEQFAMX1END"
+#     payload_crc  uint32   CRC-32 of the manifest bytes and all blocks
+#
+# ``members`` is a list of ``{"name", "head", "segments"}``: the member
+# directory's base name, its head segment index and, for every segment
+# position ``0..head``, the id of the block holding that position's
+# bytes.  ``segments`` is the deduplicated block inventory ``{"name",
+# "size", "crc"}``: the segment file name the block stands at, its
+# length and its CRC-32.  Two blocks may carry the same name (two
+# members' diverging tails occupy the same positions); a block's name is
+# the one position every member reaching it agrees on.
+#
+# Export never writes into a member.  Import writes only into private
+# staging directories populated exactly like a fork's staging (segment
+# links first, the head pointer last) and renamed into place atomically,
+# so a member appears as one complete chain or not at all.  A killed
+# import leaves a resumable marker plus whole-file staging debris: a
+# re-run of the same import finishes the remaining members with a result
+# bit for bit identical to one uninterrupted run, and the debris is
+# reclaimed deterministically by the next family operation over that
+# parent.  Both directions serialise with folds and with each other
+# through the family parent guard, and with saves, loads, appends,
+# forks, merges and deletions through the member directory locks.
+# ---------------------------------------------------------------------------
+
+
+def _family_export_snapshot(abs_paths):
+    """One consistent, quiescent snapshot of every member chain.
+
+    Returns ``(heads, records, documents)`` keyed by member path;
+    *records* maps each segment name to ``(raw_bytes, share_key)`` where
+    the share key identifies the underlying shared file.  Every member
+    lock is taken together (sorted absolute paths, a deadlock-free total
+    order) and held while the heads are read and the segment bytes are
+    inventoried, so no save, append, fork, merge, deletion or compaction
+    can move a member in between.  A member deleted underneath the
+    export, or a segment a head reaches that is absent, raises
+    FileNotFoundError; a truncated, corrupt or out-of-order segment
+    raises ValueError -- both before the artifact is written.
+    """
+    ordered = sorted(abs_paths)
+    while True:
+        with contextlib.ExitStack() as stack:
+            locked = [d for d in ordered if os.path.isdir(d)]
+            for directory in locked:
+                stack.enter_context(_DirectoryChainLock(directory))
+            if len(locked) != len(ordered):
+                missing = [d for d in ordered if d not in locked][0]
+                raise FileNotFoundError(
+                    f"incremental checkpoint directory not found: {missing!r}"
+                )
+            stores = {d: _DirectoryChainStore(d) for d in locked}
+            for directory, store in stores.items():
+                _recover_directory_chain(directory, store)
+            busy = [d for d in locked if _member_fold_busy(d)]
+            if not busy:
+                heads = {}
+                records = {}
+                documents = {}
+                for directory, store in stores.items():
+                    head = _read_head_optional(store)
+                    if head is None:
+                        raise CheckpointError(
+                            "chain has no head pointer (no basis segment "
+                            f"committed): {directory!r}"
+                        )
+                    heads[directory] = head
+                    records[directory], documents[directory] = (
+                        _read_member_segments(directory, store, head)
+                    )
+                return heads, records, documents
+        for directory in busy:
+            _wait_for_member_quiescent(directory)
+
+
+def _read_member_segments(directory, store, head):
+    """Read and validate ``seg-0..seg-head``; return ``(records, document)``.
+
+    *records* maps each segment name to ``(raw_bytes, share_key)`` with
+    the share key naming the underlying shared file, so one physical
+    segment becomes one artifact block no matter how many members reach
+    it.
+    """
+    document = _load_chain_store(store, head)
+    records = {}
+    for index in range(head + 1):
+        name = _segment_name(index)
+        raw = store.read_segment(name)
+        stat = os.stat(os.path.join(directory, name))
+        records[name] = (raw, (stat.st_dev, stat.st_ino))
+    return records, document
+
+
+def _build_family_export(members, heads, records):
+    """Freeze the inventoried family into the self-contained artifact.
+
+    Segments reached through the same underlying file become one block,
+    ordered by the first (member, position) that reaches them, so the
+    artifact is a pure function of the family: exporting the same family
+    twice produces identical bytes.
+    """
+    blocks = []  # (segment name, raw bytes), one per distinct shared file
+    block_of_share = {}  # share key -> block id
+    manifest_members = []
+    for directory in members:
+        if directory not in records:
+            raise FileNotFoundError(
+                f"incremental checkpoint directory not found: {directory!r}"
+            )
+        reach = []
+        for index in range(heads[directory] + 1):
+            name = _segment_name(index)
+            raw, share_key = records[directory][name]
+            block_id = block_of_share.get(share_key)
+            if block_id is None:
+                block_id = len(blocks)
+                block_of_share[share_key] = block_id
+                blocks.append((name, raw))
+            elif blocks[block_id][0] != name:
+                # Invariant of every fork family: a shared segment file
+                # sits at the same numbered slot in every member.
+                raise CheckpointError(
+                    "family export rejected: a shared segment file sits at "
+                    f"different positions ({blocks[block_id][0]} and {name}) "
+                    "across the members"
+                )
+            reach.append(block_id)
+        manifest_members.append(
+            {
+                "name": os.path.basename(directory),
+                "head": heads[directory],
+                "segments": reach,
+            }
+        )
+    manifest = {
+        "v": _FAMILY_EXPORT_VERSION,
+        "members": manifest_members,
+        "segments": [
+            {"name": name, "size": len(raw), "crc": zlib.crc32(raw) & 0xFFFFFFFF}
+            for name, raw in blocks
+        ],
+    }
+    return _frame_family_export(manifest, [raw for _name, raw in blocks])
+
+
+def _frame_family_export(manifest, blobs):
+    manifest_bytes = json.dumps(
+        manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    body = bytearray()
+    body += FAMILY_EXPORT_MAGIC
+    body += struct.pack("<I", manifest["v"])
+    body += struct.pack("<Q", len(manifest_bytes))
+    body += manifest_bytes
+    body += struct.pack("<Q", len(blobs))
+    crc = zlib.crc32(manifest_bytes)
+    for raw in blobs:
+        body += struct.pack("<Q", len(raw))
+        body += raw
+        crc = zlib.crc32(raw, crc)
+    body += FAMILY_EXPORT_END_MAGIC
+    body += struct.pack("<I", crc & 0xFFFFFFFF)
+    return bytes(body)
+
+
+def _check_family_member_name(name, what):
+    if (
+        not isinstance(name, str)
+        or not name
+        or name.startswith(".")
+        or os.path.basename(name) != name
+        or (os.altsep is not None and os.altsep in name)
+    ):
+        raise CheckpointError(
+            f"{what}: {name!r} is not a usable family member directory name"
+        )
+
+
+def _check_family_shape_agreement(documents, names, operation):
+    """Reject a family whose members disagree on shapes or layer order."""
+    signatures = [_family_shape_signature(document) for document in documents]
+    reference = signatures[0]
+    if any(signature != reference for signature in signatures[1:]):
+        raise CheckpointError(
+            _format_family_shape_mismatch(signatures, names, operation)
+        )
+
+
+def export_family(members, target):
+    """Pack a whole chain family into one self-contained artifact.
+
+    *members* is the sequence of the family's chain directories (its
+    order is preserved in the artifact); *target* is the artifact file's
+    destination path.  Segments the members share (the hard-linked fork
+    prefix) are stored once; each member's head and the member-owned
+    tail segments are preserved exactly, positions included.  The export
+    advances no member's optimizer step and changes no member by a byte;
+    exporting the same family twice produces identical artifacts.
+    Members keep saving, loading and appending while the export runs:
+    the artifact fixes one consistent, quiescent snapshot and no member
+    is ever observed as half a chain.
+
+    A missing member directory or a segment a member's head reaches
+    raises FileNotFoundError.  A truncated segment, a missing field, an
+    out-of-order segment, or members whose parameter shapes or layer
+    order disagree reject the whole export with ValueError before the
+    artifact is written -- no member changes by a byte.  An unwritable
+    destination directory or a full disk raises OSError; the artifact
+    itself is written through a temp file and atomically renamed, so a
+    process killed mid-export leaves only the rejected temp file behind
+    and the destination either holds the previous complete artifact or
+    the new one.
+    """
+    if isinstance(members, (str, bytes, os.PathLike)):
+        raise TypeError("a chain family must be a sequence of chain directories")
+    try:
+        members = list(members)
+    except TypeError:
+        raise TypeError(
+            "a chain family must be a sequence of chain directories"
+        ) from None
+    if not members:
+        raise CheckpointError("a chain family needs at least one chain")
+    if not isinstance(target, (str, os.PathLike)):
+        raise TypeError("export target must be a filesystem path")
+    target = os.fspath(target)
+    paths = []
+    for member in members:
+        if not isinstance(member, (str, os.PathLike)):
+            raise TypeError("chain family members must be chain directory paths")
+        paths.append(os.fspath(member))
+    for path in paths:
+        if not os.path.isdir(path):
+            raise FileNotFoundError(
+                f"incremental checkpoint directory not found: {path!r}"
+            )
+    abs_paths = [os.path.abspath(path) for path in paths]
+    if len(set(abs_paths)) != len(abs_paths):
+        raise CheckpointError("a chain family must not list a member twice")
+    parents = {os.path.dirname(path) for path in abs_paths}
+    if len(parents) != 1:
+        raise CheckpointError(
+            "a family export requires every member directory to live in "
+            "the same parent directory"
+        )
+    parent = parents.pop()
+    names = [os.path.basename(path) for path in abs_paths]
+    for name in names:
+        _check_family_member_name(name, "family export")
+    target_abs = os.path.abspath(target)
+    if os.path.isdir(target_abs):
+        raise CheckpointError(
+            f"family export target is a directory: {target!r}"
+        )
+    for member_abs in abs_paths:
+        if target_abs == member_abs or target_abs.startswith(member_abs + os.sep):
+            raise CheckpointError(
+                "family export target must not live inside a member chain "
+                "directory"
+            )
+    target_parent = os.path.dirname(target_abs)
+    if not os.path.isdir(target_parent):
+        raise FileNotFoundError(
+            f"family export destination directory not found: {target_parent!r}"
+        )
+    _sweep_parent_staging(parent)
+    if target_parent != parent:
+        _sweep_parent_staging(target_parent)
+
+    with _FamilyParentGuard(parent):
+        heads, records, documents = _family_export_snapshot(abs_paths)
+        _check_family_shape_agreement(
+            [documents[path] for path in abs_paths], names, "family export"
+        )
+        raw = _build_family_export(abs_paths, heads, records)
+    _atomic_write(target_parent, os.path.basename(target_abs), raw)
+    return None
+
+
+def _parse_family_export(raw):
+    """Validate and decode a family artifact; return ``(plan, blobs)``.
+
+    *plan* is the member list (``{"name", "head", "segments"}`` records
+    in manifest order) and *blobs* the deduplicated segment blocks in
+    inventory order.  The whole artifact -- framing, trailer CRC, the
+    manifest structure, every block's length and CRC, the per-member
+    reach layout, every segment frame (walked exactly like a load) and
+    the members' shape/layer-order agreement -- is checked before
+    anything is returned; any defect rejects the whole artifact with
+    ValueError.
+    """
+    if not isinstance(raw, (bytes, bytearray, memoryview)):
+        raise CheckpointError("family artifact must be bytes")
+    data = bytes(raw)
+    what = "family artifact"
+    prefix_len = len(FAMILY_EXPORT_MAGIC) + 4 + 8
+    if len(data) < prefix_len:
+        raise CheckpointError(f"{what} is truncated while reading its header")
+    if data[: len(FAMILY_EXPORT_MAGIC)] != FAMILY_EXPORT_MAGIC:
+        raise CheckpointError(f"not a {what} (bad magic)")
+    (version,) = struct.unpack(
+        "<I", data[len(FAMILY_EXPORT_MAGIC) : len(FAMILY_EXPORT_MAGIC) + 4]
+    )
+    if version != _FAMILY_EXPORT_VERSION:
+        raise CheckpointError(
+            f"unsupported {what} version {version}; this build reads "
+            f"version {_FAMILY_EXPORT_VERSION}"
+        )
+    (manifest_len,) = struct.unpack(
+        "<Q", data[len(FAMILY_EXPORT_MAGIC) + 4 : prefix_len]
+    )
+    if manifest_len <= 0:
+        raise CheckpointError(f"{what} manifest length is invalid")
+    trailer_len = len(FAMILY_EXPORT_END_MAGIC) + 4
+    trailer_pos = data.rfind(FAMILY_EXPORT_END_MAGIC)
+    if trailer_pos < 0 or len(data) - trailer_pos != trailer_len:
+        raise CheckpointError(
+            f"{what} trailer is missing or the file is torn"
+        )
+    manifest_start = prefix_len
+    if manifest_len > trailer_pos - manifest_start:
+        raise CheckpointError(f"{what} manifest overruns the block area")
+    manifest_bytes = data[manifest_start : manifest_start + manifest_len]
+    (stored_crc,) = struct.unpack(
+        "<I", data[trailer_pos + len(FAMILY_EXPORT_END_MAGIC) :]
+    )
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CheckpointError(f"{what} manifest is invalid: {exc}") from exc
+    if not isinstance(manifest, dict) or set(manifest) != _FAMILY_MANIFEST_KEYS:
+        raise CheckpointError(
+            f"{what} manifest must be an object with exactly the fields "
+            f"{sorted(_FAMILY_MANIFEST_KEYS)}"
+        )
+    if (
+        not isinstance(manifest["v"], int)
+        or isinstance(manifest["v"], bool)
+        or manifest["v"] != version
+    ):
+        raise CheckpointError(
+            f"{what} manifest version does not match its frame"
+        )
+    members = manifest["members"]
+    segments = manifest["segments"]
+    if not isinstance(members, list) or not members:
+        raise CheckpointError(f"{what} must name at least one member")
+    if not isinstance(segments, list) or not segments:
+        raise CheckpointError(f"{what} must carry at least one segment block")
+    block_count_pos = manifest_start + manifest_len
+    if block_count_pos + 8 > trailer_pos:
+        raise CheckpointError(f"{what} is truncated before its block inventory")
+    (block_count,) = struct.unpack(
+        "<Q", data[block_count_pos : block_count_pos + 8]
+    )
+    if block_count != len(segments):
+        raise CheckpointError(
+            f"{what} block count does not match its segment inventory"
+        )
+    pos = block_count_pos + 8
+    blobs = []
+    pool_names = []
+    running_crc = zlib.crc32(manifest_bytes)
+    for block_id, entry in enumerate(segments):
+        _exact_keys(entry, _FAMILY_SEGMENT_KEYS, f"{what} segment entry {block_id}")
+        name = entry["name"]
+        if not isinstance(name, str) or _segment_index(name) is None:
+            raise CheckpointError(
+                f"{what} segment entry {block_id} has a bad segment file name"
+            )
+        size = entry["size"]
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            raise CheckpointError(
+                f"{what} segment entry {block_id} ({name}) has an invalid size"
+            )
+        crc_value = entry["crc"]
+        if (
+            isinstance(crc_value, bool)
+            or not isinstance(crc_value, int)
+            or not 0 <= crc_value <= 0xFFFFFFFF
+        ):
+            raise CheckpointError(
+                f"{what} segment entry {block_id} ({name}) has an invalid crc"
+            )
+        if pos + 8 > trailer_pos:
+            raise CheckpointError(
+                f"{what} is truncated before segment block {block_id} ({name})"
+            )
+        (raw_len,) = struct.unpack("<Q", data[pos : pos + 8])
+        pos += 8
+        if raw_len != size or size > trailer_pos - pos:
+            raise CheckpointError(
+                f"{what} segment block {block_id} ({name}) is truncated or "
+                "its length disagrees with the manifest"
+            )
+        chunk = data[pos : pos + size]
+        pos += size
+        if (zlib.crc32(chunk) & 0xFFFFFFFF) != crc_value:
+            raise CheckpointError(
+                f"{what} segment block {block_id} ({name}) fails its CRC"
+            )
+        running_crc = zlib.crc32(chunk, running_crc)
+        pool_names.append(name)
+        blobs.append(chunk)
+    if pos != trailer_pos:
+        raise CheckpointError(f"{what} has trailing or misaligned block bytes")
+    if (running_crc & 0xFFFFFFFF) != stored_crc:
+        raise CheckpointError(
+            f"{what} CRC mismatch: the file is corrupt or torn"
+        )
+    plan = _validate_family_manifest(manifest, pool_names)
+    _validate_family_chains(plan, blobs)
+    return plan, blobs
+
+
+def _validate_family_manifest(manifest, pool_names):
+    """Check the member records against the block inventory; return the plan."""
+    plan = []
+    seen_names = set()
+    used = set()
+    for position, member in enumerate(manifest["members"]):
+        what = f"family artifact member {position}"
+        _exact_keys(member, _FAMILY_MEMBER_KEYS, what)
+        name = member["name"]
+        _check_family_member_name(name, what)
+        if name in seen_names:
+            raise CheckpointError(
+                f"family artifact lists member {name!r} more than once"
+            )
+        seen_names.add(name)
+        head = member["head"]
+        if isinstance(head, bool) or not isinstance(head, int) or head < 0:
+            raise CheckpointError(f"{what} ({name!r}) has an invalid head")
+        reach = member["segments"]
+        if not isinstance(reach, list) or len(reach) != head + 1:
+            raise CheckpointError(
+                f"{what} ({name!r}) must list exactly head + 1 segment blocks"
+            )
+        for slot, block_id in enumerate(reach):
+            if (
+                isinstance(block_id, bool)
+                or not isinstance(block_id, int)
+                or not 0 <= block_id < len(pool_names)
+            ):
+                raise CheckpointError(
+                    f"{what} ({name!r}) names no segment block at position {slot}"
+                )
+            if pool_names[block_id] != _segment_name(slot):
+                raise CheckpointError(
+                    f"{what} ({name!r}) is out of order: block "
+                    f"{pool_names[block_id]!r} cannot fill position {slot}"
+                )
+            used.add(block_id)
+        plan.append({"name": name, "head": head, "segments": list(reach)})
+    if used != set(range(len(pool_names))):
+        raise CheckpointError(
+            "family artifact carries a segment block no member reaches"
+        )
+    return plan
+
+
+def _validate_family_chains(plan, blobs):
+    """Walk every member's chain exactly like a load; check shape agreement."""
+    documents = []
+    for position, member in enumerate(plan):
+        entries = member["segments"]
+        try:
+            walker = _ChainWalker(blobs[entries[0]])
+            for slot in range(1, member["head"] + 1):
+                walker.apply_delta(slot, blobs[entries[slot]])
+            document = walker.document()
+        except CheckpointError as exc:
+            raise CheckpointError(
+                f"family artifact member {position} ({member['name']!r}) is "
+                f"invalid: {exc}"
+            ) from exc
+        documents.append(document)
+    _check_family_shape_agreement(
+        documents, [member["name"] for member in plan], "family import"
+    )
+
+
+def import_family(artifact, target):
+    """Restore a family artifact into chain directories under *target*.
+
+    *target* is an existing directory that receives one chain directory
+    per family member.  The artifact is validated in full before
+    anything is written; each member is then populated inside a private
+    staging directory (shared blocks hard-linked from the member that
+    first carries them -- the shared history exists once -- and the
+    ``head`` pointer written last, exactly the fork commit order) and
+    renamed into place atomically, so a member appears as one complete
+    chain or not at all.  The restored member count, segment positions
+    and shared layout match the exported family, and every member's
+    parameters, gradients, optimizer state and step count and hidden
+    state restore bit for bit; no optimizer step advances.
+
+    A process killed mid-import leaves a resumable marker plus
+    whole-file staging debris: re-running the same import finishes the
+    remaining members with a result bit for bit identical to one
+    uninterrupted run, and the debris is reclaimed deterministically by
+    the next family operation over the target directory.  If the target
+    already holds a chain family member the import raises ValueError
+    without changing one byte there.  A missing artifact file or a
+    missing target directory raises FileNotFoundError; a torn,
+    truncated, missing-field, reordered or shape/layer-order
+    inconsistent artifact rejects the whole import with ValueError
+    before anything is written; an unwritable directory or a full disk
+    raises OSError.
+    """
+    if not isinstance(artifact, (str, os.PathLike)):
+        raise TypeError("import artifact must be a filesystem path")
+    if not isinstance(target, (str, os.PathLike)):
+        raise TypeError("import target must be a directory path")
+    artifact = os.fspath(artifact)
+    target = os.fspath(target)
+    with open(artifact, "rb") as fh:
+        raw = fh.read()
+    plan, blobs = _parse_family_export(raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    if not os.path.exists(target):
+        raise FileNotFoundError(
+            f"family import target directory not found: {target!r}"
+        )
+    if not os.path.isdir(target):
+        raise CheckpointError(
+            f"family import target is not a directory: {target!r}"
+        )
+    parent = os.path.abspath(target)
+    with _FamilyParentGuard(parent):
+        _family_register(parent)
+        try:
+            # Reclaim staging a killed import (or fork/delete) left here.
+            # The family guard excludes a live import/export/fold, so any
+            # staging present belongs to a dead owner.
+            _sweep_parent_staging(parent)
+            marker = _read_import_marker(parent)
+            if marker is not None and marker["d"] == digest:
+                # Resume an interrupted import of this same artifact:
+                # members already in place are verified against the plan,
+                # the missing ones are committed now.
+                missing = []
+                for member in plan:
+                    final = os.path.join(parent, member["name"])
+                    if os.path.lexists(final):
+                        _verify_imported_member(final, member, blobs)
+                    else:
+                        missing.append(member)
+            else:
+                if marker is not None:
+                    _unlink_quietly(os.path.join(parent, _IMPORT_MARKER_NAME))
+                # A chain family is already in residence when the target
+                # holds any chain directory (one with a head pointer);
+                # dot-prefixed entries are markers, leases or swept debris.
+                occupant = _existing_family_member(parent)
+                if occupant is not None:
+                    raise CheckpointError(
+                        "family import target already holds a chain family "
+                        f"member: {occupant!r}"
+                    )
+                # Any non-marker entry at a planned member name is an
+                # occupied slot: reject before the marker is committed so
+                # not one member is staged.
+                for member in plan:
+                    final = os.path.join(parent, member["name"])
+                    if os.path.lexists(final):
+                        raise CheckpointError(
+                            "family import target already holds a chain "
+                            f"family member: {final!r}"
+                        )
+                _atomic_write(
+                    parent, _IMPORT_MARKER_NAME, _encode_import_marker(digest)
+                )
+                missing = plan
+            # The first member (in plan order) reaching a block holds its
+            # canonical file; later members hard-link from it, so a shared
+            # segment is stored exactly once.
+            canonical = {}
+            for member in plan:
+                for slot, block_id in enumerate(member["segments"]):
+                    if block_id not in canonical:
+                        canonical[block_id] = os.path.join(
+                            parent, member["name"], _segment_name(slot)
+                        )
+            for member in missing:
+                _commit_import_member(parent, member, blobs, canonical)
+            _unlink_quietly(os.path.join(parent, _IMPORT_MARKER_NAME))
+            _fsync_directory(parent)
+        finally:
+            _family_release(parent)
+    return None
+
+
+def _existing_family_member(parent):
+    """The first chain directory found in *parent*, or None.
+
+    A chain directory is a non-hidden subdirectory holding a ``head``
+    pointer.  Dot-prefixed entries (markers, leases, staging debris) and
+    plain files are not chain members.
+    """
+    try:
+        names = sorted(os.listdir(parent))
+    except OSError:
+        return None
+    for name in names:
+        if name.startswith("."):
+            continue
+        path = os.path.join(parent, name)
+        if os.path.isdir(path) and os.path.exists(os.path.join(path, _HEAD_NAME)):
+            return path
+    return None
+
+
+def _commit_import_member(parent, member, blobs, canonical):
+    """Stage one member directory and rename it into place atomically.
+
+    Segment files are hard-linked from the canonical copy of their block
+    (an already-committed member's slot) or written whole when this
+    member is the block's first carrier; the ``head`` pointer is
+    committed last, mirroring the chain commit order.  The staging
+    directory carries the same flock sentinel a fork staging does, so
+    the deterministic parent sweep only ever reclaims staging whose
+    import died.  A kill leaves only that staging directory behind --
+    never a half-populated member at its final name.
+    """
+    name = member["name"]
+    final = os.path.join(parent, name)
+    staging = None
+    lease_fd = None
+    committed = False
+    try:
+        # Create the staging and lock its sentinel under the parent
+        # directory's flock, exactly like a fork: a sweep therefore never
+        # sees a staging that exists but is not yet recognisably alive.
+        with _DirectoryChainLock(parent):
+            staging = tempfile.mkdtemp(
+                prefix=_IMPORT_TMP_PREFIX + name + "-", dir=parent
+            )
+            _fork_staging_register(staging)
+            lease_fd = _acquire_staging_lease(staging)
+        for slot, block_id in enumerate(member["segments"]):
+            slot_name = _segment_name(slot)
+            source = canonical[block_id]
+            if os.path.exists(source):
+                os.link(source, os.path.join(staging, slot_name))
+            else:
+                _atomic_write(staging, slot_name, blobs[block_id])
+        _atomic_write(staging, _HEAD_NAME, str(member["head"]).encode("ascii"))
+        _fsync_directory(staging)
+        if os.path.lexists(final):
+            raise CheckpointError(
+                f"family import target already holds a chain family member: "
+                f"{final!r}"
+            )
+        os.rename(staging, final)
+        committed = True
+        _fsync_directory(parent)
+        # The sentinel's work is done; a kill before this unlink leaves
+        # it as debris the member's next open reclaims.
+        _unlink_quietly(os.path.join(final, _STAGING_LOCK_NAME))
+    finally:
+        if staging is not None:
+            _release_staging_lease(lease_fd, staging)
+        if not committed and staging is not None:
+            _remove_tree_quietly(staging)
+
+
+def _verify_imported_member(final, member, blobs):
+    """Check an already-present member against the import plan on resume.
+
+    A member left by the interrupted import of the same artifact holds
+    exactly the planned prefix segments and a head at or beyond the plan
+    (a live training process may have appended since).  Anything else
+    means the location holds a different chain, and the whole import is
+    rejected before another byte is written.
+    """
+    what = f"family import target member {final!r}"
+    if not os.path.isdir(final):
+        raise CheckpointError(f"{what} is not a chain directory")
+    try:
+        with open(os.path.join(final, _HEAD_NAME), "rb") as fh:
+            head_raw = fh.read()
+    except FileNotFoundError:
+        raise CheckpointError(f"{what} has no head pointer") from None
+    try:
+        text = head_raw.decode("ascii")
+        if not re.fullmatch(r"\d+", text):
+            raise ValueError
+        actual_head = int(text)
+    except (UnicodeDecodeError, ValueError):
+        raise CheckpointError(f"{what} has a corrupt head pointer") from None
+    if actual_head < member["head"]:
+        raise CheckpointError(
+            f"{what} does not match the family artifact (its head "
+            f"{actual_head} is below {member['head']})"
+        )
+    for slot, block_id in enumerate(member["segments"]):
+        path = os.path.join(final, _segment_name(slot))
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read()
+        except FileNotFoundError:
+            raise CheckpointError(
+                f"{what} is missing segment {_segment_name(slot)}"
+            ) from None
+        if raw != blobs[block_id]:
+            raise CheckpointError(
+                f"{what} segment {_segment_name(slot)} does not match the "
+                "family artifact"
+            )
+
+
+def _encode_import_marker(digest):
+    return json.dumps(
+        {"v": 1, "d": digest}, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+
+
+def _read_import_marker(parent):
+    """The interrupted-import marker in *parent*, or None when unusable."""
+    path = os.path.join(parent, _IMPORT_MARKER_NAME)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as fh:
+            marker = json.loads(fh.read().decode("ascii"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(marker, dict) or set(marker) != _IMPORT_MARKER_KEYS:
+        return None
+    if marker["v"] != 1 or not isinstance(marker["d"], str):
+        return None
+    return marker
+
+
+# ---------------------------------------------------------------------------
+# In-memory family export / import
+#
+# The in-memory forms use the exact same manifest/block framing: a family
+# of MemoryChain stores packs to one ``bytes`` artifact and unpacks into
+# a fresh list of MemoryChain stores, with segments shared by reference
+# becoming one shared object again -- the in-memory counterpart of the
+# hard-link layout.
+# ---------------------------------------------------------------------------
+
+
+def export_family_memory(members):
+    """Pack a family of :class:`MemoryChain` stores into artifact bytes.
+
+    Same semantics as :func:`export_family`: segments the members share
+    by reference are stored once, every member's head and tail positions
+    are preserved, the result is a deterministic pure function of the
+    family, and no member is mutated or stepped.
+    """
+    if isinstance(members, MemoryChain):
+        raise TypeError("a chain family must be a sequence of MemoryChains")
+    try:
+        members = list(members)
+    except TypeError:
+        raise TypeError(
+            "a chain family must be a sequence of MemoryChains"
+        ) from None
+    if not members:
+        raise CheckpointError("a chain family needs at least one chain")
+    for member in members:
+        if not isinstance(member, MemoryChain):
+            raise TypeError("chain family members must be MemoryChains")
+    if len(set(id(member) for member in members)) != len(members):
+        raise CheckpointError("a chain family must not list a member twice")
+    ordered = sorted(members, key=id)
+    for member in ordered:
+        member._lock.acquire()
+    try:
+        heads = {}
+        records = {}
+        documents = {}
+        for member in members:
+            head = _read_head_optional(member)
+            if head is None:
+                raise CheckpointError(
+                    "chain has no head pointer (no basis segment committed)"
+                )
+            document = _load_chain_store(member, head)
+            segments = {}
+            for index in range(head + 1):
+                name = _segment_name(index)
+                raw = member.read_segment(name)
+                segments[name] = (raw, id(raw))
+            heads[id(member)] = head
+            records[id(member)] = segments
+            documents[id(member)] = document
+    finally:
+        for member in reversed(ordered):
+            member._lock.release()
+    names = [f"member-{index}" for index in range(len(members))]
+    _check_family_shape_agreement(
+        [documents[id(member)] for member in members], names, "family export"
+    )
+    return _build_family_export(
+        names,
+        {names[index]: heads[id(member)] for index, member in enumerate(members)},
+        {
+            names[index]: records[id(member)]
+            for index, member in enumerate(members)
+        },
+    )
+
+
+def import_family_memory(raw):
+    """Restore artifact *raw* into a fresh list of :class:`MemoryChain`.
+
+    The restored family has the same member count, segment positions and
+    shared-block identity as the exported one (a shared segment is one
+    object referenced by every member that reaches it), and every member
+    reassembles bit for bit to its exported state.  A torn, truncated,
+    missing-field, reordered or shape/layer-order-inconsistent artifact
+    rejects the whole import with ValueError and returns nothing.
+    """
+    plan, blobs = _parse_family_export(raw)
+    restored = []
+    for member in plan:
+        store = MemoryChain()
+        for slot, block_id in enumerate(member["segments"]):
+            store.write_segment(_segment_name(slot), blobs[block_id])
+        store.write_head(str(member["head"]).encode("ascii"))
+        restored.append(store)
+    return restored
 
 
 # ---------------------------------------------------------------------------

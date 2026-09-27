@@ -226,6 +226,51 @@ checkpoint path) and writes no files.
   first bad segment across the family is reported with its position, the
   reason and -- for a shared segment -- every chain whose head reaches
   it.
+- `Sequential.export_family(members, target) -> None` packs a whole
+  chain family into one self-contained artifact. `members` is the
+  sequence of the family's chain directories (its order is preserved);
+  `target` is the artifact file's destination path. Segments the
+  members share (the hard-linked fork prefix) are stored once as
+  deduplicated blocks; each member's head and its member-owned tail
+  segments are preserved exactly, positions included. The export
+  advances no member's optimizer step and changes no member by a byte,
+  and exporting the same family twice produces identical artifacts.
+  Members keep saving, loading and appending while the export runs --
+  the artifact fixes one consistent, quiescent snapshot and no member
+  is ever observed as half a chain. A missing member directory or
+  referenced segment raises `FileNotFoundError`; a truncated, corrupt
+  or out-of-order segment, or members whose parameter shapes or layer
+  order disagree, rejects the whole export with `ValueError` before
+  the artifact is written; an unwritable destination directory or a
+  full disk raises `OSError`. The artifact file itself is written
+  through a temp file and atomically renamed, so a process killed
+  mid-export leaves only the rejected temp file behind. With a
+  sequence of `MemoryChain` members no `target` is given and the
+  artifact bytes are returned.
+- `Sequential.import_family(source, target) -> None` restores a family
+  artifact into a chain family. `source` is a family artifact file
+  path; `target` is an existing directory that receives one chain
+  directory per family member. The artifact is validated in full
+  before anything is written; each member is staged privately (segment
+  links first, the head pointer last -- the fork commit order) and
+  renamed into place atomically, so a member appears as one complete
+  chain or not at all. The restored member count, segment positions
+  and shared layout match the exported family, and every member's
+  parameters, gradients, optimizer state and step count and hidden
+  state restore bit for bit; no optimizer step advances. A process
+  killed mid-import leaves a resumable marker plus whole-file staging
+  debris: re-running the same import finishes the remaining members
+  with a result bit for bit identical to one uninterrupted run, and
+  the debris is reclaimed deterministically by the next family
+  operation over the target directory. If the target already holds a
+  chain family member the import raises `ValueError` without changing
+  one byte there. A missing artifact file or target directory raises
+  `FileNotFoundError`; a torn, truncated, missing-field, reordered or
+  shape/layer-order-inconsistent artifact rejects the whole import
+  with `ValueError`; an unwritable directory or a full disk raises
+  `OSError`. With artifact bytes as `source` (as returned by
+  `export_family` for `MemoryChain` members) no `target` is given and
+  a list of `MemoryChain` stores is returned.
 
 ### Threading
 
@@ -349,6 +394,27 @@ is swept on the next family operation. `checkpoint.verify_chain` (or
 `Sequential.verify`) accepts a list of chain directories to verify a
 whole family read-only, reporting the first bad segment with every chain
 that reaches it.
+
+`checkpoint.export_family` (or `Sequential.export_family`) packs a whole
+chain family into one self-contained artifact file (magic `SEQFAMX1`):
+every distinct shared segment file becomes one deduplicated block and a
+manifest records the member order, each member's head and the block
+filling each of its segment positions, so the artifact stores the shared
+history once and is a deterministic pure function of the family.
+`checkpoint.import_family` (or `Sequential.import_family`) restores the
+artifact into chain directories with the same member count, segment
+positions, hard-link sharing layout and bit-for-bit state; each member
+is staged privately and renamed into place atomically, a killed import
+is resumed by re-running it (the result is bit for bit identical to one
+uninterrupted run), and its staging debris is reclaimed by the next
+family operation over the target directory. Neither direction advances
+any member's optimizer step, both serialise with forks, merges,
+deletions and single-chain/family compactions through the directory
+locks and leases, and family verification covers the restored members
+read-only in one call. `checkpoint.export_family_memory` /
+`checkpoint.import_family_memory` provide the same pack/restore for
+`MemoryChain` families, with reference-shared segments becoming one
+shared object again.
 
 Loading walks the basis and every delta up to the head and reassembles the
 state by layer (parameters, gradients, optimizer moments and step count,
