@@ -922,6 +922,64 @@ class Sequential:
                 "verify source must be a chain directory or a MemoryChain"
             )
 
+    def export_family(self, members, target):
+        """Pack a whole chain family into one self-contained archive file.
+
+        *members* is a non-empty sequence of the family's chain
+        directories (living in one parent directory); *target* is the
+        path the archive is written to.  Every segment every member's
+        head reaches is packed exactly once -- segments several members
+        share stay a single copy -- together with each member's
+        directory name, its head and its segment layout, so
+        ``import_family`` restores the family with the same member
+        count, segment layout and sharing, and every restored member
+        loads bit for bit its exported state.  The snapshot is one
+        consistent committed prefix per member while saves, loads,
+        appends, compactions and deletions on the family proceed; the
+        export advances no member's optimizer step, modifies no member,
+        and exporting the same family twice yields the identical
+        archive bytes.  The archive file is committed atomically, so a
+        process killed mid-export leaves the old archive or the new
+        one, never a half one.
+
+        A missing member directory or referenced segment raises
+        ``FileNotFoundError``; a corrupt, truncated, out-of-order or
+        shape-inconsistent chain -- or members whose parameter shapes
+        or layer order disagree -- rejects the whole export with
+        ``ValueError`` before the archive is written, and no member
+        changes by one byte.  An unwritable destination or a full disk
+        raises ``OSError``.
+        """
+        with self._lock:
+            return _checkpoint.export_family(members, target)
+
+    def import_family(self, archive, target):
+        """Restore a family archive into a chain family at *target*.
+
+        *archive* is the path of an archive written by
+        ``export_family``; *target* is an existing directory the
+        family's member directories are created in, under the names the
+        archive records.  The restored family has the exported member
+        count, segment layout and sharing, and every member loads bit
+        for bit its exported state -- parameters, gradients, optimizer
+        moments and step count, hidden state; the import advances no
+        member's optimizer step.  The whole archive is validated before
+        the target is touched: a truncated, corrupt, mis-ordered,
+        field-missing or shape-inconsistent archive rejects the whole
+        import with ``ValueError``, as does a *target* that already
+        holds the family -- in both cases without one byte of the
+        target changing.  A missing archive file or target directory
+        raises ``FileNotFoundError``; an unwritable directory or a full
+        disk raises ``OSError``.
+
+        A process killed mid-import leaves only whole members plus
+        staging residue; re-running the import finishes it, bit for bit
+        the one-run result, and the residue is reclaimed
+        deterministically by the next family operation.
+        """
+        with self._lock:
+            return _checkpoint.import_family(archive, target)
+
     def _validate_against_model(self, document):
         if not isinstance(document, dict):
             raise ValueError("checkpoint is not a valid state document")

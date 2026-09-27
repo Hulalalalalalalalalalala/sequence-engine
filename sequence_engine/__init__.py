@@ -15,9 +15,12 @@ Public interface (see README.md):
   segments and then evolves independently), ``delete`` (removing a
   branch chain and deterministically reclaiming the segments no
   remaining chain can reach), ``merge`` (landing one chain's current
-  state onto another by appending one target-owned delta segment) and
+  state onto another by appending one target-owned delta segment),
   ``verify`` (strictly read-only verification of an incremental chain
-  or a chain family).
+  or a chain family) and ``export_family`` / ``import_family``
+  (packing a whole chain family into one self-contained archive file
+  and restoring it as a chain family with the same members, segment
+  layout and sharing).
 """
 
 from .checkpoint import MemoryChain

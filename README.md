@@ -226,6 +226,46 @@ checkpoint path) and writes no files.
   first bad segment across the family is reported with its position, the
   reason and -- for a shared segment -- every chain whose head reaches
   it.
+- `Sequential.export_family(members, target) -> None` packs a whole chain
+  family into one self-contained archive file. `members` is a non-empty
+  sequence of the family's chain directories (living in one parent
+  directory); `target` is the path the archive is written to. Every
+  segment every member's head reaches is packed exactly once -- segments
+  several members share through hard links stay a single copy -- together
+  with each member's directory name, its head and its segment layout, so
+  `import_family` restores the family with the same member count, segment
+  layout and sharing. The snapshot is one consistent committed prefix per
+  member while saves, loads, appends, compactions and deletions on the
+  family proceed undisturbed; the export advances no member's optimizer
+  step, modifies no member, and exporting the same family twice yields
+  the identical archive bytes. The archive file is committed atomically
+  (temp file plus rename), so a process killed mid-export leaves the old
+  archive or the new one, never a half one. A missing member directory or
+  referenced segment raises `FileNotFoundError`; a corrupt, truncated,
+  out-of-order or shape-inconsistent chain -- or members whose parameter
+  shapes or layer order disagree -- rejects the whole export with
+  `ValueError` before the archive is written, and no member changes by
+  one byte; an unwritable destination or a full disk raises `OSError`.
+- `Sequential.import_family(archive, target) -> None` restores a family
+  archive into a chain family. `archive` is the path of an archive
+  written by `export_family`; `target` is an existing directory the
+  member directories are created in, under the names the archive
+  records. The restored family has the exported member count, segment
+  layout and sharing (segments packed once are hard links again), and
+  every member loads bit for bit its exported state -- parameters,
+  gradients, optimizer moments and step count, hidden state; the import
+  advances no member's optimizer step. The whole archive is validated
+  before the target is touched: a truncated, corrupt, mis-ordered,
+  field-missing or shape-inconsistent archive rejects the whole import
+  with `ValueError`, as does a `target` that already holds the family --
+  in both cases without one byte of the target changing. A missing
+  archive file or target directory raises `FileNotFoundError`; an
+  unwritable directory or a full disk raises `OSError`. Each member is
+  fully populated in a private staging directory and renamed into place
+  in one step, so a process killed mid-import leaves only whole members
+  plus staging residue; re-running the import finishes it, bit for bit
+  the one-run result, and the residue is reclaimed deterministically by
+  the next family operation.
 
 ### Threading
 
@@ -349,6 +389,22 @@ is swept on the next family operation. `checkpoint.verify_chain` (or
 `Sequential.verify`) accepts a list of chain directories to verify a
 whole family read-only, reporting the first bad segment with every chain
 that reaches it.
+
+`Sequential.export_family` (or `checkpoint.export_family`) packs a whole
+family into one self-contained archive file: every segment every
+member's head reaches is stored once (shared segments stay a single
+copy) together with each member's name, head and segment layout, and the
+archive is committed atomically, so a kill leaves the old archive or the
+new one, never a half one. `Sequential.import_family` (or
+`checkpoint.import_family`) restores the archive as a chain family in a
+target directory -- the same member count, segment layout and one-copy
+sharing, every member loading bit for bit its exported state. Neither
+operation advances any member's optimizer step, and exporting the same
+family twice yields the identical archive. An import interrupted
+mid-flight is finished by simply re-running it (bit for bit the one-run
+result); its staging residue is reclaimed by the next family operation,
+and a target that already holds the family is refused with `ValueError`
+without one byte of it changing.
 
 Loading walks the basis and every delta up to the head and reassembles the
 state by layer (parameters, gradients, optimizer moments and step count,
