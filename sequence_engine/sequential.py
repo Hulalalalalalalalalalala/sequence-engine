@@ -148,6 +148,18 @@ class Sequential:
       directories with the same member count, segment positions, shared
       layout and bit-for-bit state; both directions are crash-safe and
       advance no member's optimizer step.
+    * ``sync_family(source, target, artifact)`` /
+      ``apply_sync_family(artifact, target)`` -- produce an
+      incremental cross-family artifact carrying only the segments the
+      two families genuinely differ by (heads, exclusive tails and
+      positions preserved; common and unchanged segments never stored
+      twice) and atomically land it on the target family, after which
+      the two families load bit for bit with no duplicated shared
+      storage and no optimizer step advanced; the same artifact
+      applies as a no-op once the target is synced, a kill is resumed
+      by re-running, and ``family_export_to_sync`` /
+      ``sync_to_family_export`` convert between the full family export
+      and the incremental artifact in both directions.
 
     All public operations are serialised by one re-entrant lock, so
     several threads may interleave ``forward``, ``backward``, ``update``,
@@ -986,6 +998,169 @@ class Sequential:
                 "a family export needs a sequence of chain directories or "
                 "a sequence of MemoryChains"
             )
+
+    def sync_family(self, source, target, artifact=None):
+        """Produce an incremental sync artifact between two chain families.
+
+        *source* and *target* are two equal-length sequences of chain
+        directories (or :class:`MemoryChain` stores) paired
+        positionally by member name; *artifact* is the destination
+        path of the incremental artifact for directories and is
+        omitted for memory stores, in which case the artifact bytes
+        are returned.  The artifact carries only the segments the two
+        families genuinely differ by -- each member's head, its
+        source-exclusive tail and the segment positions are preserved,
+        while common and unchanged segments are recorded by position
+        alone and never stored twice.  Producing the artifact changes
+        neither family and advances no member's optimizer step.
+
+        A missing member directory or referenced segment raises
+        FileNotFoundError without touching the other family; families
+        of different lengths, a mismatched member pairing, or members
+        whose parameter shapes or layer order disagree reject the
+        whole production with ValueError before the artifact is
+        written; an unwritable destination or a full disk raises
+        OSError.
+        """
+        with self._lock:
+            if isinstance(source, (str, bytes, os.PathLike)) or isinstance(
+                target, (str, bytes, os.PathLike)
+            ):
+                raise TypeError(
+                    "a synced family must be a sequence of chain directories "
+                    "or MemoryChains"
+            )
+            try:
+                source = list(source)
+                target = list(target)
+            except TypeError:
+                raise TypeError(
+                    "a synced family must be a sequence of chain directories "
+                    "or MemoryChains"
+                ) from None
+            if all(
+                isinstance(member, _checkpoint.MemoryChain)
+                for group in (source, target)
+                for member in group
+            ) and source and target:
+                if artifact is not None:
+                    raise TypeError(
+                        "a MemoryChain sync takes no artifact path"
+                    )
+                return _checkpoint.sync_family_memory(source, target)
+            if all(
+                isinstance(member, (str, os.PathLike))
+                for group in (source, target)
+                for member in group
+            ) and source and target:
+                if artifact is None:
+                    raise TypeError(
+                        "producing a family sync requires an artifact path"
+                    )
+                return _checkpoint.sync_family(source, target, artifact)
+            raise TypeError(
+                "a family sync needs two equal-length sequences of chain "
+                "directories or two sequences of MemoryChains"
+            )
+
+    def apply_sync_family(self, artifact, target=None):
+        """Apply an incremental sync artifact to a chain family atomically.
+
+        *artifact* is a sync artifact file path, or artifact bytes (as
+        returned by :meth:`sync_family` for ``MemoryChain`` members).
+        For a file, *target* is the family directory holding the
+        target member chains the artifact was produced against and the
+        call returns ``None``; for artifact bytes, *target* is the
+        sequence of :class:`MemoryChain` stores to move onto the
+        source.  The artifact is validated in full and matched against
+        every target member before anything is written; afterwards
+        each target member loads bit for bit to its source counterpart
+        (parameters, gradients, optimizer state and step count, hidden
+        state), the source family is untouched, no optimizer step
+        advances, and applying the same artifact to the synced family
+        again is a no-op.  Shared segments stay hard-linked (or shared
+        by object in memory) and never become duplicate storage.
+
+        A missing artifact or member directory, or a referenced
+        segment that is absent, raises FileNotFoundError without
+        touching the other family; a torn, truncated, missing-field,
+        reordered or shape/layer-order-inconsistent artifact, or one
+        that does not match the target family, rejects the whole apply
+        with ValueError before one byte moves; an unwritable directory
+        or a full disk raises OSError and leaves only whole files.
+        A kill leaves resumable markers and whole-file debris that the
+        next family operation reclaims; re-running converges to the
+        one-uninterrupted-run result.
+        """
+        with self._lock:
+            if isinstance(artifact, (bytes, bytearray, memoryview)):
+                if not isinstance(target, (list, tuple)):
+                    raise TypeError(
+                        "an in-memory sync apply needs a sequence of "
+                        "MemoryChains as its target"
+                    )
+                return _checkpoint.apply_sync_family_memory(artifact, target)
+            if isinstance(artifact, (str, os.PathLike)):
+                if target is None:
+                    raise TypeError(
+                        "applying a family sync requires the target family "
+                        "directory"
+                    )
+                return _checkpoint.apply_sync_family(artifact, target)
+            raise TypeError(
+                "sync artifact must be a filesystem path or artifact bytes"
+            )
+
+    def family_export_to_sync(self, artifact, target_family_artifact):
+        """Convert a full source-family export to an incremental artifact.
+
+        Both arguments are full ``SEQFAMX1`` family artifacts (paths or
+        bytes): the source family export and the export of the target
+        family as it currently stands, paired in manifest order.  The
+        result is the incremental artifact :meth:`sync_family` would
+        produce for the same two families; common and unchanged
+        segments are dropped (their positions and CRCs recorded) and
+        the source-exclusive segments are kept once.  Pure function:
+        writes nothing and changes no chain.
+        """
+        with self._lock:
+            source_raw = self._read_family_artifact_bytes(artifact)
+            target_raw = self._read_family_artifact_bytes(
+                target_family_artifact
+            )
+            return _checkpoint.family_export_to_sync(source_raw, target_raw)
+
+    def sync_to_family_export(self, artifact, target_family_artifact=None):
+        """Convert an incremental sync artifact into a full family export.
+
+        *artifact* is a sync artifact (path or bytes); when the
+        artifact still names a common prefix, *target_family_artifact*
+        must be the full export of the target family it was produced
+        against (its prefix CRCs must match).  The result is the full
+        ``SEQFAMX1`` export of the source family -- importing it
+        restores the source with the same member count, segment
+        positions and bit-for-bit state, and a full export of the
+        target after applying the sync is byte for byte equal to it.
+        A self-contained artifact (no common prefix) needs no target
+        export.  Pure function: writes nothing.
+        """
+        with self._lock:
+            sync_raw = self._read_family_artifact_bytes(artifact)
+            target_raw = (
+                None
+                if target_family_artifact is None
+                else self._read_family_artifact_bytes(target_family_artifact)
+            )
+            return _checkpoint.sync_to_family_export(sync_raw, target_raw)
+
+    @staticmethod
+    def _read_family_artifact_bytes(source):
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            return bytes(source)
+        if isinstance(source, (str, os.PathLike)):
+            with open(os.fspath(source), "rb") as fh:
+                return fh.read()
+        raise TypeError("a family artifact must be a path or bytes")
 
     def import_family(self, source, target=None):
         """Restore a family artifact into a chain family.

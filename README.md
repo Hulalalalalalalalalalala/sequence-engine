@@ -271,6 +271,67 @@ checkpoint path) and writes no files.
   `OSError`. With artifact bytes as `source` (as returned by
   `export_family` for `MemoryChain` members) no `target` is given and
   a list of `MemoryChain` stores is returned.
+- `Sequential.sync_family(source, target, artifact=None)` produces the
+  incremental synchronization artifact between two already-restored
+  chain families (two equal-length, positionally paired sequences of
+  chain directories, or `MemoryChain` stores).  Unlike
+  `export_family`, the artifact carries only the segments the target
+  family does not already hold byte for byte: for each paired member it
+  records the head, the source-exclusive tail segments and their
+  positions, and the length and CRC of every common-prefix segment;
+  shared and unchanged segments are never stored twice (a family
+  already in sync carries no blocks).  Producing the artifact changes
+  neither family and advances no member's optimizer step, and the same
+  difference produces identical bytes.  For directory families
+  *artifact* is the destination file path (written atomically); for
+  `MemoryChain` families it is omitted and the artifact bytes are
+  returned.  A missing member directory or referenced segment raises
+  `FileNotFoundError` without touching the other family; different
+  family lengths, a mismatched pairing, or shape/layer-order
+  disagreement reject the whole production with `ValueError` before the
+  artifact is written; an unwritable destination or a full disk raises
+  `OSError`.
+- `Sequential.apply_sync_family(artifact, target)` atomically lands a
+  sync artifact on the target family (a family directory for an artifact
+  file, or a sequence of `MemoryChain` stores for artifact bytes).  The
+  artifact is validated in full -- framing, CRC, every carried chain
+  and the match against each target member (common-prefix CRCs,
+  parameter shapes and layer order) -- before one byte moves, so a
+  rejected apply leaves both families untouched.  Afterwards each
+  target member loads bit for bit to its source counterpart
+  (parameters, gradients, optimizer state and step count, hidden
+  state), the source is not modified, no optimizer step advances, and
+  applying the same artifact to the synced family again is a no-op.
+  Common segments stay the member's own hard links (one copy -- the
+  shared layout never becomes duplicate storage) and a block
+  byte-identical to a segment another family member already holds at
+  the same position is linked from that member instead of being stored
+  twice.  A produce or apply killed mid-flight either takes effect as a
+  whole or not at all: re-running the apply finishes every member via
+  per-member staged-segment publication markers (the member's next
+  ordinary open rolls its own marker forward), converges to the
+  one-uninterrupted-run result, and the whole-file residue (a family
+  block area, the resume marker and staged slots) is reclaimed
+  deterministically by the next fork, merge, deletion, compaction,
+  import or family export over the target directory.  Saves, loads and
+  appends continue during the apply and always see one complete chain.
+  A missing artifact or member directory, or a referenced segment that
+  is absent, raises `FileNotFoundError`; a torn, truncated,
+  missing-field, reordered or shape/layer-order-inconsistent artifact,
+  or one that does not match the target family, rejects the whole
+  apply with `ValueError`; an unwritable directory or a full disk
+  raises `OSError` and leaves only whole segment files.
+- `Sequential.family_export_to_sync(source_export, target_export)` and
+  `Sequential.sync_to_family_export(artifact, target_export=None)`
+  convert between the full family export and the incremental artifact
+  shape (both arguments are file paths or artifact bytes).  Given the
+  full export of the target, a full source export converts to exactly
+  the artifact `sync_family` produces; the inverse -- the incremental
+  artifact plus the target export (omitted when the artifact is
+  self-contained, i.e. no member shares a prefix) -- reconstructs the
+  full source export, byte for byte equal to exporting the target
+  family after the sync.  Both directions are pure functions and a
+  load after either conversion is bit for bit identical.
 
 ### Threading
 
@@ -415,6 +476,43 @@ read-only in one call. `checkpoint.export_family_memory` /
 `checkpoint.import_family_memory` provide the same pack/restore for
 `MemoryChain` families, with reference-shared segments becoming one
 shared object again.
+
+Two families also synchronize **incrementally**:
+`checkpoint.sync_family` (or `Sequential.sync_family`) takes the source
+and the target family -- two equal-length, positionally paired member
+lists -- and produces an artifact (magic `SEQSYNC1`) holding only the
+segments the two families genuinely differ by.  Each member's record
+names its source head, the byte prefix the two sides already share (by
+position and CRC -- those bytes ride nowhere) and one deduplicated
+block per source-exclusive segment; a family already fully in sync
+carries no blocks.  `checkpoint.apply_sync_family` (or
+`Sequential.apply_sync_family`) validates the whole artifact against
+every target member before one byte moves and then publishes each
+member with the same staged-segments-then-head commit a compaction
+uses: the member's common prefix stays its own files (hard links -- one
+copy), an exclusive block equal to a segment another family member
+holds at the same position is linked from that member rather than
+stored again, and a concurrent save, load or append either finishes
+before the switch or waits it out and then sees one complete chain.
+After the apply each target member is bit for bit the source, neither
+side's optimizer step moves, the source family is untouched and
+applying the same artifact again is a no-op.  A killed produce writes
+no artifact (the file lands through a temp file plus an atomic rename);
+a killed apply leaves a per-member publication marker plus whole staged
+segments -- the member's next open rolls the publication forward,
+re-running the apply converges to one uninterrupted run, and the block
+area, resume marker and staged debris are reclaimed by the next family
+operation over the target directory.  Read-only family verification
+covers the synced members in one call and inspects a member caught
+mid-publication in place.  `checkpoint.family_export_to_sync` /
+`checkpoint.sync_to_family_export` (or the `Sequential` methods) convert
+a full source-plus-target pair of exports to the incremental artifact
+and reconstruct the full source export from the incremental artifact
+(plus the target export when a member still shares a prefix); loading
+after either conversion is bit for bit identical.
+`checkpoint.sync_family_memory` /
+`checkpoint.apply_sync_family_memory` provide the same produce/apply for
+`MemoryChain` families, where equal segments stay one shared object.
 
 Loading walks the basis and every delta up to the head and reassembles the
 state by layer (parameters, gradients, optimizer moments and step count,

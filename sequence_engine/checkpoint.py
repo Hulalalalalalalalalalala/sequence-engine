@@ -72,6 +72,21 @@ Two on-disk shapes share the same leaf encoding and trailer:
   re-running it and its debris is reclaimed by the next family
   operation.  Neither direction advances any member's optimizer step,
   and exporting the same family twice produces identical artifacts.
+* **Cross-family incremental sync** -- beyond the full family export,
+  two paired families synchronize incrementally (magic ``SEQSYNC1``):
+  the artifact records each member's head, the length and CRCs of the
+  byte prefix the two families already share and one deduplicated
+  block per source-exclusive segment, so the shared/unchanged history
+  never stored twice.  Applying publishes each member onto the source
+  with the staged-slots-then-head protocol a compaction uses (a
+  concurrent save or append sees one complete chain), advances no
+  optimizer step, touches not one byte of the source, and is
+  idempotent; a killed produce/apply either takes effect as a whole
+  or not at all and converges on re-run, its whole-file debris
+  reclaimed by the next family operation.  The full export and the
+  incremental artifact convert in both directions
+  (``family_export_to_sync`` / ``sync_to_family_export``) and a load
+  after either conversion is bit for bit identical.
 
 Full snapshot wire format (all integers little-endian)::
 
@@ -2304,6 +2319,8 @@ def verify_chain(directory):
                 "chain verification failed at the head pointer: the chain "
                 "has no head pointer (no basis segment committed)"
             )
+        if os.path.exists(os.path.join(directory, _SYNC_MEMBER_MARKER)):
+            return _verify_through_sync_marker_read_only(directory, store, head)
         if not _marker_exists(directory):
             _verify_normal_chain(store, head)
             return ChainVerification(head, head + 1)
@@ -3926,6 +3943,17 @@ def _recover_directory_chain(directory, store):
     """
     marker_path = _marker_path(directory)
     if not os.path.exists(marker_path):
+        # A cross-family sync publication interrupted by a kill leaves
+        # its per-member marker plus whole staged segments.  Like the
+        # compaction roll-forward, finish it before the ordinary open
+        # proceeds: the publication holds the member directory lock for
+        # its whole switch, so reaching here with the lock held means
+        # the owner is dead.
+        sync_pending = _read_sync_member_marker(directory)
+        if sync_pending is not None:
+            new_head, prefix = sync_pending
+            _finish_sync_publication(directory, store, new_head, prefix)
+            return
         # A live family-fold barrier means this member already stands on
         # its completed folded chain while the family operation finishes
         # the other members: the chain is coherent and the barrier's
@@ -3937,6 +3965,8 @@ def _recover_directory_chain(directory, store):
             name
             for name in os.listdir(directory)
             if name.startswith(_STAGED_PREFIX)
+            or _is_sync_staged(name)
+            or name.startswith(_TMP_PREFIX)
         ]
         for name in leftovers:
             _unlink_quietly(os.path.join(directory, name))
@@ -4424,6 +4454,10 @@ def _sweep_parent_staging(parent):
         except OSError:
             return
         removed = False
+        # A live family-shaping operation (a family fold, an import/export
+        # or a cross-family sync) may hold temp files in this parent right
+        # now; its lease must be free before any plain temp file is swept.
+        family_live = _family_lease_live(parent)
         for name in names:
             if name.startswith((_FORK_TMP_PREFIX, _IMPORT_TMP_PREFIX)):
                 path = os.path.join(parent, name)
@@ -4448,6 +4482,21 @@ def _sweep_parent_staging(parent):
                 if not _family_lease_live(parent):
                     _unlink_quietly(os.path.join(parent, name))
                     removed = True
+            elif name.startswith(_TMP_PREFIX) and not family_live:
+                # A killed import, family fold or sync left a temp file
+                # (a half-written marker or block staged through the
+                # atomic-write discipline) directly in this parent.
+                # Every such writer holds the family lease while its temp
+                # file exists, so an unheld temp file here is debris.
+                path = os.path.join(parent, name)
+                if not os.path.isdir(path):
+                    _unlink_quietly(path)
+                    removed = True
+        # A cross-family sync killed mid-flight leaves its family block
+        # area and resume marker here as well; while a family operation
+        # is live those files belong to it and are left alone.
+        if _sweep_sync_family_debris(parent):
+            removed = True
         if removed:
             _fsync_directory(parent)
 
@@ -5676,6 +5725,1621 @@ def import_family_memory(raw):
         store.write_head(str(member["head"]).encode("ascii"))
         restored.append(store)
     return restored
+
+
+# ---------------------------------------------------------------------------
+# Cross-family incremental synchronization
+#
+# A family export (``SEQFAMX1``) packs a *whole* chain family -- every
+# member's complete chain -- into one self-contained artifact.  An
+# incremental sync artifact (``SEQSYNC1``) packs only what the target
+# family needs to adopt the source family exactly:
+#
+# * for every paired member, ``bp`` -- the length of the common byte
+#   prefix: the leading positions whose segment bytes the source and the
+#   target already hold identically (head pointers and ordering are
+#   recorded, but those shared bytes are never stored);
+# * a fingerprint (CRC) of every common-prefix segment, so an apply can
+#   prove the artifact still matches the target before it moves a byte;
+# * one deduplicated block per distinct segment byte string from the
+#   source side of the difference -- the source's exclusive tail and,
+#   for a member whose basis itself differs, one fresh basis block.
+#
+# Shared and unchanged segments are therefore never stored twice, and a
+# family already fully in sync carries no blocks at all.
+#
+# The incremental shape and the full family export convert into each
+# other: a full export of the source together with a full export of the
+# target converts to the incremental artifact (the common prefix is
+# diffed and dropped), and the incremental artifact -- together with the
+# target export when it still names a common prefix -- converts back
+# into the full export of the source.  Loading after either conversion
+# is bit for bit identical.
+#
+# Applying lands the source on the target with the same publication
+# protocol a single-chain compaction uses, so it inherits its
+# guarantees: every carried block is first materialised whole once in
+# the family directory and hard-linked into the member under a private
+# staged slot name (common positions stay the member's own files, so
+# the shared layout never degenerates into duplicate storage); the
+# switch itself -- staged slots promoted over the old ones, the old
+# tail released, the head advanced, the marker removed -- runs in one
+# member-directory lock acquisition.  Saves, loads and appends on the
+# member block on that same lock and therefore observe either the old
+# complete chain or the new complete chain, never a half one (the
+# member directory never vanishes).  A kill between the writes leaves
+# the per-member marker and the staged whole segments; the next open
+# of the member rolls the publication forward deterministically.  The
+# source family is never touched, no optimizer step advances (the step
+# count rides inside the segment bytes) and applying the same artifact
+# to the synced family again is a no-op.
+# ---------------------------------------------------------------------------
+
+SYNC_MAGIC = b"SEQSYNC1"
+SYNC_END_MAGIC = b"SEQSYNC1END"
+_SYNC_VERSION = 1
+
+# Family-directory debris.
+_SYNC_BLOCK_PREFIX = ".seqsync.blk-"
+_SYNC_MARKER_NAME = ".seqsync"
+_SYNC_MARKER_KEYS = frozenset(("v", "d"))
+_SYNC_MANIFEST_KEYS = frozenset(("v", "members", "segments"))
+_SYNC_MEMBER_KEYS = frozenset(("name", "head", "bp", "pc", "segments"))
+_SYNC_SEGMENT_KEYS = frozenset(("name", "size", "crc"))
+
+# Per-member publication debris (inside a member chain directory).
+_SYNC_STAGED_PREFIX = ".seqs-s"
+_SYNC_MEMBER_MARKER = ".seqsync.m"
+_SYNC_MEMBER_MARKER_KEYS = frozenset(("v", "h", "bp"))
+
+
+def _sync_member_names(count):
+    return [f"member-{index}" for index in range(count)]
+
+
+def _sync_staged_name(slot):
+    return f"{_SYNC_STAGED_PREFIX}-{slot:010d}.seqd"
+
+
+def _is_sync_staged(name):
+    return name.startswith(_SYNC_STAGED_PREFIX + "-")
+
+
+def _lock_all_memory(stores):
+    """Acquire every memory store lock in a deadlock-free total order.
+
+    Returns the acquisition-ordered list; callers release in reverse.
+    """
+    ordered = sorted(set(stores), key=id)
+    for store in ordered:
+        store._lock.acquire()
+    return ordered
+
+
+def _snapshot_memory_family(stores):
+    """Snapshot memory families under their (already held) store locks."""
+    heads = {}
+    records = {}
+    for store in stores:
+        head = _read_head_optional(store)
+        if head is None:
+            raise CheckpointError(
+                "chain has no head pointer (no basis segment committed)"
+            )
+        member_records = {}
+        for index in range(head + 1):
+            name = _segment_name(index)
+            member_records[name] = store.read_segment(name)
+        heads[id(store)] = head
+        records[id(store)] = member_records
+    return heads, records
+
+
+def _lock_all_directories(paths, stack):
+    """Acquire every member directory lock on *stack*, waiting out folds.
+
+    Returns ``{path: store}`` once every member is quiescent (a dead
+    fold is rolled forward first); the locks are transferred to *stack*
+    and released when it closes.  A missing member directory raises
+    FileNotFoundError.
+    """
+    ordered = sorted(set(paths))
+    while True:
+        attempt = contextlib.ExitStack()
+        try:
+            present = [d for d in ordered if os.path.isdir(d)]
+            if len(present) != len(ordered):
+                raise FileNotFoundError(
+                    "incremental checkpoint directory not found: "
+                    f"{next(d for d in ordered if not os.path.isdir(d))!r}"
+                )
+            stores = {}
+            busy = []
+            for directory in ordered:
+                attempt.enter_context(_DirectoryChainLock(directory))
+                stores[directory] = _DirectoryChainStore(directory)
+            for directory in ordered:
+                _recover_directory_chain(directory, stores[directory])
+                if _member_fold_busy(directory):
+                    busy.append(directory)
+            if busy:
+                attempt.close()
+                for directory in busy:
+                    _wait_for_member_quiescent(directory)
+                continue
+            stack.enter_context(attempt.pop_all())
+            return stores
+        finally:
+            attempt.close()
+
+
+def _snapshot_directory_family(paths, stores):
+    """Read heads and segment bytes of a directory family under locks."""
+    heads = {}
+    records = {}
+    for directory in paths:
+        store = stores[directory]
+        head = _read_head_optional(store)
+        if head is None:
+            raise CheckpointError(
+                "chain has no head pointer (no basis segment committed): "
+                f"{directory!r}"
+            )
+        member_records = {}
+        for index in range(head + 1):
+            name = _segment_name(index)
+            member_records[name] = store.read_segment(name)
+        heads[directory] = head
+        records[directory] = member_records
+    return heads, records
+
+
+def _common_prefix_length(s_records, t_records, s_head, t_head):
+    """The number of leading positions both members hold byte-identically."""
+    limit = min(s_head, t_head)
+    prefix = 0
+    while prefix <= limit:
+        name = _segment_name(prefix)
+        if s_records[name] != t_records[name]:
+            break
+        prefix += 1
+    return prefix
+
+
+def _build_sync_plan(names, source_records, source_heads, target_records,
+                     target_heads, source_keys, target_keys):
+    """Freeze source-minus-target into ``(manifest, blocks)``.
+
+    The block pool holds only source-exclusive segment bytes,
+    deduplicated by equality (equal bytes across members become one
+    block).  A family already fully in sync yields an empty pool.
+    """
+    blocks = []
+    block_of_bytes = {}
+    manifest_members = []
+    for position, (s_key, t_key) in enumerate(zip(source_keys, target_keys)):
+        s_head = source_heads[s_key]
+        t_head = target_heads[t_key]
+        s_records = source_records[s_key]
+        t_records = target_records[t_key]
+        prefix = _common_prefix_length(
+            s_records, t_records, s_head, t_head
+        )
+        prefix_crcs = [
+            zlib.crc32(t_records[_segment_name(slot)]) & 0xFFFFFFFF
+            for slot in range(prefix)
+        ]
+        reach = [None] * prefix
+        for slot in range(prefix, s_head + 1):
+            raw = s_records[_segment_name(slot)]
+            block_id = block_of_bytes.get(raw)
+            if block_id is None:
+                block_id = len(blocks)
+                block_of_bytes[raw] = block_id
+                blocks.append(raw)
+            reach.append(block_id)
+        manifest_members.append(
+            {
+                "name": names[position],
+                "head": s_head,
+                "bp": prefix,
+                "pc": prefix_crcs,
+                "segments": reach,
+            }
+        )
+    positions = {}
+    for member in manifest_members:
+        for slot, block_id in enumerate(member["segments"]):
+            if block_id is None:
+                continue
+            previous = positions.get(block_id)
+            if previous is not None and previous != slot:
+                raise CheckpointError(
+                    "sync artifact rejected: a segment block shared across "
+                    "members sits at different segment positions"
+                )
+            positions[block_id] = slot
+    manifest = {
+        "v": _SYNC_VERSION,
+        "members": manifest_members,
+        "segments": [
+            {
+                "name": _segment_name(positions[block_id]),
+                "size": len(raw),
+                "crc": zlib.crc32(raw) & 0xFFFFFFFF,
+            }
+            for block_id, raw in enumerate(blocks)
+        ],
+    }
+    return manifest, blocks
+
+
+def _frame_sync(manifest, blobs):
+    manifest_bytes = json.dumps(
+        manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    body = bytearray()
+    body += SYNC_MAGIC
+    body += struct.pack("<I", manifest["v"])
+    body += struct.pack("<Q", len(manifest_bytes))
+    body += manifest_bytes
+    body += struct.pack("<Q", len(blobs))
+    crc = zlib.crc32(manifest_bytes)
+    for raw in blobs:
+        body += struct.pack("<Q", len(raw))
+        body += raw
+        crc = zlib.crc32(raw, crc)
+    body += SYNC_END_MAGIC
+    body += struct.pack("<I", crc & 0xFFFFFFFF)
+    return bytes(body)
+
+
+def _read_sync_frame(raw, what):
+    """Validate the sync container; return ``(manifest, blobs)``.
+
+    Framing, trailer CRC, manifest structure and every block's length
+    and CRC are checked here; chain walks and target matching run in
+    the dedicated validators.  An empty block pool is legal (a family
+    already fully in sync).
+    """
+    if not isinstance(raw, (bytes, bytearray, memoryview)):
+        raise CheckpointError(f"{what} must be bytes")
+    data = bytes(raw)
+    prefix_len = len(SYNC_MAGIC) + 4 + 8
+    if len(data) < prefix_len:
+        raise CheckpointError(f"{what} is truncated while reading its header")
+    if data[: len(SYNC_MAGIC)] != SYNC_MAGIC:
+        raise CheckpointError(f"not a {what} (bad magic)")
+    (version,) = struct.unpack(
+        "<I", data[len(SYNC_MAGIC) : len(SYNC_MAGIC) + 4]
+    )
+    if version != _SYNC_VERSION:
+        raise CheckpointError(
+            f"unsupported {what} version {version}; this build reads "
+            f"version {_SYNC_VERSION}"
+        )
+    (manifest_len,) = struct.unpack(
+        "<Q", data[len(SYNC_MAGIC) + 4 : prefix_len]
+    )
+    if manifest_len <= 0:
+        raise CheckpointError(f"{what} manifest length is invalid")
+    trailer_len = len(SYNC_END_MAGIC) + 4
+    trailer_pos = data.rfind(SYNC_END_MAGIC)
+    if trailer_pos < 0 or len(data) - trailer_pos != trailer_len:
+        raise CheckpointError(f"{what} trailer is missing or the file is torn")
+    manifest_start = prefix_len
+    if manifest_len > trailer_pos - manifest_start:
+        raise CheckpointError(f"{what} manifest overruns the block area")
+    manifest_bytes = data[manifest_start : manifest_start + manifest_len]
+    (stored_crc,) = struct.unpack(
+        "<I", data[trailer_pos + len(SYNC_END_MAGIC) :]
+    )
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CheckpointError(f"{what} manifest is invalid: {exc}") from exc
+    if not isinstance(manifest, dict) or set(manifest) != _SYNC_MANIFEST_KEYS:
+        raise CheckpointError(
+            f"{what} manifest must be an object with exactly the fields "
+            f"{sorted(_SYNC_MANIFEST_KEYS)}"
+        )
+    if (
+        not isinstance(manifest["v"], int)
+        or isinstance(manifest["v"], bool)
+        or manifest["v"] != version
+    ):
+        raise CheckpointError(f"{what} manifest version does not match its frame")
+    members = manifest["members"]
+    segments = manifest["segments"]
+    if not isinstance(members, list) or not members:
+        raise CheckpointError(f"{what} must name at least one member")
+    if not isinstance(segments, list):
+        raise CheckpointError(f"{what} segment inventory must be a list")
+    block_count_pos = manifest_start + manifest_len
+    if block_count_pos + 8 > trailer_pos:
+        raise CheckpointError(f"{what} is truncated before its block inventory")
+    (block_count,) = struct.unpack(
+        "<Q", data[block_count_pos : block_count_pos + 8]
+    )
+    if block_count != len(segments):
+        raise CheckpointError(
+            f"{what} block count does not match its segment inventory"
+        )
+    pos = block_count_pos + 8
+    blobs = []
+    running_crc = zlib.crc32(manifest_bytes)
+    for block_id, entry in enumerate(segments):
+        _exact_keys(entry, _SYNC_SEGMENT_KEYS, f"{what} segment entry {block_id}")
+        name = entry["name"]
+        if not isinstance(name, str) or _segment_index(name) is None:
+            raise CheckpointError(
+                f"{what} segment entry {block_id} has a bad segment file name"
+            )
+        size = entry["size"]
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            raise CheckpointError(
+                f"{what} segment entry {block_id} ({name}) has an invalid size"
+            )
+        crc_value = entry["crc"]
+        if (
+            isinstance(crc_value, bool)
+            or not isinstance(crc_value, int)
+            or not 0 <= crc_value <= 0xFFFFFFFF
+        ):
+            raise CheckpointError(
+                f"{what} segment entry {block_id} ({name}) has an invalid crc"
+            )
+        if pos + 8 > trailer_pos:
+            raise CheckpointError(
+                f"{what} is truncated before segment block {block_id} ({name})"
+            )
+        (raw_len,) = struct.unpack("<Q", data[pos : pos + 8])
+        pos += 8
+        if raw_len != size or size > trailer_pos - pos:
+            raise CheckpointError(
+                f"{what} segment block {block_id} ({name}) is truncated or "
+                "its length disagrees with the manifest"
+            )
+        chunk = data[pos : pos + size]
+        pos += size
+        if (zlib.crc32(chunk) & 0xFFFFFFFF) != crc_value:
+            raise CheckpointError(
+                f"{what} segment block {block_id} ({name}) fails its CRC"
+            )
+        running_crc = zlib.crc32(chunk, running_crc)
+        blobs.append(chunk)
+    if pos != trailer_pos:
+        raise CheckpointError(f"{what} has trailing or misaligned block bytes")
+    if (running_crc & 0xFFFFFFFF) != stored_crc:
+        raise CheckpointError(f"{what} CRC mismatch: the file is corrupt or torn")
+    return manifest, blobs
+
+
+def _parse_sync_manifest(manifest, block_total):
+    """Structural validation of the decoded sync manifest."""
+    plan = []
+    seen_names = set()
+    for position, member in enumerate(manifest["members"]):
+        what = f"sync artifact member {position}"
+        _exact_keys(member, _SYNC_MEMBER_KEYS, what)
+        name = member["name"]
+        _check_family_member_name(name, what)
+        if name in seen_names:
+            raise CheckpointError(
+                f"sync artifact lists member {name!r} more than once"
+            )
+        seen_names.add(name)
+        head = member["head"]
+        if isinstance(head, bool) or not isinstance(head, int) or head < 0:
+            raise CheckpointError(f"{what} ({name!r}) has an invalid head")
+        prefix = member["bp"]
+        if isinstance(prefix, bool) or not isinstance(prefix, int) or prefix < 0:
+            raise CheckpointError(
+                f"{what} ({name!r}) has an invalid common prefix length"
+            )
+        if prefix > head + 1:
+            raise CheckpointError(
+                f"{what} ({name!r}) names a common prefix beyond its chain"
+            )
+        prefix_crcs = member["pc"]
+        if not isinstance(prefix_crcs, list) or len(prefix_crcs) != prefix:
+            raise CheckpointError(
+                f"{what} ({name!r}) must carry one common-prefix CRC per "
+                "common position"
+            )
+        for slot, crc_value in enumerate(prefix_crcs):
+            if (
+                isinstance(crc_value, bool)
+                or not isinstance(crc_value, int)
+                or not 0 <= crc_value <= 0xFFFFFFFF
+            ):
+                raise CheckpointError(
+                    f"{what} ({name!r}) has an invalid common-prefix CRC at "
+                    f"position {slot}"
+                )
+        reach = member["segments"]
+        if not isinstance(reach, list) or len(reach) != head + 1:
+            raise CheckpointError(
+                f"{what} ({name!r}) must name one position for 0..head"
+            )
+        for slot in range(prefix):
+            if reach[slot] is not None:
+                raise CheckpointError(
+                    f"{what} ({name!r}) stores the common segment at "
+                    f"position {slot}"
+                )
+        for slot in range(prefix, head + 1):
+            block_id = reach[slot]
+            if (
+                isinstance(block_id, bool)
+                or not isinstance(block_id, int)
+                or not 0 <= block_id < block_total
+            ):
+                raise CheckpointError(
+                    f"{what} ({name!r}) names no segment block at position {slot}"
+                )
+        plan.append(
+            {
+                "name": name,
+                "head": head,
+                "bp": prefix,
+                "pc": list(prefix_crcs),
+                "segments": list(reach),
+            }
+        )
+    return plan
+
+
+def _walk_sync_member(member, blobs, prefix_reader):
+    """Walk one post-sync member chain exactly like a load.
+
+    Common-prefix bytes come from *prefix_reader(slot)*; a member with
+    no common prefix starts from its carried basis block.
+    """
+    prefix = member["bp"]
+    if prefix == 0:
+        walker = _ChainWalker(blobs[member["segments"][0]])
+        start = 1
+    else:
+        walker = _ChainWalker(prefix_reader(0))
+        for slot in range(1, prefix):
+            walker.apply_delta(slot, prefix_reader(slot))
+        start = prefix
+    for slot in range(start, member["head"] + 1):
+        walker.apply_delta(slot, blobs[member["segments"][slot]])
+    return walker.document()
+
+
+def _parse_sync_artifact(raw, target_readers=None):
+    """Fully validate a sync artifact; return ``(plan, blobs)``.
+
+    Every member's post-sync chain is walked like a load and the
+    members' parameter shapes and layer order must agree.  With
+    *target_readers* (one callable per member returning the target's
+    raw segment at a prefix position) the common prefix is walked on
+    the target's own bytes -- the produce self-check, the apply match
+    check and the conversions use this.  Without readers every member
+    must be fully carried (``bp == 0``), i.e. the artifact is
+    self-contained.
+    """
+    manifest, blobs = _read_sync_frame(raw, "sync artifact")
+    plan = _parse_sync_manifest(manifest, len(blobs))
+    documents = []
+    for position, member in enumerate(plan):
+        if target_readers is not None:
+            reader = target_readers[position]
+        elif member["bp"] != 0:
+            raise CheckpointError(
+                f"sync artifact member {position} ({member['name']!r}) has a "
+                "common prefix but no target family to resolve it against"
+            )
+        else:
+            reader = None
+        try:
+            document = _walk_sync_member(member, blobs, reader)
+        except CheckpointError as exc:
+            raise CheckpointError(
+                f"sync artifact member {position} ({member['name']!r}) is "
+                f"invalid: {exc}"
+            ) from exc
+        documents.append(document)
+    _check_family_shape_agreement(
+        documents, [member["name"] for member in plan], "sync"
+    )
+    return plan, blobs
+
+
+# -- input validation -------------------------------------------------------
+
+
+def _check_sync_family_inputs(source_members, target_members, memory=False):
+    kind = "MemoryChains" if memory else "chain directories"
+    scalar = MemoryChain if memory else (str, bytes, os.PathLike)
+    if isinstance(source_members, scalar) or isinstance(
+        target_members, scalar
+    ):
+        raise TypeError(f"a synced family must be a sequence of {kind}")
+    try:
+        source_members = list(source_members)
+        target_members = list(target_members)
+    except TypeError:
+        raise TypeError(f"a synced family must be a sequence of {kind}") from None
+    if not source_members or not target_members:
+        raise CheckpointError("a synced family needs at least one chain per side")
+    if len(source_members) != len(target_members):
+        raise CheckpointError(
+            "sync families must have the same number of members "
+            f"({len(source_members)} source vs {len(target_members)} target)"
+        )
+    if memory:
+        for member in source_members + target_members:
+            if not isinstance(member, MemoryChain):
+                raise TypeError("sync family members must be MemoryChains")
+        if len({id(store) for store in source_members}) != len(source_members):
+            raise CheckpointError(
+                "a synced family must not list a source member twice"
+            )
+        if len({id(store) for store in target_members}) != len(target_members):
+            raise CheckpointError(
+                "a synced family must not list a target member twice"
+            )
+        return source_members, target_members
+    source_paths = []
+    target_paths = []
+    for label, members, sink in (
+        ("source", source_members, source_paths),
+        ("target", target_members, target_paths),
+    ):
+        for member in members:
+            if not isinstance(member, (str, os.PathLike)):
+                raise TypeError(
+                    "sync family members must be chain directory paths"
+                )
+            sink.append(os.path.abspath(os.fspath(member)))
+        if len(set(sink)) != len(sink):
+            raise CheckpointError(
+                f"a synced family must not list a {label} member twice"
+            )
+        parents = {os.path.dirname(path) for path in sink}
+        if len(parents) != 1:
+            raise CheckpointError(
+                f"a sync requires every {label} member directory to live in "
+                "one parent directory"
+            )
+        for path in sink:
+            _check_family_member_name(
+                os.path.basename(path), f"sync {label} family"
+            )
+    for index, (source_path, target_path) in enumerate(
+        zip(source_paths, target_paths)
+    ):
+        if os.path.basename(source_path) != os.path.basename(target_path):
+            raise CheckpointError(
+                f"sync pair {index} names different members: "
+                f"{os.path.basename(source_path)!r} on the source side vs "
+                f"{os.path.basename(target_path)!r} on the target side; pair "
+                "family members positionally by their directory name"
+            )
+    return source_paths, target_paths
+
+
+def _check_sync_documents(s_documents, t_documents, source_names, target_names):
+    """Shape/layer-order agreement within and across the two families."""
+    _check_family_shape_agreement(s_documents, source_names, "sync source family")
+    _check_family_shape_agreement(t_documents, target_names, "sync target family")
+    for index, (s_doc, t_doc) in enumerate(zip(s_documents, t_documents)):
+        if _family_shape_signature(s_doc) != _family_shape_signature(t_doc):
+            raise CheckpointError(
+                _format_family_shape_mismatch(
+                    [
+                        _family_shape_signature(s_doc),
+                        _family_shape_signature(t_doc),
+                    ],
+                    [source_names[index], target_names[index]],
+                    "sync",
+                )
+            )
+
+
+# -- produce (directories) --------------------------------------------------
+
+
+def sync_family(source_members, target_members, target):
+    """Produce an incremental sync artifact between two chain families.
+
+    *source_members* and *target_members* are two equal-length sequences
+    of chain directories, positionally paired (member *i* of the target
+    is the counterpart of member *i* of the source); *target* is the
+    destination path of the artifact file.  The artifact carries only
+    what the two families genuinely differ by: each member's common
+    byte prefix is recorded by position and CRC alone (the shared
+    bytes are never stored) and the source's exclusive segments become
+    deduplicated blocks, shared across members exactly as the families
+    store them.  Shared and unchanged segments are never stored twice;
+    a member the target already holds in full adds no block.  Neither
+    family is modified and no member's optimizer step advances;
+    producing the same difference twice yields identical bytes.
+
+    Members keep saving, loading and appending while the artifact is
+    produced: the family guards of both parent directories are taken in
+    a stable order and every member lock in one deadlock-free total
+    order, under which the heads and segment bytes are snapshotted, so
+    the artifact fixes one consistent picture and no chain is observed
+    half.
+
+    A missing member directory or a missing referenced segment raises
+    FileNotFoundError without touching the other family; families of
+    different lengths and members whose parameter shapes or layer
+    order disagree (within either family or across a pair) reject the
+    whole production with ValueError before the artifact is written; an
+    unwritable destination directory or a full disk raises OSError and
+    the artifact file is written through a temp file and atomically
+    renamed, so a kill leaves only the rejected temp file.
+    """
+    source_paths, target_paths = _check_sync_family_inputs(
+        source_members, target_members
+    )
+    for path in source_paths + target_paths:
+        if not os.path.isdir(path):
+            raise FileNotFoundError(
+                f"incremental checkpoint directory not found: {path!r}"
+            )
+    if not isinstance(target, (str, os.PathLike)):
+        raise TypeError("sync artifact target must be a filesystem path")
+    target_file = os.path.abspath(os.fspath(target))
+    if os.path.isdir(target_file):
+        raise CheckpointError(f"sync artifact target is a directory: {target!r}")
+    for member_abs in source_paths + target_paths:
+        if target_file == member_abs or target_file.startswith(member_abs + os.sep):
+            raise CheckpointError(
+                "sync artifact target must not live inside a member chain "
+                "directory"
+            )
+    target_dir = os.path.dirname(target_file)
+    if not os.path.isdir(target_dir):
+        raise FileNotFoundError(
+            f"sync artifact destination directory not found: {target_dir!r}"
+        )
+    _sweep_parent_staging(target_dir)
+    raw = _produce_sync_directory_bytes(source_paths, target_paths)
+    _atomic_write(target_dir, os.path.basename(target_file), raw)
+    return None
+
+
+def _produce_sync_directory_bytes(source_paths, target_paths):
+    """The pure produce step for two directory families."""
+    source_parent = os.path.dirname(source_paths[0])
+    target_parent = os.path.dirname(target_paths[0])
+    _sweep_parent_staging(source_parent)
+    if target_parent != source_parent:
+        _sweep_parent_staging(target_parent)
+    # Both family guards in a stable (sorted) order so opposing syncs
+    # cannot deadlock; then one total order over every member lock.
+    guards = sorted({source_parent, target_parent})
+    with contextlib.ExitStack() as stack:
+        for parent in guards:
+            stack.enter_context(_FamilyParentGuard(parent))
+        all_paths = sorted(set(source_paths + target_paths))
+        stores = _lock_all_directories(all_paths, stack)
+        s_heads, s_records = _snapshot_directory_family(source_paths, stores)
+        t_heads, t_records = _snapshot_directory_family(target_paths, stores)
+        s_documents = [
+            _load_chain_store(stores[path], s_heads[path])
+            for path in source_paths
+        ]
+        t_documents = [
+            _load_chain_store(stores[path], t_heads[path])
+            for path in target_paths
+        ]
+    _check_sync_documents(
+        s_documents, t_documents,
+        [os.path.basename(path) for path in source_paths],
+        [os.path.basename(path) for path in target_paths],
+    )
+    names = [os.path.basename(path) for path in source_paths]
+    manifest, blocks = _build_sync_plan(
+        names, s_records, s_heads, t_records, t_heads,
+        source_paths, target_paths,
+    )
+    raw = _frame_sync(manifest, blocks)
+    # Produce-time self-check: the artifact walks against the exact
+    # target bytes just snapshotted.
+    readers = [
+        (lambda slot, records=t_records[path]: records[_segment_name(slot)])
+        for path in target_paths
+    ]
+    _parse_sync_artifact(raw, readers)
+    return raw
+
+
+# -- produce (memory) -------------------------------------------------------
+
+
+def sync_family_memory(source_members, target_members):
+    """Produce an incremental sync artifact from two memory families.
+
+    Same semantics as :func:`sync_family` for :class:`MemoryChain`
+    stores: only the genuine difference is carried, shared segments are
+    one block, neither family is mutated or stepped and the result is a
+    deterministic pure function of the two families.  Returns the
+    artifact bytes.
+    """
+    source_members, target_members = _check_sync_family_inputs(
+        source_members, target_members, memory=True
+    )
+    all_stores = list(
+        {id(store): store for store in source_members + target_members}.values()
+    )
+    ordered = _lock_all_memory(all_stores)
+    try:
+        s_heads, s_records = _snapshot_memory_family(source_members)
+        t_heads, t_records = _snapshot_memory_family(target_members)
+        s_documents = [
+            _load_chain_store(store, s_heads[id(store)])
+            for store in source_members
+        ]
+        t_documents = [
+            _load_chain_store(store, t_heads[id(store)])
+            for store in target_members
+        ]
+    finally:
+        for store in reversed(ordered):
+            store._lock.release()
+    names = _sync_member_names(len(source_members))
+    _check_sync_documents(s_documents, t_documents, names, names)
+    manifest, blocks = _build_sync_plan(
+        names, s_records, s_heads, t_records, t_heads,
+        [id(store) for store in source_members],
+        [id(store) for store in target_members],
+    )
+    raw = _frame_sync(manifest, blocks)
+    readers = [
+        (lambda slot, records=t_records[id(store)]: records[_segment_name(slot)])
+        for store in target_members
+    ]
+    _parse_sync_artifact(raw, readers)
+    return raw
+
+
+# -- apply: per-member publication ------------------------------------------
+
+
+def _sync_block_path(parent, block_id):
+    return os.path.join(parent, f"{_SYNC_BLOCK_PREFIX}{block_id:010d}")
+
+
+def _encode_sync_member_marker(head, prefix):
+    return json.dumps(
+        {"v": 1, "h": head, "bp": prefix},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+
+
+def _read_sync_member_marker(directory):
+    """The per-member publication marker, or None when absent/corrupt.
+
+    A corrupt marker is treated as absent by callers that validate the
+    directory state separately; recovery itself surfaces a malformed
+    marker as ValueError.
+    """
+    path = os.path.join(directory, _SYNC_MEMBER_MARKER)
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as fh:
+        try:
+            marker = json.loads(fh.read().decode("ascii"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CheckpointError("sync publication marker is corrupt") from exc
+    if not isinstance(marker, dict) or set(marker) != _SYNC_MEMBER_MARKER_KEYS:
+        raise CheckpointError("sync publication marker is corrupt")
+    if marker["v"] != 1:
+        raise CheckpointError("sync publication marker is corrupt")
+    head, prefix = marker["h"], marker["bp"]
+    if (
+        isinstance(head, bool)
+        or not isinstance(head, int)
+        or head < 0
+        or isinstance(prefix, bool)
+        or not isinstance(prefix, int)
+        or not 0 <= prefix <= head + 1
+    ):
+        raise CheckpointError("sync publication marker is corrupt")
+    return head, prefix
+
+
+def _finish_sync_publication(directory, store, head, prefix):
+    """Roll an interrupted (or just-staged) sync publication forward.
+
+    Runs under the member directory lock: staged whole segments are
+    promoted over their slots ascending (including the staged prefix
+    links that converge coincidentally-equal segments onto one inode),
+    every slot beyond the new head is released (one directory entry per
+    unlink, so a segment a sibling chain shares keeps its bytes through
+    that sibling's link), the head advances and the marker plus staged
+    debris are removed -- leaving exactly one complete chain.
+
+    Every staged slot is a hard link, so promotion is just a rename of
+    one directory entry onto the slot: the segment's inode (and bytes)
+    survive through the promoted link even when the link's other entry
+    was the temporary family block area, and every member reaching the
+    block keeps sharing that one inode after the block entry is
+    reclaimed.
+    """
+    for slot in range(0, head + 1):
+        staged = os.path.join(directory, _sync_staged_name(slot))
+        target = os.path.join(directory, _segment_name(slot))
+        if os.path.exists(staged):
+            os.replace(staged, target)
+        elif slot >= prefix and not os.path.exists(target):
+            raise CheckpointError(
+                "sync publication staging is incomplete; the member cannot "
+                "be rolled forward"
+            )
+    for name in list(os.listdir(directory)):
+        index = _segment_index(name)
+        if index is not None and index > head:
+            _unlink_quietly(os.path.join(directory, name))
+        elif _is_sync_staged(name) or name.startswith(_TMP_PREFIX):
+            _unlink_quietly(os.path.join(directory, name))
+    _commit_head(store, head)
+    _unlink_quietly(os.path.join(directory, _SYNC_MEMBER_MARKER))
+    _fsync_directory(directory)
+
+
+def _verify_through_sync_marker_read_only(directory, store, head):
+    """Read-only verification of a member caught mid sync-publication.
+
+    Like the compaction marker walk, no recovery is performed: the one
+    coherent post-sync chain is assembled from whichever slot currently
+    holds each segment -- the member's own files for the common prefix
+    and the staged whole segment (if present) or the promoted slot for
+    the synced part.  The head still names the old chain while a staged
+    slot is missing.
+    """
+    new_head, prefix = _read_sync_member_marker(directory)
+    try:
+        basis_raw = store.read_segment(_segment_name(_BASIS_INDEX))
+    except FileNotFoundError:
+        raise CheckpointError(
+            "chain verification failed at segment 0 "
+            f"(basis, segment file {_segment_name(_BASIS_INDEX)!r}): "
+            "the basis segment file is missing"
+        ) from None
+    walker = _ChainWalker(basis_raw)
+    for slot in range(1, new_head + 1):
+        if slot < prefix:
+            try:
+                raw = store.read_segment(_segment_name(slot))
+            except FileNotFoundError:
+                raise CheckpointError(
+                    f"chain verification failed at segment {slot} "
+                    f"(delta, segment file {_segment_name(slot)!r}): "
+                    "the segment file is missing"
+                ) from None
+        else:
+            staged = os.path.join(directory, _sync_staged_name(slot))
+            if os.path.exists(staged):
+                raw = _read_existing(staged)
+            else:
+                try:
+                    raw = store.read_segment(_segment_name(slot))
+                except FileNotFoundError:
+                    raise CheckpointError(
+                        f"chain verification failed at segment {slot} "
+                        f"(delta, segment file {_segment_name(slot)!r}): "
+                        "a staged segment of the interrupted sync is missing"
+                    ) from None
+        try:
+            walker.apply_delta(slot, raw)
+        except CheckpointError as exc:
+            raise _verify_failure(
+                *_verify_segment_position(slot, "delta"), exc
+            ) from exc
+    try:
+        walker.document()
+    except CheckpointError as exc:
+        raise _verify_failure(
+            f"segment {new_head}",
+            f"chain assembly, segment file {_segment_name(new_head)!r}",
+            exc,
+        ) from exc
+    return ChainVerification(new_head, new_head + 1)
+
+
+def _materialize_sync_blocks(parent, needed, blobs):
+    """Write the carried blocks members need, once each, as whole files.
+
+    Every block goes through the temp-file-plus-rename discipline, so a
+    kill leaves only the rejected temp file -- never a half block.
+    Re-running skips blocks already materialised whole.
+    """
+    for block_id in sorted(needed):
+        path = _sync_block_path(parent, block_id)
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as fh:
+                    if fh.read() == blobs[block_id]:
+                        continue
+            except OSError:
+                pass
+        _atomic_write(parent, os.path.basename(path), blobs[block_id])
+
+
+def _sync_member_already_done(directory, store, member, blobs):
+    """Whether the member already carries the synced chain as a prefix.
+
+    True when its head is at least the source head and the chain through
+    that head is byte for byte the post-sync chain (common prefix still
+    matching the recorded CRCs, exclusive slots equal to the carried
+    blocks).  A member that kept appending after a sync committed is
+    therefore "done" and its own longer tail is preserved, exactly like
+    an import resume tolerating appends to committed members.
+    """
+    head = _read_head_optional(store)
+    if head is None or head < member["head"]:
+        return False
+    for slot in range(member["bp"]):
+        try:
+            raw = store.read_segment(_segment_name(slot))
+        except FileNotFoundError:
+            return False
+        if (zlib.crc32(raw) & 0xFFFFFFFF) != member["pc"][slot]:
+            return False
+    for slot in range(member["bp"], member["head"] + 1):
+        try:
+            raw = store.read_segment(_segment_name(slot))
+        except FileNotFoundError:
+            return False
+        if raw != blobs[member["segments"][slot]]:
+            return False
+    return True
+
+
+def _find_family_slot_file(parent, target_paths, slot, block_bytes, skip_path):
+    """A member's existing segment at *slot* byte-identical to *block_bytes*.
+
+    Fork-family members reach the same chain position *slot* through one
+    physical segment whenever their bytes agree (the hard-link sharing a
+    fork creates).  Applying a sync must not turn that one copy into two:
+    an exclusive carried block byte-identical to a segment another
+    member already holds at the same slot is staged as a link to that
+    member's file instead of to the block area.  Returns the first match
+    in plan order, or None.
+    """
+    name = _segment_name(slot)
+    for path in target_paths:
+        if path == skip_path:
+            continue
+        candidate = os.path.join(path, name)
+        if not os.path.exists(candidate):
+            continue
+        try:
+            with open(candidate, "rb") as fh:
+                if fh.read() == block_bytes:
+                    return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _apply_one_sync_member_locked(parent, member, path, store, blobs,
+                                 target_paths):
+    """Validate, stage and publish one member with its lock already held.
+
+    The whole switch runs under the caller's member-directory lock, so a
+    concurrent save, load or append either completes before the switch
+    (and is preserved as part of the target being validated) or waits it
+    out and then proceeds against the new complete chain -- it can never
+    commit into the gap and be lost, and no reader ever sees half a
+    chain.
+    """
+    head = _read_head_optional(store)
+    if head is None:
+        raise CheckpointError(
+            f"sync target member {member['name']!r} has no head pointer"
+        )
+    if head + 1 < member["bp"]:
+        raise CheckpointError(
+            "sync artifact does not match the target family: member "
+            f"{member['name']!r} is shorter than the recorded common history"
+        )
+    # Match the recorded common prefix exactly before anything moves.
+    for slot in range(member["bp"]):
+        raw = store.read_segment(_segment_name(slot))
+        if (zlib.crc32(raw) & 0xFFFFFFFF) != member["pc"][slot]:
+            raise CheckpointError(
+                "sync artifact does not match the target family: the common "
+                f"segment at position {slot} of member {member['name']!r} "
+                "differs"
+            )
+    target_doc = _load_chain_store(store, head)
+
+    def reader(slot, store=store):
+        return store.read_segment(_segment_name(slot))
+
+    source_doc = _walk_sync_member(member, blobs, reader)
+    if _family_shape_signature(target_doc) != _family_shape_signature(
+        source_doc
+    ):
+        raise CheckpointError(
+            "sync artifact does not match the target family: member "
+            f"{member['name']!r} parameter shapes or layer order disagree"
+        )
+    if _sync_member_already_done(path, store, member, blobs):
+        return False
+
+    # Stage the member's post-sync segments as whole private-slot files.
+    # Every segment the member ends with is materialised: exclusive
+    # slots link to the family block area (or to a sibling that already
+    # holds the equal bytes at the same slot -- one copy, never two),
+    # and a common-prefix slot whose equal bytes a sibling reaches
+    # through a different inode is linked from that sibling as well, so
+    # the synced family converges onto the one-inode-per-slot layout a
+    # fork family has (the directory-level counterpart of
+    # _converge_identical_bases).  All staged links exist before the
+    # marker is written, which is the invariant a killed publication
+    # rolls forward on.
+    for slot in range(member["bp"]):
+        own = os.path.join(path, _segment_name(slot))
+        block_bytes = store.read_segment(_segment_name(slot))
+        sibling = _find_family_slot_file(
+            parent, target_paths, slot, block_bytes, path
+        )
+        if sibling is not None and not os.path.samefile(sibling, own):
+            staged = os.path.join(path, _sync_staged_name(slot))
+            if not os.path.exists(staged):
+                os.link(sibling, staged)
+    for slot in range(member["bp"], member["head"] + 1):
+        block_bytes = blobs[member["segments"][slot]]
+        staged = os.path.join(path, _sync_staged_name(slot))
+        if os.path.exists(staged):
+            with open(staged, "rb") as fh:
+                if fh.read() != block_bytes:
+                    raise CheckpointError("sync publication staging is corrupt")
+        else:
+            shared_file = _find_family_slot_file(
+                parent, target_paths, slot, block_bytes, path
+            )
+            source_file = (
+                shared_file
+                if shared_file is not None
+                else _sync_block_path(parent, member["segments"][slot])
+            )
+            os.link(source_file, staged)
+    _atomic_write(
+        path,
+        _SYNC_MEMBER_MARKER,
+        _encode_sync_member_marker(member["head"], member["bp"]),
+    )
+    _finish_sync_publication(path, store, member["head"], member["bp"])
+    return True
+
+
+def _encode_sync_marker(digest):
+    return json.dumps(
+        {"v": 1, "d": digest}, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+
+
+def _read_sync_marker(parent):
+    path = os.path.join(parent, _SYNC_MARKER_NAME)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as fh:
+            marker = json.loads(fh.read().decode("ascii"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(marker, dict) or set(marker) != _SYNC_MARKER_KEYS:
+        return None
+    if marker["v"] != 1 or not isinstance(marker["d"], str):
+        return None
+    return marker
+
+
+def _sweep_sync_family_debris(parent):
+    """Reclaim the block area / marker a killed sync left in *parent*.
+
+    Called from :func:`_sweep_parent_staging`; the sync's own apply
+    removes the files on success.  A live family operation holds the
+    family lease, in which case its files are left strictly alone.
+    Returns whether anything was removed.
+    """
+    if _family_lease_live(parent):
+        return False
+    changed = False
+    try:
+        names = os.listdir(parent)
+    except OSError:
+        return False
+    for name in names:
+        if name.startswith(_SYNC_BLOCK_PREFIX) or name == _SYNC_MARKER_NAME:
+            _unlink_quietly(os.path.join(parent, name))
+            changed = True
+    if changed:
+        _fsync_directory(parent)
+    return changed
+
+
+def apply_sync_family(artifact, target):
+    """Apply an incremental sync artifact to a chain family atomically.
+
+    *artifact* is a sync artifact file path (as produced by
+    :func:`sync_family`); *target* is the family directory holding the
+    target member chains the artifact was produced against, paired by
+    member name.  The artifact is validated in full -- framing, CRC,
+    every carried chain and the match against each target member (the
+    common-prefix CRCs, parameter shapes and layer order) -- before the
+    family marker, one block or one member segment is written, so a
+    rejected apply leaves both families byte for byte untouched.
+
+    Every target member then adopts the source member exactly: the
+    source-exclusive blocks are materialised once in the family
+    directory and hard-linked into each member's private staged slots,
+    common positions remain the member's own files (the shared layout
+    never degenerates into duplicate storage), and the switch runs in
+    one member-lock acquisition -- staged slots promoted, the old tail
+    released, the head advanced -- so a concurrent save, load or append
+    observes the old complete chain or the new one, never half a chain.
+    Afterwards loading a target member is bit for bit identical to
+    loading the source -- parameters, gradients, optimizer state and
+    step count and hidden state -- the source family is unchanged, the
+    apply advances no optimizer step, and applying the same artifact to
+    the synced family again is a no-op.
+
+    A process killed mid-apply leaves only whole files: the family
+    block area and resumable marker, and per-member staged segments
+    plus their publication marker.  Re-running the same apply (or just
+    opening a member) rolls every member forward and finishes with a
+    result bit for bit identical to one uninterrupted run; the family
+    debris is reclaimed by the next fork, merge, deletion,
+    single-chain/family compaction, import or family export over the
+    target directory.  A missing artifact or member directory, or a
+    referenced segment that is absent, raises FileNotFoundError without
+    touching the other family; a torn, truncated, missing-field,
+    reordered or shape/layer-order-inconsistent artifact, or one that
+    does not match the target family, rejects the whole apply with
+    ValueError before anything is written; an unwritable directory or a
+    full disk raises OSError and leaves only whole files behind.
+    """
+    if not isinstance(artifact, (str, os.PathLike)):
+        raise TypeError("sync artifact must be a filesystem path")
+    if not isinstance(target, (str, os.PathLike)):
+        raise TypeError("sync target must be a directory path")
+    artifact = os.fspath(artifact)
+    target = os.fspath(target)
+    with open(artifact, "rb") as fh:
+        raw = fh.read()
+    parent = os.path.abspath(target)
+    if not os.path.exists(parent):
+        raise FileNotFoundError(f"sync target directory not found: {target!r}")
+    if not os.path.isdir(parent):
+        raise CheckpointError(f"sync target is not a directory: {target!r}")
+
+    digest = hashlib.sha256(raw).hexdigest()
+    # Container validation needs no target and happens before any lock
+    # or write: a torn artifact never creates a marker or a block.
+    manifest, blobs = _read_sync_frame(raw, "sync artifact")
+    preliminary = _parse_sync_manifest(manifest, len(blobs))
+    # Reclaim staging/block residue a killed family operation left here
+    # (the sweep takes the parent flock, so it never disturbs live work).
+    _sweep_parent_staging(parent)
+    with _FamilyParentGuard(parent):
+        _family_register(parent)
+        try:
+            target_paths = []
+            for member in preliminary:
+                path = os.path.join(parent, member["name"])
+                if not os.path.isdir(path):
+                    raise FileNotFoundError(
+                        "sync target family is missing member directory "
+                        f"{member['name']!r} under {parent!r}"
+                    )
+                if not os.path.exists(os.path.join(path, _HEAD_NAME)):
+                    raise CheckpointError(
+                        "sync artifact does not match the target family: "
+                        f"{member['name']!r} is not a chain directory"
+                    )
+                target_paths.append(path)
+            # Every member lock is taken together (sorted paths, a
+            # deadlock-free total order) and held until every member has
+            # published, so an append can never commit into the gap
+            # between validation and the switch.  Each open first rolls a
+            # dead publication (its own or a previous sync's) forward.
+            with contextlib.ExitStack() as member_stack:
+                stores = _lock_all_directories(target_paths, member_stack)
+                readers = []
+                target_documents = []
+                for member, path in zip(preliminary, target_paths):
+                    store = stores[path]
+                    head = _read_head_optional(store)
+                    if head is None:
+                        raise CheckpointError(
+                            f"sync target member {member['name']!r} has no "
+                            "head pointer"
+                        )
+                    if head + 1 < member["bp"]:
+                        raise CheckpointError(
+                            "sync artifact does not match the target family: "
+                            f"member {member['name']!r} is shorter than the "
+                            "recorded common history"
+                        )
+                    for slot in range(member["bp"]):
+                        prefix_raw = store.read_segment(_segment_name(slot))
+                        if (
+                            zlib.crc32(prefix_raw) & 0xFFFFFFFF
+                            != member["pc"][slot]
+                        ):
+                            raise CheckpointError(
+                                "sync artifact does not match the target "
+                                f"family: the common segment at position "
+                                f"{slot} of member {member['name']!r} differs"
+                            )
+
+                    def reader(slot, store=store):
+                        return store.read_segment(_segment_name(slot))
+
+                    readers.append(reader)
+                    target_documents.append(_load_chain_store(store, head))
+                source_documents = [
+                    _walk_sync_member(member, blobs, reader)
+                    for member, reader in zip(preliminary, readers)
+                ]
+                _check_family_shape_agreement(
+                    source_documents,
+                    [member["name"] for member in preliminary],
+                    "sync",
+                )
+                for member, target_doc, source_doc in zip(
+                    preliminary, target_documents, source_documents
+                ):
+                    if _family_shape_signature(
+                        target_doc
+                    ) != _family_shape_signature(source_doc):
+                        raise CheckpointError(
+                            "sync artifact does not match the target family: "
+                            f"member {member['name']!r} parameter shapes or "
+                            "layer order disagree"
+                        )
+                done = [
+                    _sync_member_already_done(
+                        path, stores[path], member, blobs
+                    )
+                    for path, member in zip(target_paths, preliminary)
+                ]
+                # Whole-artifact validation is complete; only now may the
+                # resume marker and the one shared block area appear.
+                marker = _read_sync_marker(parent)
+                if marker is None or marker["d"] != digest:
+                    _atomic_write(
+                        parent, _SYNC_MARKER_NAME, _encode_sync_marker(digest)
+                    )
+                needed = set()
+                for member, finished in zip(preliminary, done):
+                    if not finished:
+                        needed.update(member["segments"][member["bp"]:])
+                _materialize_sync_blocks(parent, needed, blobs)
+                # Publish every member while its lock stays held: stage
+                # the whole segments, switch the head, release the old
+                # tail -- one complete chain at every instant.
+                for path, member, finished in zip(
+                    target_paths, preliminary, done
+                ):
+                    if not finished:
+                        _apply_one_sync_member_locked(
+                            parent, member, path, stores[path], blobs,
+                            target_paths,
+                        )
+            for block_id in range(len(blobs)):
+                _unlink_quietly(_sync_block_path(parent, block_id))
+            _unlink_quietly(os.path.join(parent, _SYNC_MARKER_NAME))
+            _fsync_directory(parent)
+        finally:
+            _family_release(parent)
+    return None
+
+
+# -- apply (memory) ---------------------------------------------------------
+
+
+def apply_sync_family_memory(artifact, target_members):
+    """Apply a sync artifact to a family of :class:`MemoryChain` stores.
+
+    Same semantics as :func:`apply_sync_family`: the artifact is
+    validated in full and matched against every target member before
+    one store is touched, each target adopts the source bit for bit
+    with the common prefix kept as the target's own bytes objects and
+    one carried block object shared by every member that reaches it,
+    the apply advances no optimizer step and applying the same
+    artifact to the synced family again is a no-op.  A rejected apply
+    leaves every store untouched.
+    """
+    if isinstance(target_members, MemoryChain):
+        raise TypeError("a synced family must be a sequence of MemoryChains")
+    try:
+        target_members = list(target_members)
+    except TypeError:
+        raise TypeError(
+            "a synced family must be a sequence of MemoryChains"
+        ) from None
+    if not target_members:
+        raise CheckpointError("a synced family needs at least one target chain")
+    for member in target_members:
+        if not isinstance(member, MemoryChain):
+            raise TypeError("sync family members must be MemoryChains")
+    if len({id(store) for store in target_members}) != len(target_members):
+        raise CheckpointError("a synced family must not list a target member twice")
+    manifest, blobs = _read_sync_frame(artifact, "sync artifact")
+    plan = _parse_sync_manifest(manifest, len(blobs))
+    if len(plan) != len(target_members):
+        raise CheckpointError(
+            "sync artifact does not match the target family: member count "
+            f"{len(plan)} vs {len(target_members)}"
+        )
+    ordered = _lock_all_memory(target_members)
+    try:
+        readers = []
+        target_documents = []
+        for member, member_plan in zip(target_members, plan):
+            head = _read_head_optional(member)
+            if head is None:
+                raise CheckpointError(
+                    f"sync target member {member_plan['name']!r} has no head "
+                    "pointer"
+                )
+            if head + 1 < member_plan["bp"]:
+                raise CheckpointError(
+                    "sync artifact does not match the target family: member "
+                    f"{member_plan['name']!r} is shorter than the common "
+                    "history"
+                )
+
+            def reader(slot, member=member):
+                return member._objects[_segment_name(slot)]
+
+            readers.append(reader)
+            for slot in range(member_plan["bp"]):
+                raw = member._objects.get(_segment_name(slot))
+                if raw is None:
+                    raise CheckpointError(
+                        "sync artifact does not match the target family: the "
+                        f"common segment at position {slot} is missing"
+                    )
+                if (zlib.crc32(raw) & 0xFFFFFFFF) != member_plan["pc"][slot]:
+                    raise CheckpointError(
+                        "sync artifact does not match the target family: the "
+                        f"common segment at position {slot} of member "
+                        f"{member_plan['name']!r} differs"
+                    )
+            target_documents.append(_load_chain_store(member, head))
+        source_documents = [
+            _walk_sync_member(member, blobs, reader)
+            for member, reader in zip(plan, readers)
+        ]
+        _check_family_shape_agreement(
+            source_documents, [m["name"] for m in plan], "sync"
+        )
+        for member_plan, target_doc, source_doc in zip(
+            plan, target_documents, source_documents
+        ):
+            if _family_shape_signature(target_doc) != _family_shape_signature(
+                source_doc
+            ):
+                raise CheckpointError(
+                    "sync artifact does not match the target family: member "
+                    f"{member_plan['name']!r} parameter shapes or layer "
+                    "order disagree"
+                )
+        # All checks passed: rebuild each store under the held locks.
+        # Equal bytes at the same slot across the family collapse onto
+        # one object -- the in-memory counterpart of the fork family's
+        # one inode -- including coincidentally-equal prefixes.
+        existing = {}
+        for target_store, member_plan in zip(target_members, plan):
+            for slot in range(member_plan["bp"]):
+                own = target_store._objects[_segment_name(slot)]
+                existing.setdefault((slot, own), own)
+        for target_store, member_plan in zip(target_members, plan):
+            new_objects = {}
+            for slot in range(member_plan["bp"]):
+                own = target_store._objects[_segment_name(slot)]
+                new_objects[_segment_name(slot)] = existing.setdefault(
+                    (slot, own), own
+                )
+            for slot in range(member_plan["bp"], member_plan["head"] + 1):
+                block_bytes = blobs[member_plan["segments"][slot]]
+                new_objects[_segment_name(slot)] = existing.setdefault(
+                    (slot, block_bytes), block_bytes
+                )
+            new_objects[_HEAD_NAME] = str(member_plan["head"]).encode("ascii")
+            target_store._objects.clear()
+            target_store._objects.update(new_objects)
+    finally:
+        for store in reversed(ordered):
+            store._lock.release()
+    return None
+
+
+# -- full <-> incremental conversion ----------------------------------------
+
+
+def _records_from_export_plan(plan, blobs):
+    """Build the record maps the sync planner expects from an export."""
+    records = {}
+    heads = {}
+    for position, member in enumerate(plan):
+        records[position] = {
+            _segment_name(slot): blobs[block_id]
+            for slot, block_id in enumerate(member["segments"])
+        }
+        heads[position] = member["head"]
+    return records, heads, list(range(len(plan)))
+
+
+def _walk_export_member(member, blobs):
+    walker = _ChainWalker(blobs[member["segments"][0]])
+    for slot in range(1, member["head"] + 1):
+        walker.apply_delta(slot, blobs[member["segments"][slot]])
+    return walker.document()
+
+
+def family_export_to_sync(raw, target_family_raw):
+    """Convert a full source-family export into an incremental artifact.
+
+    *raw* is a full family artifact (``SEQFAMX1``) of the source family
+    and *target_family_raw* a full family artifact of the target family
+    as it currently stands; both must pack the same member count and
+    model shapes, paired in manifest order.  The result is the
+    incremental artifact :func:`sync_family` would produce for the same
+    two families: common and unchanged segments are dropped (their
+    positions and CRCs recorded) and the source-exclusive segments are
+    kept once.  Pure function, writes nothing.
+    """
+    source_plan, source_blobs = _parse_family_export(raw)
+    target_plan, target_blobs = _parse_family_export(target_family_raw)
+    if len(source_plan) != len(target_plan):
+        raise CheckpointError(
+            "sync conversion needs two families with the same member count "
+            f"({len(source_plan)} source vs {len(target_plan)} target)"
+        )
+    s_records, s_heads, s_keys = _records_from_export_plan(
+        source_plan, source_blobs
+    )
+    t_records, t_heads, t_keys = _records_from_export_plan(
+        target_plan, target_blobs
+    )
+    names = [member["name"] for member in source_plan]
+    s_documents = [_walk_export_member(m, source_blobs) for m in source_plan]
+    t_documents = [_walk_export_member(m, target_blobs) for m in target_plan]
+    _check_sync_documents(s_documents, t_documents, names, names)
+    manifest, blocks = _build_sync_plan(
+        names, s_records, s_heads, t_records, t_heads, s_keys, t_keys
+    )
+    sync_raw = _frame_sync(manifest, blocks)
+    readers = [
+        (lambda slot, rec=t_records[position]: rec[_segment_name(slot)])
+        for position in t_keys
+    ]
+    _parse_sync_artifact(sync_raw, readers)
+    return sync_raw
+
+
+def _canonical_full_export(plan, pool_entries):
+    """Frame the canonical full export from per-member raw-segment rows.
+
+    *pool_entries* is a list per member of raw segment bytes for slots
+    0..head.  Equal bytes collapse to one deduplicated block in
+    first-use order -- content identity, like the on-disk family's
+    hard-link sharing -- so the result is byte for byte what
+    :func:`export_family` produces for the equivalent fork family,
+    regardless of whether a prefix byte arrived from the target export
+    or from a carried block.
+    """
+    pool = []
+    canonical = {}
+    export_members = []
+    for member, entries in zip(plan, pool_entries):
+        reach = []
+        for raw in entries:
+            new_id = canonical.get(raw)
+            if new_id is None:
+                new_id = len(pool)
+                canonical[raw] = new_id
+                pool.append(raw)
+            reach.append(new_id)
+        export_members.append(
+            {"name": member["name"], "head": member["head"], "segments": reach}
+        )
+    position_of = {}
+    for member in export_members:
+        for slot, block_id in enumerate(member["segments"]):
+            position_of.setdefault(block_id, slot)
+    manifest = {
+        "v": _FAMILY_EXPORT_VERSION,
+        "members": export_members,
+        "segments": [
+            {
+                "name": _segment_name(position_of[block_id]),
+                "size": len(raw),
+                "crc": zlib.crc32(raw) & 0xFFFFFFFF,
+            }
+            for block_id, raw in enumerate(pool)
+        ],
+    }
+    export_raw = _frame_family_export(manifest, pool)
+    _parse_family_export(export_raw)
+    return export_raw
+
+
+def sync_to_family_export(raw, target_family_raw=None):
+    """Convert an incremental sync artifact into a full family export.
+
+    The result is the full ``SEQFAMX1`` artifact of the source family:
+    when *target_family_raw* (the full export of the target family the
+    artifact was produced against) is given, every member's common
+    prefix is filled from it -- its prefix CRCs must match -- and the
+    exclusive tail follows, so importing the result restores the
+    source family with member count, segment positions and bit-for-bit
+    state, and a full export of the target family after applying the
+    sync is byte for byte equal to it.  When *target_family_raw* is
+    omitted every member must be fully carried (no common prefix),
+    i.e. the artifact is already self-contained.  Pure function, writes
+    nothing.
+    """
+    manifest, blobs = _read_sync_frame(raw, "sync artifact")
+    plan = _parse_sync_manifest(manifest, len(blobs))
+    if target_family_raw is None:
+        if any(member["bp"] != 0 for member in plan):
+            raise CheckpointError(
+                "sync artifact has a common prefix: converting it to a full "
+                "family export needs the target family export"
+            )
+        _parse_sync_artifact(raw)
+        pool_entries = [
+            [
+                blobs[member["segments"][slot]]
+                for slot in range(member["head"] + 1)
+            ]
+            for member in plan
+        ]
+        return _canonical_full_export(plan, pool_entries)
+    target_plan, target_blobs = _parse_family_export(target_family_raw)
+    if len(plan) != len(target_plan):
+        raise CheckpointError(
+            "sync conversion needs a target family export with the same "
+            f"member count ({len(plan)} vs {len(target_plan)})"
+        )
+    pool_entries = []
+    documents = []
+    for member, t_member in zip(plan, target_plan):
+        if t_member["head"] + 1 < member["bp"]:
+            raise CheckpointError(
+                f"sync conversion rejected: target member {member['name']!r} "
+                "is shorter than the common prefix"
+            )
+        entries = []
+        for slot in range(member["bp"]):
+            chunk = target_blobs[t_member["segments"][slot]]
+            if (zlib.crc32(chunk) & 0xFFFFFFFF) != member["pc"][slot]:
+                raise CheckpointError(
+                    "sync conversion rejected: the target export does not "
+                    f"match the common prefix of member {member['name']!r}"
+                )
+            entries.append(chunk)
+        for slot in range(member["bp"], member["head"] + 1):
+            entries.append(blobs[member["segments"][slot]])
+        walker = _ChainWalker(entries[0])
+        for slot in range(1, member["head"] + 1):
+            walker.apply_delta(slot, entries[slot])
+        documents.append(walker.document())
+        pool_entries.append(entries)
+    _check_family_shape_agreement(
+        documents, [member["name"] for member in plan], "sync conversion"
+    )
+    return _canonical_full_export(plan, pool_entries)
+
+
 
 
 # ---------------------------------------------------------------------------

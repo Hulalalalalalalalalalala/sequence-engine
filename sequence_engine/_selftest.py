@@ -3125,6 +3125,345 @@ def _check_family_export_import_memory():
     )
 
 
+def _check_family_sync_memory():
+    # Cross-family incremental synchronization, entirely in memory: the
+    # artifact carries only the source-exclusive segments, applying it
+    # lands the source state bit for bit, shared segments stay one
+    # object, and the full and incremental artifacts convert both ways.
+    seq, _ = _fresh_stack()
+    main = _checkpoint.MemoryChain()
+    seq.save(main)  # seg 0 (basis, no hidden)
+    out, hidden = seq.forward(Tensor(_SEG1))
+    seq.backward(_total(out))
+    seq.update(_LR)
+    seq.save(main)  # seg 1 (hidden introduced)
+    seq.adam_step(_ADAM_LR)
+    seq.save(main)  # seg 2
+    out, hidden = seq.forward(Tensor(_SEG2), hidden)
+    seq.backward(_total(out))
+    seq.update(_LR)
+    seq.save(main)  # seg 3
+    seq.adam_step(_ADAM_LR)
+    seq.save(main)  # seg 4
+    b1 = _checkpoint.fork_chain_memory(main, up_to=3)
+    b1_seq, _ = _fresh_stack()
+    b1_hidden = b1_seq.load(b1)
+    o, b1_hidden = b1_seq.forward(Tensor(_SEG2), b1_hidden)
+    b1_seq.backward(_total(o))
+    b1_seq.adam_step(_ADAM_LR)
+    b1_seq.save(b1)  # b1-owned seg 4
+    source = [main, b1]
+    source_states = [
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+        for chain in source
+    ]
+    source_steps = [
+        _checkpoint.load_chain_memory(chain)["optim"]["t"] for chain in source
+    ]
+
+    # The target family shares a prefix, then diverges on its own.
+    t_main = _checkpoint.fork_chain_memory(main, up_to=2)
+    t_seq, _ = _fresh_stack()
+    t_hidden = t_seq.load(t_main)
+    o, t_hidden = t_seq.forward(Tensor(_SEG1), t_hidden)
+    t_seq.backward(_total(o))
+    t_seq.update(_LR)
+    t_seq.save(t_main)
+    t_seq.adam_step(_ADAM_LR)
+    t_seq.save(t_main)
+    t_b1 = _checkpoint.fork_chain_memory(t_main, up_to=1)
+    targets = [t_main, t_b1]
+    target_export = _checkpoint.export_family_memory(targets)
+    prefix_objects = [
+        t_main._objects[_checkpoint._segment_name(slot)] for slot in range(3)
+    ]
+    b1_prefix_objects = [
+        t_b1._objects[_checkpoint._segment_name(slot)] for slot in range(2)
+    ]
+
+    artifact = _checkpoint.sync_family_memory(source, targets)
+    _check(
+        artifact[:8] == _checkpoint.SYNC_MAGIC,
+        "a sync artifact carries the sync magic",
+    )
+    _check(
+        _checkpoint.sync_family_memory(source, targets) == artifact,
+        "repeated sync production is byte-identical",
+    )
+    for chain, state in zip(source, source_states):
+        _check(
+            _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+            == state,
+            "sync production changes no source member",
+        )
+    for chain, steps in zip(source, source_steps):
+        _check(
+            _checkpoint.load_chain_memory(chain)["optim"]["t"] == steps,
+            "sync production advances no optimizer step",
+        )
+
+    plan, blobs = _checkpoint._parse_sync_artifact(
+        artifact,
+        [
+            (lambda slot, c=c: c._objects[_checkpoint._segment_name(slot)])
+            for c in targets
+        ],
+    )
+    # Exactly the source-exclusive positions are carried: main 3..4 and
+    # branch 2..4, deduped; the common prefixes (0..2 / 0..1) ride no
+    # blocks at all.
+    _check(
+        [member["bp"] for member in plan] == [3, 2],
+        "the artifact records each member's common prefix length",
+    )
+    exclusive = set()
+    for member, chain in zip(plan, source):
+        for slot in range(member["bp"], member["head"] + 1):
+            exclusive.add(chain._objects[_checkpoint._segment_name(slot)])
+    _check(
+        len(blobs) == len(exclusive),
+        "the artifact stores each distinct exclusive segment once and no "
+        "shared segment",
+    )
+
+    _checkpoint.apply_sync_family_memory(artifact, targets)
+    for chain, state in zip(targets, source_states):
+        _check(
+            _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+            == state,
+            "an applied target member reassembles bit for bit to its source",
+        )
+    for chain, steps in zip(targets, source_steps):
+        _check(
+            _checkpoint.load_chain_memory(chain)["optim"]["t"] == steps,
+            "applying a sync advances no optimizer step",
+        )
+    _check(
+        t_main.read_head() == main.read_head()
+        and t_b1.read_head() == b1.read_head(),
+        "each target head points at the source head segment",
+    )
+    # The common prefix keeps the target's own bytes objects (its
+    # sharing with sibling chains intact); carried blocks are one object
+    # shared across every member that reaches them.
+    for slot, obj in enumerate(prefix_objects):
+        _check(
+            t_main._objects[_checkpoint._segment_name(slot)] is obj,
+            "a common-prefix segment keeps the target's own object",
+        )
+    for slot, obj in enumerate(b1_prefix_objects):
+        _check(
+            t_b1._objects[_checkpoint._segment_name(slot)] is obj,
+            "the branch common prefix keeps its own object",
+        )
+    _check(
+        t_main._objects[_checkpoint._segment_name(3)]
+        is t_b1._objects[_checkpoint._segment_name(3)],
+        "a shared source segment is one object across synced members",
+    )
+    for chain in targets:
+        _check(
+            _checkpoint.verify_chain_memory(chain).ok,
+            "a synced member verifies",
+        )
+
+    # Re-applying the same artifact is a no-op (heads and objects stay
+    # exactly as they are).
+    snapshot = {id(c): dict(c._objects) for c in targets}
+    _checkpoint.apply_sync_family_memory(artifact, targets)
+    for chain in targets:
+        _check(
+            dict(chain._objects) == snapshot[id(chain)],
+            "applying the same sync twice is a no-op",
+        )
+
+    # Full <-> incremental conversion.  The incremental artifact built
+    # from the two full exports is byte for byte the produced one, and
+    # the incremental artifact plus the target full export converts
+    # back to the source full export -- byte for byte what a full
+    # export of the synced family is.
+    source_export = _checkpoint.export_family_memory(source)
+    converted = _checkpoint.family_export_to_sync(source_export, target_export)
+    _check(
+        converted == artifact,
+        "full source export + full target export converts to the produced "
+        "incremental artifact",
+    )
+    back = _checkpoint.sync_to_family_export(artifact, target_export)
+    synced_export = _checkpoint.export_family_memory(targets)
+    _check(
+        back == synced_export == source_export,
+        "incremental -> full conversion reproduces the source family export "
+        "and the export of the synced family byte for byte",
+    )
+
+    # A self-contained artifact (no common prefix) converts with no
+    # target export at all.
+    other_weights = _base_weights()
+    other_weights["b1"] = [value + 0.1 for value in other_weights["b1"]]
+    fresh_a = _checkpoint.MemoryChain()
+    fresh_b = _checkpoint.MemoryChain()
+    fa, _ = _fresh_stack(other_weights)
+    fa.save(fresh_a)
+    fb, _ = _fresh_stack(other_weights)
+    fb.save(fresh_b)
+    standalone = _checkpoint.sync_family_memory(source, [fresh_a, fresh_b])
+    s_plan, _ = _checkpoint._parse_sync_artifact(standalone)
+    _check(
+        all(member["bp"] == 0 for member in s_plan),
+        "a target with no shared history yields a self-contained artifact",
+    )
+    standalone_full = _checkpoint.sync_to_family_export(standalone)
+    restored = _checkpoint.import_family_memory(standalone_full)
+    for chain, state in zip(restored, source_states):
+        _check(
+            _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+            == state,
+            "a self-contained sync converts to a full export that restores "
+            "the source bit for bit",
+        )
+    _checkpoint.apply_sync_family_memory(
+        standalone, [fresh_a, fresh_b]
+    )
+    for chain, state in zip([fresh_a, fresh_b], source_states):
+        _check(
+            _checkpoint.build_bytes(_checkpoint.load_chain_memory(chain))
+            == state,
+            "a self-contained sync applies bit for bit",
+        )
+
+    # Two families already in sync: no blocks are carried, applying is a
+    # no-op and the round trip still reproduces the full export.
+    same_a = [
+        _checkpoint.fork_chain_memory(chain) for chain in source
+    ]
+    same_b = [
+        _checkpoint.fork_chain_memory(chain) for chain in source
+    ]
+    empty_artifact = _checkpoint.sync_family_memory(same_a, same_b)
+    e_manifest, e_blobs = _checkpoint._read_sync_frame(
+        empty_artifact, "sync artifact"
+    )
+    e_plan = _checkpoint._parse_sync_manifest(e_manifest, len(e_blobs))
+    _check(
+        len(e_blobs) == 0
+        and all(member["bp"] == member["head"] + 1 for member in e_plan),
+        "an in-sync family pair carries no blocks at all",
+    )
+    before = {id(c): dict(c._objects) for c in same_b}
+    _checkpoint.apply_sync_family_memory(empty_artifact, same_b)
+    for chain in same_b:
+        _check(
+            dict(chain._objects) == before[id(chain)],
+            "applying an empty sync changes nothing",
+        )
+
+    # Error taxonomy.
+    _expect(
+        TypeError,
+        lambda: _checkpoint.sync_family_memory(main, targets),
+        "a bare MemoryChain is not a sync family",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.sync_family_memory([main], targets),
+        "families of different lengths are rejected",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.sync_family_memory([main, main], targets),
+        "a duplicated source member is rejected",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.apply_sync_family_memory(artifact, [t_main]),
+        "an artifact for two members does not apply to one",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.apply_sync_family_memory(b"", targets),
+        "an empty sync artifact is rejected",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.apply_sync_family_memory(b"not a sync", targets),
+        "foreign bytes are rejected",
+    )
+    _expect(
+        ValueError,
+        lambda: _checkpoint.apply_sync_family_memory(
+            artifact[: len(artifact) // 2], targets
+        ),
+        "a truncated sync artifact is rejected",
+    )
+    flipped = bytearray(artifact)
+    flipped[len(flipped) // 2] ^= 0xFF
+    untouched = {id(c): dict(c._objects) for c in targets}
+    _expect(
+        ValueError,
+        lambda: _checkpoint.apply_sync_family_memory(bytes(flipped), targets),
+        "a flipped byte fails the artifact CRC",
+    )
+    for chain in targets:
+        _check(
+            dict(chain._objects) == untouched[id(chain)],
+            "a rejected apply leaves every target store untouched",
+        )
+    # An artifact produced against a different target family is refused.
+    other_targets = [fresh_a, fresh_b]
+    mismatched = standalone
+    _checkpoint.apply_sync_family_memory(mismatched, other_targets)
+    wrong = [
+        _checkpoint.fork_chain_memory(main, up_to=0),
+        _checkpoint.fork_chain_memory(main, up_to=0),
+    ]
+    _expect(
+        ValueError,
+        lambda: _checkpoint.apply_sync_family_memory(artifact, wrong),
+        "an artifact that does not match the target family is rejected",
+    )
+    # Members whose parameter shapes disagree cannot be synced.
+    shaped_weights = _base_weights()
+    shaped_weights["b1"] = [0.01, -0.02, 0.03, 0.04]
+    shaped = _checkpoint.MemoryChain()
+    shaped_seq, _ = _fresh_stack(shaped_weights)
+    shaped_seq.save(shaped)
+    shaped_target = _checkpoint.MemoryChain()
+    st, _ = _fresh_stack(shaped_weights)
+    st.save(shaped_target)
+    _expect(
+        ValueError,
+        lambda: _checkpoint.sync_family_memory(
+            [main], [shaped_target]
+        ),
+        "shape-inconsistent families refuse a sync",
+    )
+    # The container-level entry points cover the memory families too.
+    via_seq, _ = _fresh_stack()
+    probe_a = _checkpoint.fork_chain_memory(main)
+    probe_b = _checkpoint.fork_chain_memory(main)
+    probe_artifact = via_seq.sync_family([source[0]], [probe_a])
+    via_seq.apply_sync_family(probe_artifact, [probe_a])
+    _check(
+        _checkpoint.build_bytes(_checkpoint.load_chain_memory(probe_a))
+        == source_states[0],
+        "Sequential.sync_family / apply_sync_family work on memory families",
+    )
+    _check(
+        isinstance(
+            via_seq.family_export_to_sync(source_export, target_export),
+            bytes,
+        ),
+        "Sequential.family_export_to_sync returns artifact bytes",
+    )
+    _check(
+        isinstance(
+            via_seq.sync_to_family_export(artifact, target_export), bytes
+        ),
+        "Sequential.sync_to_family_export returns a full family artifact",
+    )
+
+
 _GROUPS = [
     ("tensor basics", _check_tensor_basics),
     ("tensor validation", _check_tensor_validation),
@@ -3153,6 +3492,7 @@ _GROUPS = [
     ("in-memory chain merge", _check_chain_merge_memory),
     ("in-memory family compaction", _check_family_compaction_memory),
     ("in-memory family export/import", _check_family_export_import_memory),
+    ("in-memory cross-family incremental sync", _check_family_sync_memory),
     ("streaming compaction interleave", _check_streaming_compaction_interleaves),
     ("chain verification", _check_chain_verification),
     ("backward replay failure surfaced", _check_backward_replay_failure_is_surfaced),
